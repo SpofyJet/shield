@@ -1,7 +1,27 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.23.10 (Commercial Edition) — PCAP NAME FIX
+#  VPN NODE DDoS PROTECTION v3.23.12 (Commercial Edition) — COSMETIC FIX
+#
+#  Что нового vs v3.23.11:
+#    - FIX: финальное сообщение установщика и Settings меню показывали
+#      ct=50000 (legacy hardcoded text). Реальный лимит в nft = 15000
+#      с v3.23.3+, но текст в выводе не был обновлён. Поправлено.
+#
+#  Что нового vs v3.23.10:
+#    - CRIT FIX: pcap-service не работал в v3.23.10. systemd unit использует
+#      `%` как СВОИ specifiers (%H=hostname, %m=machineid, %Y=hash). Когда
+#      я писал `%Y%m%d-%H%M%S` для strftime tcpdump — systemd подставлял
+#      свои значения, и tcpdump получал имя файла типа
+#      `syn-/etc/systemd/system07397.../run/credentials/.../sweden2.../var/lib.pcap`.
+#      ОК что я первоначально делал в v3.23.9 (`%%Y%%m%%d`) — это правильно
+#      для systemd escape. В саморевью v3.23.10 я ошибочно решил что %%
+#      это баг и убрал их → сломал pcap полностью.
+#      Fix: вернуть `%%Y%%m%%d-%%H%%M%%S` в unit-файле. Внутри single-quote
+#      heredoc `%%` сохраняется literal → systemd получает `%%` → даёт
+#      tcpdump один `%` для strftime → правильное имя файла.
+#    - FIX: guard self-test "integer expression expected" — была пустая
+#      переменная в `[ $X -gt N ]`. Защита через `${X:-0}` дефолт.
 #
 #  Что нового vs v3.23.9:
 #    - CRIT FIX: в v3.23.9 heredoc для shieldnode-pcap.service использовал
@@ -292,7 +312,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.23.10"
+SHIELDNODE_VERSION="3.23.12"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -6009,7 +6029,11 @@ HELP
         fi
 
         # 9. logrotate работает
-        LR_FAILED=$(journalctl -u shieldnode-logrotate --since "24 hours ago" --no-pager 2>/dev/null | grep -c "FAILURE" || echo 0)
+        # v3.23.11: grep -c всегда возвращает число (0 если пусто), но exit != 0
+        # при пустом матче. `|| echo 0` приклеивал ВТОРУЮ строку "0" → integer
+        # expression error. Используем default через ${X:-0} вместо ||.
+        LR_FAILED=$(journalctl -u shieldnode-logrotate --since "24 hours ago" --no-pager 2>/dev/null | grep -c "FAILURE" 2>/dev/null)
+        LR_FAILED="${LR_FAILED:-0}"
         if [ "$LR_FAILED" -gt 5 ]; then
             echo "  [⚠] shieldnode-logrotate: $LR_FAILED ошибок за 24ч"
             WARNINGS=$((WARNINGS + 1))
@@ -7152,7 +7176,7 @@ show_settings_menu() {
         echo -e "  [${B}4${N}] Tor exit blocklist            $s4"
         echo ""
         echo -e "  ${DIM}v3.20.0: пункты [3] Mobile-RU и [5] Broadband-RU убраны.${N}"
-        echo -e "  ${DIM}Защита упрощена — единый лимит ct=50000 для всех IP.${N}"
+        echo -e "  ${DIM}Защита упрощена — единый лимит ct=15000 для всех IP.${N}"
         echo ""
         echo -e "  [${B}f${N}] Force github sync now"
         echo -e "  [${B}v${N}] Force version check now"
@@ -8065,7 +8089,7 @@ Wants=network.target
 [Service]
 Type=simple
 ExecStart=__TCPDUMP_BIN__ -i any -nn -s 128 \
-    -w /var/log/pcap/syn-%Y%m%d-%H%M%S.pcap \
+    -w /var/log/pcap/syn-%%Y%%m%%d-%%H%%M%%S.pcap \
     -W 20 -C 50 -G 3600 -Z root \
     '(tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack == 0)'
 Restart=always
@@ -8954,7 +8978,7 @@ echo -e "   • Blocklists:    ${BL_LINE}"
 # v3.20.6: блок Mobile-RU удалён — whitelist отменён в v3.20.0, оставшаяся
 # отображалка вводила в заблуждение ("первый sync через несколько минут" —
 # никакого sync не будет, фичи нет).
-echo -e "   • Лимиты:        ct=50000, new-conn=40000/min ${DIM}(500-1000 client base)${NC}"
+echo -e "   • Лимиты:        ct=15000, new-conn=40000/min ${DIM}(500-1000 client base)${NC}"
 # v3.14.0: статус auto-sync features
 if [ "${ENABLE_GITHUB_SYNC:-1}" = "1" ]; then
     echo -e "   • GitHub sync:   ${GREEN}ON${NC}  ${DIM}(custom.txt каждые 6ч)${NC}"
