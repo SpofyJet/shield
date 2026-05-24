@@ -25,9 +25,7 @@ icmp_*, tcp_rfc1337, log_martians, UDP conntrack timeouts) shieldnode пишет
 
 **Auto-promote (v3.23.3):** IP с count>=2000 за 24ч (conn_flood/syn_flood) автоматом попадает в `custom-local.txt` навсегда. TTL 90 дней: записи удаляются если IP не атакует >30 дней. CrowdSec whitelist cross-check.
 
-**/24 datacenter aggregator (v3.23.3):** 3+ /32 из одной /24 в suspect_v4 → whois lookup → если datacenter ASN → бан всей /24. Whois cache 24h + Team Cymru fallback. Dry-run первые 7 дней (только лог, без банов) для проверки оператором. ISP-whitelist (CGNAT провайдеры не агрегируются).
-
-**PCAP capture (v3.23.3):** rolling SYN-only ring buffer 1GB в `/var/log/pcap/` + attack-archiver: при скачке >10k drops/min копирует current ring в `/var/lib/shieldnode/pcap-archive/attack-<TS>/` (7-day retention). Для отправки хостеру при DDoS.
+**PCAP capture (v3.23.3+):** rolling SYN-only ring buffer 1GB в `/var/log/pcap/` + attack-archiver: при скачке >10k drops/min копирует current ring в `/var/lib/shieldnode/pcap-archive/attack-<TS>/` (7-day retention). Для отправки хостеру при DDoS.
 
 **Требует:** `net.netfilter.nf_conntrack_max >= 262144` (Ubuntu 24.04 default OK на нодах ≥1GB RAM).
 
@@ -83,15 +81,22 @@ sudo guard sync       # синк custom.txt прямо сейчас
 
 ## Версии
 
-- **v3.23.3** — POST-INCIDENT HARDENING (на основе DDoS-инцидента 2026-05-24):
+- **v3.23.4** — POST-INCIDENT FINAL (на основе DDoS-инцидента 2026-05-24):
+  - **REMOVED**: /24 subnet aggregator + whois install (был в v3.23.3-rc, удалён до stable). CrowdSec community blocklist + threat-feeds покрывают ~90% datacenter ботнетов, дополнительная сложность не оправдана. Auto-promote events.db → custom-local + ручной custom.txt — достаточно.
+  - **FEATURE**: idempotent cleanup в начале установщика (ШАГ 12.6). При upgrade с v3.23.3-rc автоматически удаляет legacy `shieldnode-subnet-aggregator.{service,timer}` + nft set `datacenter_subnet_bans_v4` + whois cache. Чистый upgrade без ручной очистки.
+  - **FIX**: CrowdSec scenario `shieldnode/conn-flood` более не включает `UFW-BLOCK` в filter (это port scan, не DDoS — не должен попадать в community blocklist под `labels.type='ddos'`).
+  - **FIX**: degraded feed warning теперь со скользящим peak — auto-reset если current >= 80% от peak (источник восстановился). Без этого старый peak застрял бы навсегда после временного скачка.
+  - **FIX**: TTL cleanup в auto-promote логирует warning если `date` команда не сработала (silent failure removed).
+  - **FIX**: PCAP archiver проверяет существование nft table перед сравнением counters — если `shieldnode-nftables` упал, пишет CRITICAL alert в syslog вместо silent skip.
+  - **FIX**: CrowdSec grok pattern строже — `NOTSPACE` вместо greedy `DATA` (защита от случайного захвата лишних полей).
+- **v3.23.3** — POST-INCIDENT HARDENING (DDoS-инцидент 2026-05-24, base релиз):
   - **CRIT**: `ct count over` снижен с **50000 → 15000** TCP per-IP. Инцидент показал атаку где боты держали 5k-128k conn/IP, проходили под старый лимит. Замер легитимных пиков на работающих нодах: 700-750 conn/IP. Новый порог = запас 20x от пика, режет все известные ботнеты в инциденте.
   - **FEATURE**: rolling **pcap-capture** включён по умолчанию (`shieldnode-pcap.service`). Ring buffer 1GB, SYN-only, 128 байт/пакет. На нормальной нагрузке ~100-200MB/сутки. Файлы: `/var/log/pcap/syn-*.pcap`. Для отправки хостеру при DDoS.
   - **FEATURE**: **pcap attack-archiver** (`shieldnode-pcap-archiver.timer`). Каждую минуту проверяет nft drop-counters: при скачке >10k drops/min копирует current ring в `/var/lib/shieldnode/pcap-archive/attack-<TS>/` навсегда (7-day retention). Решает проблему ring buffer overflow при volumetric атаках (100k pps заполняет 1GB за ~80 сек).
   - **FEATURE**: **auto-promote** events.db → custom-local.txt каждые 6ч. IP с count>=2000 за 24ч (только conn_flood/syn_flood) → постоянный бан. **TTL 90 дней**: записи удаляются если IP больше не атакует >30 дней (защита от unbounded growth). **CrowdSec whitelist cross-check** перед каждым промоутом.
-  - **FEATURE**: **/24 datacenter aggregator** (`shieldnode-subnet-aggregator.timer`). 3+ /32 из одной /24 в `suspect_v4` → whois lookup → если datacenter ASN → бан всей /24. Whois cache 24h в `/var/lib/shieldnode/whois-cache/` + Team Cymru fallback (защита от RIPE rate-limit 1000 req/h при 50+ нод за NAT). **Dry-run первые 7 дней** (только лог, без банов) для проверки оператором. ISP-whitelist расширен под мировых провайдеров (Sonatel, PALTEL, Kazakhtelecom, Globe Telecom, NOS, TOT, VNPT, Maroc Telecom, Free SAS, Telstra, Saudi Telecom, Emirates Internet и т.д.).
-  - **FEATURE**: **CrowdSec scenario** `shieldnode/conn-flood` для community publication. Filter покрывает SYN-ESCALATE, UDP-ESCALATE, CONN-FLOOD, SYN-FLOOD, UFW-BLOCK. Grok pattern под реальный формат `events.log`. Acquisition пишется только если events.log существует.
-  - **FEATURE**: **degraded feed health warning** в blocklist updater. Сохраняет peak entries за всё время. Если current <50% от peak — WARN в syslog (детект "тихих" поломок типа смена URL формата или удаление repo).
-  - **INFRA**: **динамический DNS whitelist** из `/etc/resolv.conf` + `resolvectl` + `/run/systemd/resolve/` (вместо hardcoded `1.1.1.1`, `8.8.8.8`). MY_IP detection без `ifconfig.me` — через `ip route get 1.1.1.1` + public-IP filter в hostname fallback. Locks в `/run/shieldnode/` (вместо устаревшего `/var/run`). PCAP restart только если конфиг изменился (sha256 sequence). whois install с 3x retry + явный алерт если не установился.
+  - **FEATURE**: **CrowdSec scenario** `shieldnode/conn-flood` для community publication. Filter покрывает SYN-ESCALATE, UDP-ESCALATE, CONN-FLOOD, SYN-FLOOD. Grok pattern под реальный формат `events.log`. Acquisition пишется только если events.log существует.
+  - **FEATURE**: **degraded feed health warning** в blocklist updater. Сохраняет peak entries. Если current <50% от peak — WARN в syslog (детект "тихих" поломок типа смена URL формата или удаление repo).
+  - **INFRA**: **динамический DNS whitelist** из `/etc/resolv.conf` + `resolvectl` + `/run/systemd/resolve/` (вместо hardcoded `1.1.1.1`, `8.8.8.8`). MY_IP detection без `ifconfig.me` — через `ip route get 1.1.1.1` + public-IP filter в hostname fallback. Locks в `/run/shieldnode/` (вместо устаревшего `/var/run`). PCAP restart только если конфиг изменился (sha256 sequence).
 - **v3.23.2** — EXTENDED THREAT FEEDS:
   - **FEATURE**: `threat` blocklist расширен с 2 до 5 источников: + **blocklist.de** (~30k IP fail2ban-агрегатор, фильтрует SYN-flood ложняки), + **Feodotracker abuse.ch** (botnet C2), + **IPSum level 3** (агрегатор 30+ источников). Все источники без регистраций и API-ключей.
   - **TUNING**: `DEFAULT_MIN_ENTRIES_THREAT` 500 → 5000 (защита от тихого деградирования: если несколько источников отвалились — updater не применяет частичный список).
