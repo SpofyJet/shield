@@ -81,6 +81,13 @@ sudo guard sync       # синк custom.txt прямо сейчас
 
 ## Версии
 
+- **v3.23.10** — PCAP NAME FIX (hotfix к v3.23.9):
+  - **CRIT FIX**: в v3.23.9 heredoc для `shieldnode-pcap.service` использовал `<<PCAP_UNIT_EOF` без quotes (для подстановки `$TCPDUMP_BIN`), и в strftime-pattern удвоились `%` → tcpdump получал буквальное имя файла `syn-%%Y%%m%%d-%%H%%M%%S.pcap` вместо timestamp. PCAP записи были бы сломаны.
+  - Fix: single-quote heredoc (literal) + targeted `sed` замена ровно одного placeholder `__TCPDUMP_BIN__` после создания файла. Никакого expand'а `$VAR`/`%`, всё literal до явной замены.
+- **v3.23.9** — WHITELIST PERF FIX (анализ скриншота с `nft delete element ... 88.8% CPU`):
+  - **PERF FIX**: `shieldnode-whitelist-updater` использовал 6 отдельных `nft delete` команд per-IP (каждая отдельный fork+exec+nft init). При 3 IP в TRUSTED_IPS = 18 nft процессов на каждый sync, CPU spike до 90%. На скриншоте видны `nft delete element inet ddos_protect suspect_v4 { 213.165.55.166 }` висящие в top.
+  - Fix: переход на batch `nft -f -` (1 nft process для всех delete операций). Снижение CPU usage в 18x на nodes с TRUSTED_IPS. Срабатывает при path-watcher (whitelist-local.txt) и периодических sync.
+  - **FIX**: `shieldnode-pcap.service status=203/EXEC` на Ubuntu 24 (tcpdump path был `/usr/sbin/tcpdump`, реальный — `/usr/bin/tcpdump`). Auto-detect через `command -v tcpdump`. apt install с 3x retry. Если tcpdump недоступен — сервис не создаётся (не висит в failed state с crashes каждые 10 сек).
 - **v3.23.8** — COMPRESSION HARDENING (production-ready):
   - **FIX**: gzip rotation error logging — раньше `2>/dev/null` глотал "no space"/"permission denied", теперь все ошибки в syslog (`shieldnode-gzip`, `shieldnode-agg-retry`).
   - **FIX**: cleanup при upgrade имеет fallback на `truncate` если диск >=95% (gzip не уместится во временный файл). 80-94% → gzip (сохраняем историю), >=95% → truncate (быстро, но теряем старое).
