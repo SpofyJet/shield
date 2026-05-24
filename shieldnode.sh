@@ -1,7 +1,25 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.23.3 (Commercial Edition) — POST-INCIDENT HARDENING
+#  VPN NODE DDoS PROTECTION v3.23.4 (Commercial Edition) — POST-INCIDENT HARDENING
+#
+#  Что нового vs v3.23.3:
+#    - REMOVED: /24 subnet aggregator + whois install.
+#      Был добавлен в v3.23.3-rc, удалён до stable релиза.
+#      Причина: дополнительная сложность (whois package + кэш + dry-run logic)
+#      vs незначительный профит (CrowdSec community + threat-feeds уже покрывают
+#      90% datacenter ботнетов). Auto-promote + ручной custom.txt — достаточно.
+#      Cleanup: установщик автоматически удалит legacy unit'ы при upgrade.
+#    - FIX: CrowdSec scenario shieldnode/conn-flood filter более не включает
+#      UFW-BLOCK события (это port scan, не DDoS, не должен попадать в
+#      community blocklist под labels.type='ddos').
+#    - FIX: degraded feed warning теперь со скользящим peak (auto-reset если
+#      current >= 80% от peak — источник восстановился).
+#    - FIX: TTL cleanup в auto-promote логирует warning если date-parsing
+#      не сработал (silent failure removed).
+#    - INFRA: idempotent cleanup в начале установщика — корректно удаляет
+#      legacy systemd unit'ы и nft set'ы от предыдущих версий (включая
+#      subnet-aggregator от v3.23.3-rc если был установлен).
 #
 #  Что нового vs v3.23.1 (на основе DDoS-инцидента 2026-05-24 + долгосрочное усиление):
 #    1. CRIT: ct count over 50000 → 15000.
@@ -18,33 +36,27 @@
 #       Каждые 6ч IP с count>=2000/24ч → custom-local.txt.
 #       Раз в сутки cleanup: записи старше 90 дней удаляются если IP не
 #       появлялся в events.db последние 30 дней. Защита от unbounded growth.
-#    4. FEATURE: /24 datacenter aggregator с whois cache + dry-run.
-#       Whois cache 24h TTL в /var/lib/shieldnode/whois-cache (защита от RIPE
-#       rate-limit 1000 req/h при 50+ нод за NAT). Fallback на Team Cymru
-#       (bulk-friendly). Первые 7 дней — dry-run mode (только лог, не банит)
-#       для проверки оператором без риска ложных банов.
-#    5. FEATURE: CrowdSec scenario с правильным parser pattern.
-#       Filter: SYN-ESCALATE, UDP-ESCALATE, CONN-FLOOD, SYN-FLOOD, UFW-BLOCK.
+#    4. FEATURE: CrowdSec scenario с правильным parser pattern.
+#       Filter: SYN-ESCALATE, UDP-ESCALATE, CONN-FLOOD, SYN-FLOOD.
 #       Grok pattern покрывает форматы с/без dpt=.
 #       Acquisition пишется только если events.log существует.
-#    6. FEATURE: degraded feed health warning.
+#    5. FEATURE: degraded feed health warning.
 #       Updater сохраняет peak entries в /var/lib/shieldnode/.peak-<name>.
 #       Если current <50% от peak — WARN в syslog (детект "тихих" поломок
 #       источников типа смена URL формата или удаление repo).
-#    7. FEATURE: CrowdSec whitelist cross-check в auto-promote.
+#    6. FEATURE: CrowdSec whitelist cross-check в auto-promote.
 #       Перед триггером update — удаляем из custom-local любые IP помеченные
 #       whitelist'ом в CrowdSec. Защита от конфликта приоритетов.
-#    8. FEATURE: threat blocklist расширен до 5 источников (v3.23.2 cumulative):
+#    7. FEATURE: threat blocklist расширен до 5 источников (v3.23.2 cumulative):
 #       + blocklist.de (~30k IP fail2ban-агрегатор), + Feodotracker abuse.ch,
 #       + IPSum level 3. DEFAULT_MIN_ENTRIES_THREAT 500 → 5000.
-#    9. INFRA: динамический whitelist DNS из /etc/resolv.conf / resolvectl
+#    8. INFRA: динамический whitelist DNS из /etc/resolv.conf / resolvectl
 #       / systemd-resolved (вместо hardcoded 1.1.1.1, 8.8.8.8).
-#   10. INFRA: MY_IP detection без внешних сервисов — через ip route get
+#    9. INFRA: MY_IP detection без внешних сервисов — через ip route get
 #       и фильтр public IP в hostname fallback.
-#   11. INFRA: /run/shieldnode/ для locks и transient state (вместо устаревшего
+#   10. INFRA: /run/shieldnode/ для locks и transient state (вместо устаревшего
 #       /var/run и хрупкого /var/lib/shieldnode/.*-hash).
-#   12. INFRA: whois install с 3x retry, явный алерт если не установился.
-#   13. INFRA: PCAP restart только если конфиг изменился (sha256 sequence)
+#   11. INFRA: PCAP restart только если конфиг изменился (sha256 sequence)
 #       или сервис не запущен — не обрывать активный capture зря.
 #
 #  TODO (v3.24+, не критично сейчас):
@@ -182,7 +194,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.23.3"
+SHIELDNODE_VERSION="3.23.4"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -3503,15 +3515,22 @@ grep -oE '^[[:space:]]*[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]+)?' "$TMP/all.raw" | \
 V4_COUNT=$(wc -l < "$TMP/parsed.list")
 V4_COUNT="${V4_COUNT:-0}"
 
-# 5.5) v3.23.3: Health warning — если получили намного меньше чем когда-то
-# (источники могут "тихо умирать": URL поменялся, repo удалили, ToS-change).
-# Сохраняем peak за всё время в state-файле. Если текущее <50% от peak — алерт.
+# 5.5) v3.23.4: Health warning — если получили намного меньше чем когда-то.
+# Источники могут "тихо умирать": URL поменялся, repo удалили, ToS-change.
+# Сохраняем peak в state-файле. Auto-reset: если current >= 80% от peak,
+# обновляем peak до current — источник восстановился, baseline сместился.
 PEAK_FILE="/var/lib/shieldnode/.peak-${NAME}"
 PEAK=$(cat "$PEAK_FILE" 2>/dev/null || echo 0)
 PEAK="${PEAK:-0}"
 if [ "$V4_COUNT" -gt "$PEAK" ]; then
+    # Новый рекорд
+    echo "$V4_COUNT" > "$PEAK_FILE"
+elif [ "$PEAK" -gt 1000 ] && [ "$V4_COUNT" -ge "$((PEAK * 80 / 100))" ]; then
+    # Current >= 80% от peak — recовery, сдвигаем baseline к current
+    # (защита от "застрявшего" peak когда источник временно прыгал высоко)
     echo "$V4_COUNT" > "$PEAK_FILE"
 elif [ "$PEAK" -gt 1000 ] && [ "$V4_COUNT" -lt "$((PEAK / 2))" ]; then
+    # Current < 50% от peak — источник деградировал, alert
     logger -t "$LOG_TAG" "WARN: degraded feed — got $V4_COUNT entries, peak was $PEAK (<50%, источник мог измениться)"
 fi
 
@@ -7336,10 +7355,64 @@ fi
 # ==============================================================================
 
 # ==============================================================================
-# ШАГ 12.9: PCAP-CAPTURE (v3.23.3) — rolling forensics для DDoS-инцидентов
+# ШАГ 12.6: CLEANUP LEGACY (v3.23.4) — удаление компонентов прошлых версий
 # ==============================================================================
 
-print_header "ШАГ 12.9: PCAP-CAPTURE (rolling SYN dump)"
+print_header "ШАГ 12.6: CLEANUP LEGACY"
+
+# Удаляем компоненты от ранних версий v3.23.x которые более не используются.
+# Это критично для idempotent upgrade — если ноду уже обновляли на v3.23.3-rc
+# с subnet-aggregator, надо корректно его убрать чтоб не висели dead unit'ы.
+
+LEGACY_REMOVED=0
+
+# v3.23.3-rc: subnet-aggregator (whois-based /24 datacenter banning)
+# Удалён в v3.23.4 — недостаточно профита vs сложность.
+for unit in shieldnode-subnet-aggregator.timer shieldnode-subnet-aggregator.service; do
+    if systemctl list-unit-files 2>/dev/null | grep -q "^$unit"; then
+        systemctl disable --now "$unit" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/$unit" 2>/dev/null
+        LEGACY_REMOVED=1
+    fi
+done
+if [ -f /usr/local/sbin/shieldnode-subnet-aggregator.sh ]; then
+    rm -f /usr/local/sbin/shieldnode-subnet-aggregator.sh
+    LEGACY_REMOVED=1
+fi
+
+# Удаляем nft set и rule если были созданы
+if nft list set inet ddos_protect datacenter_subnet_bans_v4 >/dev/null 2>&1; then
+    # Найти handle правила использующего этот set
+    RULE_HANDLE=$(nft -a list chain inet ddos_protect prerouting 2>/dev/null | \
+        grep "datacenter_subnet_bans_v4" | grep -oE 'handle [0-9]+' | awk '{print $2}' | head -1)
+    if [ -n "$RULE_HANDLE" ]; then
+        nft delete rule inet ddos_protect prerouting handle "$RULE_HANDLE" 2>/dev/null || true
+    fi
+    nft delete set inet ddos_protect datacenter_subnet_bans_v4 2>/dev/null || true
+    LEGACY_REMOVED=1
+fi
+
+# Whois cache directory (если был создан)
+if [ -d /var/lib/shieldnode/whois-cache ]; then
+    rm -rf /var/lib/shieldnode/whois-cache
+    LEGACY_REMOVED=1
+fi
+
+# Dry-run marker (если был)
+rm -f /etc/shieldnode/.subnet-aggr-dryrun /var/lib/shieldnode/.aggregator-install-time 2>/dev/null
+
+if [ "$LEGACY_REMOVED" = "1" ]; then
+    systemctl daemon-reload 2>/dev/null || true
+    print_ok "Legacy components от v3.23.3-rc удалены (subnet-aggregator)"
+else
+    print_info "Legacy components не найдены — clean install"
+fi
+
+# ==============================================================================
+# ШАГ 12.7: PCAP-CAPTURE (v3.23.3) — rolling forensics для DDoS-инцидентов
+# ==============================================================================
+
+print_header "ШАГ 12.7: PCAP-CAPTURE (rolling SYN dump)"
 
 # Хостер при DDoS требует pcap для блокировки upstream / abuse-report.
 # tcpdump на SYN-пакеты без ACK (начало TCP-соединения), 128 байт payload.
@@ -7434,6 +7507,14 @@ mkdir -p "$LOCK_DIR"
 exec {LOCK_FD}> "$LOCK"
 flock -n "$LOCK_FD" || exit 0
 
+# Проверяем что nft table существует. Если нет — shieldnode-nftables упал,
+# что само по себе серьёзный инцидент. Записываем alert и не делаем сравнения
+# (иначе CURRENT_DROPS=0 → дельта negative → trigger не сработает в реальной атаке).
+if ! nft list table inet ddos_protect >/dev/null 2>&1; then
+    logger -t "$LOG_TAG" "CRITICAL: nft table 'inet ddos_protect' missing — shieldnode-nftables.service may be down"
+    exit 1
+fi
+
 # Текущий счётчик drop'ов из всех counters в ddos_protect
 CURRENT_DROPS=$(nft list table inet ddos_protect 2>/dev/null | \
     awk '/counter packets/ {gsub(/[^0-9]/,"",$3); sum+=$3} END {print sum+0}')
@@ -7503,10 +7584,10 @@ systemctl start shieldnode-pcap-archiver.timer >/dev/null 2>&1
 print_ok "PCAP archiver enabled (trigger >10k drops/min, archive 7d retention)"
 
 # ==============================================================================
-# ШАГ 12.10: AUTO-PROMOTE (v3.23.3) — events.db → custom-local.txt
+# ШАГ 12.8: AUTO-PROMOTE (v3.23.3) — events.db → custom-local.txt
 # ==============================================================================
 
-print_header "ШАГ 12.10: AUTO-PROMOTE events.db → custom-local.txt"
+print_header "ШАГ 12.8: AUTO-PROMOTE events.db → custom-local.txt"
 
 # Каждые 6ч: IP с count>=2000 за 24ч И type IN (conn_flood, syn_flood)
 # автоматом попадают в custom-local.txt навсегда.
@@ -7553,7 +7634,10 @@ EXISTING=$(grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' "$CUSTOM_LOCAL" 
 cleanup_old_entries() {
     local cutoff_ttl
     cutoff_ttl=$(date -u -d "$TTL_DAYS days ago" +%s 2>/dev/null || date -v-${TTL_DAYS}d -u +%s 2>/dev/null || echo 0)
-    [ "$cutoff_ttl" -eq 0 ] && return 0
+    if [ "$cutoff_ttl" -eq 0 ]; then
+        logger -t "$LOG_TAG" "WARN: TTL cleanup skipped — date command failed (GNU/BSD compat issue?)"
+        return 0
+    fi
 
     local recent_attackers
     recent_attackers=$(sqlite3 "$DB" "
@@ -7760,326 +7844,10 @@ systemctl start shieldnode-auto-promote.timer >/dev/null 2>&1
 print_ok "Auto-promote enabled (каждые 6ч, count>=2000/24ч, conn_flood/syn_flood only)"
 
 # ==============================================================================
-# ШАГ 12.11: SUBNET-AGGREGATOR (v3.23.3) — /24 агрегация только для datacenter ASN
+# ШАГ 12.9: CROWDSEC SCENARIO (v3.23.3) — conn_flood публикация в community
 # ==============================================================================
 
-print_header "ШАГ 12.11: SUBNET-AGGREGATOR (/24 datacenter only)"
-
-# Каждые 30 минут:
-# 1. Сканирует suspect_v4: если 3+ /32 из одной /24 — кандидат на агрегацию
-# 2. Whois lookup для /24: проверка ASN
-# 3. Если ASN — datacenter (по white-list keywords) И НЕ в системном whitelist —
-#    добавляет /24 в datacenter_subnet_bans set (отдельный, чтобы не путать с custom)
-# 4. Domestic ISP /24 (CGNAT, broadband) НЕ агрегируются
-
-# Datacenter keywords для whois ASN-name (case-insensitive)
-# Что банится: dedicated hosting / colocation / bulletproof / VPS providers
-# Что НЕ банится: ISP / Telecom / Mobile / Broadband / Cable / WiFi / Wireless
-
-cat > /usr/local/sbin/shieldnode-subnet-aggregator.sh <<'AGGR_SCRIPT_EOF'
-#!/bin/bash
-# /24 aggregator for datacenter ASNs only
-# Triggered every 30 min by shieldnode-subnet-aggregator.timer
-# v3.23.3: whois cache (24h TTL) + Team Cymru fallback + dry-run mode
-set -euo pipefail
-
-LOCK_DIR=/run/shieldnode
-LOCK="$LOCK_DIR/subnet-aggr.lock"
-LOG_TAG=shieldnode-subnet-aggr
-NFT_SET_DC=datacenter_subnet_bans_v4
-NFT_TABLE="inet ddos_protect"
-WHOIS_CACHE_DIR=/var/lib/shieldnode/whois-cache
-DRY_RUN_FILE=/etc/shieldnode/.subnet-aggr-dryrun
-DRY_RUN_DAYS=7  # первые 7 дней — только логировать, не банить
-INSTALL_MARKER=/var/lib/shieldnode/.aggregator-install-time
-
-mkdir -p "$LOCK_DIR" "$WHOIS_CACHE_DIR"
-exec {LOCK_FD}> "$LOCK"
-flock -n "$LOCK_FD" || { logger -t "$LOG_TAG" "already running, skip"; exit 0; }
-
-command -v whois >/dev/null 2>&1 || { logger -t "$LOG_TAG" "whois not installed, skip"; exit 0; }
-
-# === Dry-run logic: первые 7 дней после установки только логируем ===
-[ -f "$INSTALL_MARKER" ] || date +%s > "$INSTALL_MARKER"
-INSTALL_TIME=$(cat "$INSTALL_MARKER")
-NOW=$(date +%s)
-AGE_DAYS=$(( (NOW - INSTALL_TIME) / 86400 ))
-
-if [ "$AGE_DAYS" -lt "$DRY_RUN_DAYS" ] && [ ! -f "$DRY_RUN_FILE" ]; then
-    DRY_RUN=1
-    logger -t "$LOG_TAG" "DRY-RUN mode (age=${AGE_DAYS}d < ${DRY_RUN_DAYS}d). Will log only, no bans."
-else
-    DRY_RUN=0
-fi
-
-# === 1. Текущие suspect_v4 IPs ===
-SUSPECT=$(nft list set "$NFT_TABLE" suspect_v4 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u)
-[ -z "$SUSPECT" ] && exit 0
-
-# === 2. Группируем по /24, кандидаты — где 3+ /32 ===
-CANDIDATES=$(echo "$SUSPECT" | awk -F. '{print $1"."$2"."$3".0/24"}' | sort | uniq -c | awk '$1>=3 {print $2}')
-[ -z "$CANDIDATES" ] && exit 0
-
-# === 3. Динамический whitelist системных подсетей ===
-
-detect_my_ip() {
-    local ip iface
-    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/{for(i=1;i<=NF;i++)if($i=="src"){print $(i+1);exit}}')
-    [ -n "$ip" ] && { echo "$ip"; return; }
-    iface=$(ip -4 route show default 2>/dev/null | awk '/default/{print $5; exit}')
-    [ -n "$iface" ] && ip=$(ip -4 -o addr show "$iface" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
-    [ -n "$ip" ] && { echo "$ip"; return; }
-    # Public IP fallback (filter out RFC1918/CGNAT)
-    hostname -I 2>/dev/null | tr ' ' '\n' | \
-        grep -vE '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|127\.|169\.254\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)' | \
-        head -1
-}
-MY_IP=$(detect_my_ip)
-
-get_dns_servers() {
-    {
-        grep -hE '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}'
-        resolvectl status 2>/dev/null | awk '/Current DNS Server:|DNS Servers:/ {for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print $i}'
-        [ -r /run/systemd/resolve/resolv.conf ] && grep -hE '^nameserver' /run/systemd/resolve/resolv.conf 2>/dev/null | awk '{print $2}'
-    } | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u
-}
-DNS_SERVERS=$(get_dns_servers)
-
-get_whitelist_24() {
-    [ -n "$MY_IP" ] && echo "$MY_IP" | awk -F. '{print $1"."$2"."$3".0/24"}'
-    ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -vE '^127\.' | awk -F. '{print $1"."$2"."$3".0/24"}'
-    for dns in $DNS_SERVERS; do echo "$dns" | awk -F. '{print $1"."$2"."$3".0/24"}'; done
-    cat <<HARDCODE
-104.16.0.0/12
-172.64.0.0/13
-162.158.0.0/15
-8.8.8.0/24
-8.8.4.0/24
-142.250.0.0/15
-142.251.0.0/16
-17.0.0.0/8
-13.32.0.0/15
-13.64.0.0/11
-13.96.0.0/13
-13.104.0.0/14
-35.180.0.0/14
-35.184.0.0/13
-52.0.0.0/11
-52.32.0.0/11
-52.64.0.0/12
-52.84.0.0/15
-54.144.0.0/12
-54.192.0.0/12
-54.240.0.0/12
-HARDCODE
-}
-WHITELIST_24=$(get_whitelist_24 | sort -u)
-
-is_in_whitelist() {
-    local target="$1"
-    echo "$WHITELIST_24" | python3 -c "
-import sys, ipaddress
-target = ipaddress.ip_network('$target', strict=False)
-for line in sys.stdin:
-    line = line.strip()
-    if not line: continue
-    try:
-        net = ipaddress.ip_network(line, strict=False)
-        if target.subnet_of(net) or net.overlaps(target):
-            sys.exit(0)
-    except Exception:
-        pass
-sys.exit(1)
-" 2>/dev/null
-}
-
-# === Whois с локальным кэшем (24h TTL) ===
-# Защищает от RIPE/ARIN rate-limit (1000 req/h с одного IP).
-# При большом количестве нод за NAT — критично.
-cached_whois() {
-    local ip="$1"
-    local cache_file="$WHOIS_CACHE_DIR/${ip}.cache"
-    local now=$(date +%s)
-    local cache_age=$((24 * 3600))  # 24h TTL
-
-    # Hit: cache существует и свежий
-    if [ -f "$cache_file" ]; then
-        local mtime=$(stat -c %Y "$cache_file" 2>/dev/null || echo 0)
-        if [ $((now - mtime)) -lt $cache_age ]; then
-            cat "$cache_file"
-            return 0
-        fi
-    fi
-
-    # Miss: пробуем Team Cymru (bulk-friendly, без rate limit для разумного использования)
-    local result
-    result=$(timeout 5 whois -h whois.cymru.com " -v $ip" 2>/dev/null | tail -1 | sed 's/^[[:space:]]*//' || true)
-    if [ -n "$result" ] && [ "${result:0:2}" != "AS" ] || [ "${#result}" -gt 20 ]; then
-        # Cymru format: "AS_NUM | IP | BGP_PREFIX | CC | REGISTRY | ALLOCATED | AS_DESCRIPTION"
-        # Берём AS_DESCRIPTION (последнее поле) как "owner"
-        echo "$result" > "$cache_file"
-        echo "$result"
-        return 0
-    fi
-
-    # Fallback: стандартный whois (rate-limited, но точнее)
-    result=$(timeout 5 whois "$ip" 2>/dev/null | grep -iE "^(netname|orgname|org-name|descr|owner|aut-num|organization):" | head -15 || true)
-    if [ -n "$result" ]; then
-        echo "$result" > "$cache_file"
-        echo "$result"
-        return 0
-    fi
-
-    # Total failure — записываем пустой маркер чтобы не долбить whois чаще раза в день
-    echo "WHOIS_UNAVAILABLE" > "$cache_file"
-    echo ""
-    return 1
-}
-
-# === Keywords ===
-DC_KEYWORDS='(DigitalOcean|Linode|Vultr|OVH|Hetzner|Contabo|Choopa|FranTech|BuyVM|HostHatch|Quadranet|Leaseweb|Colocation|Datacenter|VPS|dedicated server|cloud hosting|MEVSPACE|M247|SKYNET NETWORK|Tamatiya|Coreix|SpectraIP|Proton66|FastVPS|Global Internet Solutions|Aeza|MivoCloud|Limestone Networks|HostUS|Webhosting)'
-
-ISP_KEYWORDS='(Telecom|Telecommunications|Communications S\.A|Comunicaciones|Wireless|Broadband|Cable|Internet Provider|Internet Services|Mobile|Cellular|WiFi|DSL|Fiber|FTTH|ISP|Television|CableVision|Telefonica|Vodafone|Orange|Verizon|AT&T|Comcast|Charter|Cox|Spectrum|Telia|Tele2|Bharti Airtel|Reliance|Jio|MTN|Tata|Rostelecom|MegaFon|Beeline|Sonatel|PALTEL|Kazakhtelecom|Globe Telecom|NOS Comunica|Triple T|TOT Public|VNPT|Maroc Telecom|Free SAS|Telstra|One New Zealand|Celcom|Pakistan Telecom|JSC Kazakh|Saudi Telecom|Emirates Internet|Hot-Net|FPT Telecom)'
-
-# === Cache cleanup: удаляем записи старше 7 дней ===
-find "$WHOIS_CACHE_DIR" -type f -mtime +7 -delete 2>/dev/null || true
-
-# === Обработка кандидатов ===
-PROMOTED=0
-SKIPPED_WHITELIST=0
-SKIPPED_ISP=0
-SKIPPED_UNKNOWN=0
-DRY_RUN_LOG=()
-
-for net in $CANDIDATES; do
-    if is_in_whitelist "$net"; then
-        SKIPPED_WHITELIST=$((SKIPPED_WHITELIST + 1))
-        continue
-    fi
-
-    sample_ip=$(echo "$SUSPECT" | grep -F "${net%.0/24}." | head -1)
-    [ -z "$sample_ip" ] && continue
-
-    whois_out=$(cached_whois "$sample_ip")
-
-    if [ -z "$whois_out" ] || [ "$whois_out" = "WHOIS_UNAVAILABLE" ]; then
-        SKIPPED_UNKNOWN=$((SKIPPED_UNKNOWN + 1))
-        logger -t "$LOG_TAG" "skip (no whois data): $net"
-        continue
-    fi
-
-    if echo "$whois_out" | grep -qiE "$ISP_KEYWORDS"; then
-        SKIPPED_ISP=$((SKIPPED_ISP + 1))
-        org_short=$(echo "$whois_out" | head -1 | tr -d '\n' | cut -c1-60)
-        logger -t "$LOG_TAG" "skip ISP: $net ($org_short)"
-        continue
-    fi
-
-    if echo "$whois_out" | grep -qiE "$DC_KEYWORDS"; then
-        org_short=$(echo "$whois_out" | head -1 | tr -d '\n' | cut -c1-60)
-
-        if [ "$DRY_RUN" = "1" ]; then
-            DRY_RUN_LOG+=("$net|$org_short")
-            logger -t "$LOG_TAG" "DRY-RUN would promote: $net ($org_short)"
-        else
-            # Создаём set если не существует
-            nft list set "$NFT_TABLE" "$NFT_SET_DC" >/dev/null 2>&1 || \
-                nft "add set $NFT_TABLE $NFT_SET_DC { type ipv4_addr; flags interval; auto-merge; }" 2>/dev/null
-
-            if nft "add element $NFT_TABLE $NFT_SET_DC { $net }" 2>/dev/null; then
-                PROMOTED=$((PROMOTED + 1))
-                logger -t "$LOG_TAG" "PROMOTED datacenter /24: $net ($org_short)"
-            fi
-        fi
-    else
-        SKIPPED_UNKNOWN=$((SKIPPED_UNKNOWN + 1))
-        org_short=$(echo "$whois_out" | head -1 | tr -d '\n' | cut -c1-60)
-        logger -t "$LOG_TAG" "skip (not DC, not ISP): $net ($org_short)"
-    fi
-done
-
-if [ "$DRY_RUN" = "1" ]; then
-    DRY_COUNT=${#DRY_RUN_LOG[@]}
-    logger -t "$LOG_TAG" "DRY-RUN summary: would_promote=$DRY_COUNT, skip_whitelist=$SKIPPED_WHITELIST, skip_isp=$SKIPPED_ISP, skip_unknown=$SKIPPED_UNKNOWN"
-    logger -t "$LOG_TAG" "DRY-RUN: чтобы включить реальный бан раньше, создай файл: touch $DRY_RUN_FILE"
-else
-    logger -t "$LOG_TAG" "summary: promoted=$PROMOTED, skip_whitelist=$SKIPPED_WHITELIST, skip_isp=$SKIPPED_ISP, skip_unknown=$SKIPPED_UNKNOWN"
-fi
-
-exit 0
-AGGR_SCRIPT_EOF
-
-chmod +x /usr/local/sbin/shieldnode-subnet-aggregator.sh
-
-# Установить whois если нет
-# Установить whois (используется subnet-aggregator).
-# Retry 3 раза с backoff на случай временной недоступности apt mirror.
-if ! command -v whois >/dev/null 2>&1; then
-    for try in 1 2 3; do
-        if apt-get install -y whois >/dev/null 2>&1; then
-            break
-        fi
-        sleep $((try * 2))
-    done
-
-    if ! command -v whois >/dev/null 2>&1; then
-        # Записываем флаг чтобы guard CLI показал warning оператору
-        echo "whois package failed to install ($(date -u +%FT%TZ))" > /var/lib/shieldnode/.whois-missing
-        print_warn "whois install FAILED — subnet aggregator будет skip'ать пока не починишь apt"
-        print_info "  Ручной фикс: sudo apt update && sudo apt install -y whois"
-    else
-        rm -f /var/lib/shieldnode/.whois-missing 2>/dev/null
-    fi
-fi
-
-cat > /etc/systemd/system/shieldnode-subnet-aggregator.service <<'AGGR_UNIT_EOF'
-[Unit]
-Description=Shieldnode /24 datacenter aggregator
-After=shieldnode-nftables.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/shieldnode-subnet-aggregator.sh
-Nice=15
-AGGR_UNIT_EOF
-
-cat > /etc/systemd/system/shieldnode-subnet-aggregator.timer <<'AGGR_TIMER_EOF'
-[Unit]
-Description=Run shieldnode-subnet-aggregator every 30 minutes
-
-[Timer]
-OnBootSec=20min
-OnUnitActiveSec=30min
-RandomizedDelaySec=120
-
-[Install]
-WantedBy=timers.target
-AGGR_TIMER_EOF
-
-systemctl daemon-reload
-systemctl enable shieldnode-subnet-aggregator.timer >/dev/null 2>&1
-systemctl start shieldnode-subnet-aggregator.timer >/dev/null 2>&1
-
-# Создаём nft set если ещё не создан (используется агрегатором)
-nft list set inet ddos_protect datacenter_subnet_bans_v4 >/dev/null 2>&1 || \
-    nft 'add set inet ddos_protect datacenter_subnet_bans_v4 { type ipv4_addr; flags interval; auto-merge; }' 2>/dev/null
-
-# Добавляем drop правило для этого set в prerouting (только если ещё не добавлено)
-if ! nft list chain inet ddos_protect prerouting 2>/dev/null | grep -q "datacenter_subnet_bans_v4"; then
-    # Add rule (без position): порядок не критичен, set lookup идемпотентен.
-    # Если set пуст — правило просто не срабатывает. Если в set появятся /24 —
-    # они будут проверяться вместе с остальными правилами цепочки.
-    nft "add rule inet ddos_protect prerouting ip saddr @datacenter_subnet_bans_v4 counter name datacenter_subnet_drop_v4 drop" 2>/dev/null || \
-        nft "add rule inet ddos_protect prerouting ip saddr @datacenter_subnet_bans_v4 counter drop" 2>/dev/null
-fi
-
-print_ok "Subnet aggregator enabled (каждые 30мин, только datacenter ASN, ISP whitelisted)"
-
-# ==============================================================================
-# ШАГ 12.12: CROWDSEC SCENARIO (v3.23.3) — conn_flood публикация в community
-# ==============================================================================
-
-print_header "ШАГ 12.12: CROWDSEC scenario для conn_flood"
+print_header "ШАГ 12.9: CROWDSEC scenario для conn_flood"
 
 # Локальные conn_flood/syn_flood events публикуются в CrowdSec community blocklist.
 # Twoи данные помогают community, ты получаешь более полный feed.
@@ -8097,7 +7865,7 @@ if [ -d "$CS_SCEN_DIR" ] && [ -f "$EVENTS_LOG_FILE" ]; then
 type: leaky
 name: shieldnode/conn-flood
 description: "Detect chronic conn_flood/syn_flood attackers via shieldnode events"
-filter: "evt.Meta.log_type == 'shieldnode_event' && evt.Meta.event_type in ['SYN-ESCALATE','UDP-ESCALATE','CONN-FLOOD','SYN-FLOOD','UFW-BLOCK']"
+filter: "evt.Meta.log_type == 'shieldnode_event' && evt.Meta.event_type in ['SYN-ESCALATE','UDP-ESCALATE','CONN-FLOOD','SYN-FLOOD']"
 groupby: evt.Meta.source_ip
 distinct: evt.Meta.source_ip
 leakspeed: "10s"
@@ -8124,10 +7892,11 @@ name: shieldnode/events-parser
 description: "Parse shieldnode event log entries"
 nodes:
     - grok:
-        # Покрывает оба формата:
-        #   [TS] SYN-ESCALATE ip=X.X.X.X hits=N
-        #   [TS] UFW-BLOCK ip=X.X.X.X dpt=N hits=N
-        pattern: '^\[%{TIMESTAMP_ISO8601:timestamp}\] %{DATA:event_type} ip=%{IPV4:source_ip}(?: dpt=%{NUMBER:dport})? hits=%{NUMBER:hits}'
+        # Реальный формат:
+        #   [2026-05-24 12:34:56] SYN-ESCALATE ip=1.2.3.4 hits=2000 (...)
+        #   [TS] UFW-BLOCK ip=X.X.X.X dpt=N hits=N (port scan / closed port)
+        # Используем NOTSPACE для event_type (точечный матч без жадности).
+        pattern: '^\[%{TIMESTAMP_ISO8601:timestamp}\] %{NOTSPACE:event_type} ip=%{IPV4:source_ip}(?: dpt=%{NUMBER:dport})? hits=%{NUMBER:hits}'
         apply_on: message
       statics:
         - meta: log_type
