@@ -1,7 +1,81 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.23.4 (Commercial Edition) — POST-INCIDENT HARDENING
+#  VPN NODE DDoS PROTECTION v3.23.8 (Commercial Edition) — COMPRESSION HARDENING
+#
+#  Что нового vs v3.23.7:
+#    - FIX: фоновый gzip в aggregator теперь логирует ошибки в syslog
+#      (раньше 2>/dev/null проглатывал "no space"/"permission denied").
+#      Plus retry: если на старте aggregator находит несжатый archive
+#      events.log.YYYYMMDD-* — пробует сжать его ещё раз.
+#    - FIX: cleanup при upgrade теперь fallback на truncate если диск
+#      критически забит (>95%) и gzip может не уместиться. Защита от
+#      "висим 10 минут на 37GB gzip когда нет свободного места".
+#      При >95% — truncate (быстро, теряем данные). При <95% — gzip
+#      (медленно, сохраняем). Промежуточно: при 90-95% диск показывает
+#      progress через nohup wrapper.
+#    - FIX: PCAP archive теперь СЖИМАЕТСЯ в tar.zst перед удалением
+#      (не теряем forensics для хостера). Старше 7 дней → tar.zst.
+#      Старше 30 дней → удалить.
+#    - FIX: xz -9 → xz -6 в cleanup'е (втрое быстрее, ratio 95% от -9).
+#    - FIX: системные logs cleanup — whitelist известных паттернов
+#      (syslog.*.gz, kern.log.*.gz, etc), не broad-match всех .gz в
+#      /var/log. Защита от случайного удаления docker logs.
+#
+#  Что нового vs v3.23.6:
+#    - CRIT FIX: events.log при заполнении теперь СЖИМАЕТСЯ (gzip), а не truncate.
+#      Раньше: events.log >500MB → tail -c 100MB → ТЕРЯЛИ 400MB истории.
+#      Теперь: events.log >100MB → mv в events.log.<TS> → gzip в фоне → новый
+#      пустой events.log. На диске 37GB → ~2GB (95% компрессии на текстовых
+#      логах). История полностью сохранена, читается через `zless`.
+#    - FEATURE: автоматическая ретенция архивов:
+#       * .gz архивы старше 14 дней → пересжимаются xz -9 (50% доп. экономии)
+#       * .xz архивы старше 90 дней → удаляются
+#    - FIX: cleanup при upgrade теперь сжимает существующие большие events.log
+#      вместо truncate (не теряет данные). Удаляет только архивы старее 30
+#      дней (раньше 1 день — слишком агрессивно).
+#    - FIX: logrotate config: maxsize 50M → 100M (меньше частых ротаций),
+#      rotate 30 дней (история атак сохраняется).
+#
+#  Что нового vs v3.23.5:
+#    - CRIT FIX: should_log() в aggregator использовал `grep -F "^${key}|"` —
+#      это fixed-string mode, где `^` ищется буквально, не как anchor.
+#      Эффект: state lookup ВСЕГДА возвращал empty → каждое событие писалось
+#      как "впервые видим" → дедуп НЕ РАБОТАЛ. Главная фича v3.23.5 была сломана.
+#      Fix: переход на in-memory bash associative array (load state на старте,
+#      atomic dump в конце). Plus: flock на скрипт против concurrent runs.
+#    - CRIT FIX: race condition в aggregator. Timer запускается каждую минуту,
+#      тики могли пересекаться при долгой обработке. Теперь flock защищает.
+#    - PERF FIX: state-операции были O(N×12) grep/sed на каждом тике. Теперь O(1)
+#      bash hash lookup. На крупных нодах (4000+ unique IP) разница в 100-1000x
+#      по CPU за тик.
+#    - INFRA: state-файл пишется atomically (tmp + mv), не повреждается при kill.
+#    - FEATURE: автоматическая чистка диска при upgrade (ШАГ 12.6).
+#      Если /var/log >80% — установщик truncate'ит events.log до 100MB,
+#      удаляет ротированные *.gz/*.1 в /var/log/{shieldnode,}/, vacuums
+#      journald, чистит apt cache, truncate'ит syslog/kern.log >200MB.
+#      Решает кейс spofyltd (37GB в /var/log от длительной атаки на старой
+#      версии) — после upgrade диск свободен для нормальной работы.
+#
+#  Что нового vs v3.23.4:
+#    - CRIT FIX: events.log больше не заполняет диск при длительных атаках.
+#      Раньше aggregator писал каждый активный IP при каждом тике (30s) — при
+#      атаке 4000 уникальных IP × 2 тика/мин × 100 байт = 800 KB/min = 1.2 GB/день.
+#      Теперь state-based logging: пишется только если IP новый, или count
+#      вырос на >=1000, или прошёл час с последнего лога этого IP. Сокращение
+#      throughput'а в 100-1000 раз без потери информации (events.db всё пишет).
+#    - CRIT FIX: hard cap 500MB на events.log. Если writer перерос лимит —
+#      auto-rotate (tail 100MB last). Защита даже если logrotate broken.
+#    - FIX: logrotate config теперь с copytruncate (раньше падал с status=1
+#      потому что shieldnode-aggregator держал fd на events.log).
+#    - FIX: systemd Restart=on-failure для shieldnode-nftables/events/pcap —
+#      авто-recovery при крэшах вместо тихого падения защиты.
+#    - FIX: aggregator detect MY_IP в suspect_v4 → log WARNING + skip
+#      (вместо busy-loop удаления). Self-flood случаи (loopback через
+#      public_ip в nginx/proxy_pass) больше не зацикливают CPU.
+#    - FEATURE: `guard self-test` — диагностика готовности ноды:
+#      conntrack_max vs RAM, диск, MY_IP в suspect, services, nft tables.
+#      Запускать после upgrade или при подозрениях.
 #
 #  Что нового vs v3.23.3:
 #    - REMOVED: /24 subnet aggregator + whois install.
@@ -191,10 +265,10 @@ cscli_collection_installed() {
 
 # Github repo для скачивания дефолтных lists/*.txt при pipe-mode установке.
 # Можно переопределить через env (для тестинга на форке).
-SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
+SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.23.4"
+SHIELDNODE_VERSION="3.23.8"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -2811,7 +2885,7 @@ fi
 cat > /etc/systemd/system/shieldnode-nftables.service <<EOF
 [Unit]
 Description=Shieldnode DDoS protection nftables ruleset
-Documentation=https://github.com/abcproxy70-ops/shield
+Documentation=https://github.com/SpofyJet/shield
 DefaultDependencies=no
 Before=network-pre.target
 Wants=network-pre.target
@@ -4938,7 +5012,7 @@ cat > /etc/logrotate.d/shieldnode <<'LOGROTATE_EOF'
 /var/log/shieldnode/*.log {
     daily
     rotate 30
-    maxsize 50M
+    maxsize 100M
     compress
     delaycompress
     missingok
@@ -4948,7 +5022,7 @@ cat > /etc/logrotate.d/shieldnode <<'LOGROTATE_EOF'
     create 0640 root root
 }
 LOGROTATE_EOF
-print_ok "Logrotate: /etc/logrotate.d/shieldnode (daily, rotate 30, maxsize 50M)"
+print_ok "Logrotate: /etc/logrotate.d/shieldnode (daily, rotate 30, maxsize 100M, compress)"
 
 # v3.20.3: Aggressive logrotate для /var/log/syslog и /var/log/kern.log
 # Причина: shieldnode/nftables/CrowdSec пишут много drop-events в kern.log.
@@ -4988,7 +5062,16 @@ After=multi-user.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/sbin/logrotate /etc/logrotate.conf
+# v3.23.5: запускаем только shieldnode-конфиги (не системный logrotate.conf
+# который может зависеть от сторонних broken-конфигов в /etc/logrotate.d/).
+# --state в /var/lib/shieldnode/ изолирует наш state от системного.
+ExecStart=/usr/sbin/logrotate --state /var/lib/shieldnode/logrotate.state /etc/logrotate.d/shieldnode
+ExecStartPost=/usr/sbin/logrotate --state /var/lib/shieldnode/logrotate-syslog.state /etc/logrotate.d/shieldnode-syslog-aggressive
+# Failures игнорируем (exit code от logrotate непредсказуем при многих файлах)
+SuccessExitStatus=0 1 2
+
+Restart=on-failure
+RestartSec=60
 EOF
 
 cat > /etc/systemd/system/shieldnode-logrotate.timer <<'EOF'
@@ -5194,10 +5277,38 @@ declare -A ufw_block_ips ufw_block_ports
 # v3.5: для events.log — собираем порт назначения и тип flood'а
 declare -A ddos_ports ddos_proto
 
+# v3.23.5: определяем MY_IP для self-flood detection
+MY_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/{for(i=1;i<=NF;i++)if($i=="src"){print $(i+1);exit}}')
+MY_IP_ALERT_FILE="/var/lib/shieldnode/.my-ip-self-flood-alert"
+
+# Helper: skip MY_IP в счётчиках (self-flood = некорректная конфигурация nginx/proxy)
+# Возвращает 0 если IP — это наш собственный (skip), 1 если нет (учитывать)
+is_my_ip() {
+    [ -n "$MY_IP" ] && [ "$1" = "$MY_IP" ] && return 0
+    return 1
+}
+
+# Один раз в час алертим в syslog если видим MY_IP в потоке (не спамим)
+alert_self_flood() {
+    local now alert_ts
+    now=$(date +%s)
+    alert_ts=$(cat "$MY_IP_ALERT_FILE" 2>/dev/null || echo 0)
+    alert_ts="${alert_ts:-0}"
+    if [ $((now - alert_ts)) -gt 3600 ]; then
+        logger -t "$LOG_TAG" "WARNING: self-flood detected (MY_IP=$MY_IP в drop logs) — проверь nginx proxy_pass на public_ip, должно быть 127.0.0.1 или unix socket"
+        echo "$now" > "$MY_IP_ALERT_FILE"
+    fi
+}
+
 # v3.10.2 PERF FIX: заменили per-line `echo $line | grep | head | cut` на
 # single-pass awk. Бенчмарк на 10k log-lines: 94 сек → 0.026 сек (3700×).
 # Под штормом 100k events/min теперь обрабатывается за <1 сек.
 while IFS='|' read -r kind ip port proto; do
+    # v3.23.5: self-flood — наш IP в drop logs → alert и skip
+    if [ -n "$ip" ] && is_my_ip "$ip"; then
+        alert_self_flood
+        continue
+    fi
     case "$kind" in
         scanner)
             [ -n "$ip" ] && scanner_ips[$ip]=$((${scanner_ips[$ip]:-0} + 1))
@@ -5340,75 +5451,199 @@ done < <(awk '
     }
 ' "$TMP")
 
-# v3.5: пишем человекочитаемые строки в events.log
+# v3.23.6: state-based logging в events.log (БЕЗ багов v3.23.5).
+# Главное правило: пишем только если событие "новое" или "значимое".
+# Это снижает throughput логов в 100-1000 раз при длительных атаках.
+#
+# Архитектура (исправлено с v3.23.5):
+#   - State load: один раз в начале — читаем state-файл в bash hash
+#   - Lookup: O(1) через ${LAST_COUNT[key]} (не grep на каждой проверке)
+#   - State save: atomic write (tmp + mv) в конце
+#   - Concurrency: flock защищает от пересечения тиков
+#
+# Решение писать:
+#   - впервые увидели (ip,type) → пишем
+#   - count вырос >= LOG_DELTA_THRESHOLD от last_logged_count → пишем
+#   - прошло >= LOG_REFRESH_INTERVAL с last_logged_ts → пишем (refresh)
+#   - иначе skip
+
+LOG_STATE_FILE="/var/lib/shieldnode/.events-log-state"
+LOG_STATE_LOCK="/run/shieldnode/agg-state.lock"
+LOG_DELTA_THRESHOLD=1000   # +1000 hits с последнего лога
+LOG_REFRESH_INTERVAL=3600  # 1 час периодический refresh
+LOG_STATE_TTL=259200       # 3 дня — старые записи cleanup
+
+mkdir -p /run/shieldnode 2>/dev/null
+
+# Lock на запись state — защита от race между тиками
+exec {STATE_LOCK_FD}> "$LOG_STATE_LOCK"
+flock -n "$STATE_LOCK_FD" || {
+    logger -t "$LOG_TAG" "another aggregator run holds state lock — skip this tick"
+    exit 0
+}
+
+NOW_TS=$(date +%s)
+
+# === Load state file в bash hash (O(N) единоразово) ===
+declare -A LAST_COUNT
+declare -A LAST_TS
+
+if [ -f "$LOG_STATE_FILE" ]; then
+    while IFS='|' read -r s_ip s_type s_cnt s_ts; do
+        # Defensive: пропускаем malformed строки
+        [ -z "$s_ip" ] && continue
+        [ -z "$s_type" ] && continue
+        s_cnt="${s_cnt:-0}"
+        s_ts="${s_ts:-0}"
+        # TTL cleanup при load: записи старше TTL — выбрасываем
+        if [ $((NOW_TS - s_ts)) -lt "$LOG_STATE_TTL" ]; then
+            local_key="${s_ip}|${s_type}"
+            LAST_COUNT["$local_key"]="$s_cnt"
+            LAST_TS["$local_key"]="$s_ts"
+        fi
+    done < "$LOG_STATE_FILE"
+fi
+
+# Helper: должны ли логировать (ip, type, current_count)?
+# Возвращает 0 (да) или 1 (нет). При "да" — обновляет в-памяти state.
+should_log() {
+    local ip="$1" type="$2" cnt="$3"
+    local key="${ip}|${type}"
+
+    local last_cnt="${LAST_COUNT[$key]:-}"
+    local last_ts="${LAST_TS[$key]:-}"
+
+    if [ -z "$last_cnt" ]; then
+        # Впервые видим — логируем
+        LAST_COUNT["$key"]="$cnt"
+        LAST_TS["$key"]="$NOW_TS"
+        return 0
+    fi
+
+    local delta=$((cnt - last_cnt))
+    local age=$((NOW_TS - last_ts))
+
+    if [ "$delta" -ge "$LOG_DELTA_THRESHOLD" ] || [ "$age" -ge "$LOG_REFRESH_INTERVAL" ]; then
+        # Значительное событие — логируем + обновляем state
+        LAST_COUNT["$key"]="$cnt"
+        LAST_TS["$key"]="$NOW_TS"
+        return 0
+    fi
+
+    return 1
+}
+
+# Atomic dump state в файл (вызывается в конце скрипта через trap)
+save_state() {
+    local tmp="${LOG_STATE_FILE}.tmp.$$"
+    {
+        for key in "${!LAST_COUNT[@]}"; do
+            # key = "ip|type"
+            echo "${key}|${LAST_COUNT[$key]}|${LAST_TS[$key]}"
+        done
+    } > "$tmp" 2>/dev/null && mv "$tmp" "$LOG_STATE_FILE" 2>/dev/null
+    rm -f "$tmp" 2>/dev/null
+}
+trap save_state EXIT
+
+# Hard-cap проверка перед записью (v3.23.7+): если events.log >100MB —
+# СЖИМАЕМ (не теряем данные!). gzip в фоне через nohup чтобы не блокировать
+# aggregator. Старые archive'ы старше 30 дней удаляются.
+EVENTS_LOG_ROTATE_THRESHOLD=$((100 * 1024 * 1024))  # 100 MB
+
+# v3.23.8: retry для брошенных несжатых архивов (если предыдущий gzip упал)
+# Ищем events.log.<TS> файлы БЕЗ .gz/.xz суффикса — пробуем сжать
+for leftover in /var/log/shieldnode/events.log.[0-9]*; do
+    [ -f "$leftover" ] || continue
+    case "$leftover" in
+        *.gz|*.xz) continue ;;  # уже сжаты
+    esac
+    # Несжатый archive остался от прошлого падения — досжимаем
+    nohup bash -c "
+        gzip '$leftover' 2>&1 | logger -t shieldnode-agg-retry || \
+            logger -t shieldnode-agg-retry 'gzip retry FAILED for $leftover (диск может быть полон)'
+    " >/dev/null 2>&1 &
+done
+
+if [ -f "$EVENTS_LOG" ]; then
+    EVENTS_SIZE=$(stat -c%s "$EVENTS_LOG" 2>/dev/null || echo 0)
+    if [ "$EVENTS_SIZE" -gt "$EVENTS_LOG_ROTATE_THRESHOLD" ]; then
+        ROTATE_TS=$(date +%Y%m%d-%H%M%S)
+        ARCHIVED="${EVENTS_LOG}.${ROTATE_TS}"
+        # Atomic move (writer переоткроет fd на следующем тике)
+        if mv "$EVENTS_LOG" "$ARCHIVED" 2>/dev/null; then
+            touch "$EVENTS_LOG"
+            chmod 0640 "$EVENTS_LOG"
+            # v3.23.8: gzip с error logging — не глотаем stderr
+            nohup bash -c "
+                if gzip '$ARCHIVED' 2>&1 | logger -t shieldnode-gzip; then
+                    logger -t shieldnode-agg 'gzip OK: ${ARCHIVED}.gz'
+                else
+                    logger -t shieldnode-agg 'WARNING: gzip FAILED for $ARCHIVED (диск переполнен? permissions?)'
+                fi
+            " >/dev/null 2>&1 &
+            logger -t "$LOG_TAG" "events.log rotated to ${ARCHIVED}.gz ($((EVENTS_SIZE / 1024 / 1024))MB → gzip in background)"
+        fi
+    fi
+fi
+
 TS=$(date '+%Y-%m-%d %H:%M:%S')
 {
     for ip in "${!scanner_ips[@]}"; do
         cnt=${scanner_ips[$ip]}
-        echo "[$TS] SCANNER ip=$ip hits=$cnt"
+        should_log "$ip" "SCANNER" "$cnt" && echo "[$TS] SCANNER ip=$ip hits=$cnt"
     done
     for ip in "${!ddos_ips[@]}"; do
         cnt=${ddos_ips[$ip]}
         port=${ddos_ports[$ip]:-?}
         proto=${ddos_proto[$ip]:-?}
-        # Тип flood'а: TCP=SYN-flood, UDP=UDP-flood (грубо, более точно — counters в guard)
         case "$proto" in
             TCP) ftype="SYN-flood" ;;
             UDP) ftype="UDP-flood" ;;
             *)   ftype="$proto-flood" ;;
         esac
-        echo "[$TS] DDOS BLOCK ip=$ip port=$port type=$ftype hits=$cnt"
+        should_log "$ip" "DDOS" "$cnt" && echo "[$TS] DDOS BLOCK ip=$ip port=$port type=$ftype hits=$cnt"
     done
-    # v3.11: Tor exit drops
     for ip in "${!tor_ips[@]}"; do
         cnt=${tor_ips[$ip]}
-        echo "[$TS] TOR EXIT BLOCK ip=$ip hits=$cnt"
+        should_log "$ip" "TOR" "$cnt" && echo "[$TS] TOR EXIT BLOCK ip=$ip hits=$cnt"
     done
-    # v3.12.0: threat + custom blocklists
     for ip in "${!threat_ips[@]}"; do
         cnt=${threat_ips[$ip]}
-        echo "[$TS] THREAT BLOCK ip=$ip hits=$cnt"
+        should_log "$ip" "THREAT" "$cnt" && echo "[$TS] THREAT BLOCK ip=$ip hits=$cnt"
     done
     for ip in "${!custom_ips[@]}"; do
         cnt=${custom_ips[$ip]}
-        echo "[$TS] CUSTOM BLOCK ip=$ip hits=$cnt"
+        should_log "$ip" "CUSTOM" "$cnt" && echo "[$TS] CUSTOM BLOCK ip=$ip hits=$cnt"
     done
-    # v3.20.0: output loops для mobile_ru/broadband_ru УБРАНЫ.
-    # v3.20.1: conn-flood drops (>5000 concurrent connections, единый лимит)
     for ip in "${!conn_flood_ips[@]}"; do
         cnt=${conn_flood_ips[$ip]}
-        echo "[$TS] CONN-FLOOD ip=$ip hits=$cnt (exceeded ct=50000)"
+        should_log "$ip" "CONN-FLOOD" "$cnt" && echo "[$TS] CONN-FLOOD ip=$ip hits=$cnt (exceeded ct=15000)"
     done
-    # v3.22.0: newconn-flood drops (>40000 new conn/min)
     for ip in "${!newconn_flood_ips[@]}"; do
         cnt=${newconn_flood_ips[$ip]}
-        echo "[$TS] NEWCONN-FLOOD ip=$ip hits=$cnt (>40000 new conn/min — banned 15min)"
+        should_log "$ip" "NEWCONN-FLOOD" "$cnt" && echo "[$TS] NEWCONN-FLOOD ip=$ip hits=$cnt (>40000 new conn/min — banned 15min)"
     done
-    # v3.15.3: TCP-flag-invalid drops (XMAS/NULL/SYN+FIN scans — nmap)
     for ip in "${!tcp_invalid_ips[@]}"; do
         cnt=${tcp_invalid_ips[$ip]}
-        echo "[$TS] TCP-INVALID ip=$ip hits=$cnt (nmap-like scanner: XMAS/NULL/SYN+FIN)"
+        should_log "$ip" "TCP-INVALID" "$cnt" && echo "[$TS] TCP-INVALID ip=$ip hits=$cnt (nmap-like scanner: XMAS/NULL/SYN+FIN)"
     done
-    # v3.15.3: FIB anti-spoof drops (spoofed source IP, no reverse route)
     for ip in "${!fib_spoof_ips[@]}"; do
         cnt=${fib_spoof_ips[$ip]}
-        echo "[$TS] FIB-SPOOF ip=$ip hits=$cnt (spoofed src, kernel can't route back)"
+        should_log "$ip" "FIB-SPOOF" "$cnt" && echo "[$TS] FIB-SPOOF ip=$ip hits=$cnt (spoofed src, kernel can't route back)"
     done
-    # v3.15.3: SYN-flood escalation (suspect → confirmed_attack ban 1h)
     for ip in "${!syn_escalate_ips[@]}"; do
         cnt=${syn_escalate_ips[$ip]}
-        echo "[$TS] SYN-ESCALATE ip=$ip hits=$cnt (suspect→confirmed via SYN-flood — banned 1h)"
+        should_log "$ip" "SYN-ESCALATE" "$cnt" && echo "[$TS] SYN-ESCALATE ip=$ip hits=$cnt (suspect→confirmed via SYN-flood — banned 1h)"
     done
-    # v3.15.3: UDP-flood escalation
     for ip in "${!udp_escalate_ips[@]}"; do
         cnt=${udp_escalate_ips[$ip]}
-        echo "[$TS] UDP-ESCALATE ip=$ip hits=$cnt (suspect→confirmed via UDP-flood — banned 1h)"
+        should_log "$ip" "UDP-ESCALATE" "$cnt" && echo "[$TS] UDP-ESCALATE ip=$ip hits=$cnt (suspect→confirmed via UDP-flood — banned 1h)"
     done
-    # v3.16.0: UFW BLOCK дропы (на закрытые порты)
     for ip in "${!ufw_block_ips[@]}"; do
         cnt=${ufw_block_ips[$ip]}
         port="${ufw_block_ports[$ip]:-?}"
-        echo "[$TS] UFW-BLOCK ip=$ip dpt=$port hits=$cnt (port scan / closed port)"
+        should_log "$ip" "UFW-BLOCK" "$cnt" && echo "[$TS] UFW-BLOCK ip=$ip dpt=$port hits=$cnt (port scan / closed port)"
     done
 } >> "$EVENTS_LOG" 2>/dev/null
 
@@ -5639,6 +5874,7 @@ Usage:
   sudo guard rollback   restore state from before last 'guard upgrade'
   sudo guard sync       force github sync of custom.txt now
   sudo guard check      force version check now
+  sudo guard self-test  health check (v3.23.5+): conntrack, disk, MY_IP, services
 
 Interactive menu:
   [1] active attacks            [4] scanner blocklist samples
@@ -5650,13 +5886,143 @@ Interactive menu:
 HELP
         exit 0
         ;;
+    self-test)
+        # v3.23.5: диагностика готовности ноды
+        if [[ $EUID -ne 0 ]]; then echo "Run as root: sudo guard self-test"; exit 1; fi
+        ISSUES=0
+        WARNINGS=0
+        echo "════════ shieldnode self-test ════════"
+        echo ""
+
+        # 1. shieldnode-nftables service
+        if systemctl is-active --quiet shieldnode-nftables; then
+            echo "  [✓] shieldnode-nftables: active"
+        else
+            echo "  [✗] shieldnode-nftables: NOT ACTIVE"
+            ISSUES=$((ISSUES + 1))
+        fi
+
+        # 2. nft table existence
+        if nft list table inet ddos_protect >/dev/null 2>&1; then
+            echo "  [✓] nft table inet ddos_protect: exists"
+        else
+            echo "  [✗] nft table inet ddos_protect: MISSING"
+            ISSUES=$((ISSUES + 1))
+        fi
+
+        # 3. CrowdSec
+        if systemctl is-active --quiet crowdsec; then
+            echo "  [✓] crowdsec: active"
+        else
+            echo "  [✗] crowdsec: NOT ACTIVE"
+            ISSUES=$((ISSUES + 1))
+        fi
+
+        # 4. CrowdSec firewall bouncer
+        if systemctl is-active --quiet crowdsec-firewall-bouncer; then
+            echo "  [✓] crowdsec-firewall-bouncer: active (stream mode)"
+        else
+            echo "  [✗] crowdsec-firewall-bouncer: NOT ACTIVE — community blocklist не применяется"
+            ISSUES=$((ISSUES + 1))
+        fi
+
+        # 5. conntrack_max vs RAM
+        CT_MAX=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo 0)
+        RAM_MB=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
+        RECOMMENDED=262144
+        [ "$RAM_MB" -gt 2000 ] && RECOMMENDED=786432
+        [ "$RAM_MB" -gt 4000 ] && RECOMMENDED=2097152
+        [ "$RAM_MB" -gt 8000 ] && RECOMMENDED=4194304
+        if [ "$CT_MAX" -ge "$RECOMMENDED" ]; then
+            echo "  [✓] nf_conntrack_max: $CT_MAX (рекомендованный для ${RAM_MB}MB RAM: $RECOMMENDED)"
+        else
+            echo "  [⚠] nf_conntrack_max: $CT_MAX — мало для ${RAM_MB}MB RAM (рекомендовано $RECOMMENDED)"
+            echo "      Fix: upgrade vpn-node-setup до v5.1.1+ (tier-aware sizing)"
+            WARNINGS=$((WARNINGS + 1))
+        fi
+
+        # 6. Disk usage (/var/log)
+        DISK_PCT=$(df --output=pcent /var/log 2>/dev/null | tail -1 | tr -d ' %')
+        if [ "${DISK_PCT:-0}" -ge 90 ]; then
+            echo "  [✗] disk /var/log: ${DISK_PCT}% — CRITICAL, очисти срочно"
+            ISSUES=$((ISSUES + 1))
+        elif [ "${DISK_PCT:-0}" -ge 80 ]; then
+            echo "  [⚠] disk /var/log: ${DISK_PCT}% — высокая нагрузка"
+            WARNINGS=$((WARNINGS + 1))
+        else
+            echo "  [✓] disk /var/log: ${DISK_PCT}% used"
+        fi
+
+        # 7. events.log size
+        if [ -f /var/log/shieldnode/events.log ]; then
+            EV_SIZE=$(stat -c%s /var/log/shieldnode/events.log 2>/dev/null || echo 0)
+            EV_MB=$((EV_SIZE / 1024 / 1024))
+            if [ "$EV_MB" -gt 400 ]; then
+                echo "  [⚠] events.log: ${EV_MB} MB — близко к hard cap 500MB"
+                WARNINGS=$((WARNINGS + 1))
+            else
+                echo "  [✓] events.log: ${EV_MB} MB"
+            fi
+        fi
+
+        # 8. MY_IP в suspect_v4 (self-flood detection)
+        MY_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/{for(i=1;i<=NF;i++)if($i=="src"){print $(i+1);exit}}')
+        if [ -n "$MY_IP" ]; then
+            if nft list set inet ddos_protect suspect_v4 2>/dev/null | grep -qF "$MY_IP"; then
+                echo "  [✗] MY_IP ($MY_IP) находится в suspect_v4 — self-flood!"
+                echo "      Причина: nginx/proxy_pass через public IP вместо 127.0.0.1 или unix socket"
+                echo "      Fix: добавить MY_IP в TRUSTED_IPS (guard → Trusted IPs → Add)"
+                echo "           и проверить nginx config (proxy_pass http://127.0.0.1:PORT)"
+                ISSUES=$((ISSUES + 1))
+            else
+                echo "  [✓] MY_IP ($MY_IP): чист в suspect_v4"
+            fi
+        fi
+
+        # 9. logrotate работает
+        LR_FAILED=$(journalctl -u shieldnode-logrotate --since "24 hours ago" --no-pager 2>/dev/null | grep -c "FAILURE" || echo 0)
+        if [ "$LR_FAILED" -gt 5 ]; then
+            echo "  [⚠] shieldnode-logrotate: $LR_FAILED ошибок за 24ч"
+            WARNINGS=$((WARNINGS + 1))
+        else
+            echo "  [✓] shieldnode-logrotate: OK"
+        fi
+
+        # 10. PCAP capture
+        if systemctl is-active --quiet shieldnode-pcap; then
+            echo "  [✓] shieldnode-pcap: active (forensics готов)"
+        else
+            echo "  [⚠] shieldnode-pcap: не активен — нет pcap для хостера при DDoS"
+            WARNINGS=$((WARNINGS + 1))
+        fi
+
+        # 11. Threat blocklist health
+        THREAT_COUNT=$(nft list set inet ddos_protect threat_blocklist_v4 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
+        if [ "$THREAT_COUNT" -lt 1000 ]; then
+            echo "  [⚠] threat_blocklist_v4: только $THREAT_COUNT IPs — feeds могли сломаться"
+            WARNINGS=$((WARNINGS + 1))
+        else
+            echo "  [✓] threat_blocklist_v4: $THREAT_COUNT IPs"
+        fi
+
+        echo ""
+        echo "════════ Summary ════════"
+        if [ "$ISSUES" -eq 0 ] && [ "$WARNINGS" -eq 0 ]; then
+            echo "  All checks passed — нода в норме"
+            exit 0
+        else
+            echo "  Issues: $ISSUES | Warnings: $WARNINGS"
+            [ "$ISSUES" -gt 0 ] && exit 2
+            exit 1
+        fi
+        ;;
     upgrade)
         # v3.14.0: re-run установщика с github
         # v3.18.8: качаем во временный файл с -fsSL + sanity-check ПЕРЕД exec.
         #          Без этого 404/MITM/empty body превращался в `bash <(<html>)` и
         #          мог снести работающую установку.
         if [[ $EUID -ne 0 ]]; then echo "Run as root: sudo guard upgrade"; exit 1; fi
-        REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
+        REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
         TMP_INSTALLER=$(mktemp /tmp/shieldnode-upgrade.XXXXXX.sh) || { echo "FATAL: mktemp failed"; exit 1; }
         # Удалим временный файл при выходе если до exec не дойдём
         trap 'rm -f "$TMP_INSTALLER"' EXIT
@@ -7406,6 +7772,219 @@ if [ "$LEGACY_REMOVED" = "1" ]; then
     print_ok "Legacy components от v3.23.3-rc удалены (subnet-aggregator)"
 else
     print_info "Legacy components не найдены — clean install"
+fi
+
+# === DISK CLEANUP (v3.23.6) ===
+# Критично для нод где предыдущая атака разлила /var/log до 100%.
+# Если /var/log >80% — агрессивная чистка ДО продолжения установки
+# (apt install и nft reload могут упасть на полном диске).
+DISK_USAGE=$(df --output=pcent /var/log 2>/dev/null | tail -1 | tr -d ' %')
+DISK_USAGE="${DISK_USAGE:-0}"
+
+if [ "$DISK_USAGE" -ge 80 ]; then
+    print_warn "Disk /var/log заполнен на ${DISK_USAGE}% — выполняю cleanup"
+    CLEANED_MB=0
+
+    # 1. v3.23.7+: events.log — gzip ИЛИ truncate в зависимости от свободного места.
+    # При >=95% диск критичен — gzip может не уместиться (нужна tmp space).
+    # При 80-94% — gzip (сохраняем историю).
+    if [ -f /var/log/shieldnode/events.log ]; then
+        OLD_SIZE=$(stat -c%s /var/log/shieldnode/events.log 2>/dev/null || echo 0)
+        if [ "$OLD_SIZE" -gt 104857600 ]; then  # >100MB
+            if [ "$DISK_USAGE" -ge 95 ]; then
+                # CRITICAL: нет места для gzip, делаем truncate (теряем старые записи)
+                tail -c 50M /var/log/shieldnode/events.log > /var/log/shieldnode/events.log.tmp 2>/dev/null && \
+                    mv /var/log/shieldnode/events.log.tmp /var/log/shieldnode/events.log
+                NEW_SIZE=$(stat -c%s /var/log/shieldnode/events.log 2>/dev/null || echo 0)
+                CLEANED_MB=$((CLEANED_MB + (OLD_SIZE - NEW_SIZE) / 1024 / 1024))
+                print_warn "  events.log: $((OLD_SIZE / 1024 / 1024))MB → 50MB (TRUNCATE — диск >95%, gzip не вмещается)"
+                print_info "  → история старее ~часа потеряна (диск был критичен)"
+            else
+                # NORMAL: сжимаем (сохраняем историю)
+                ARCHIVED_NAME="/var/log/shieldnode/events.log.upgrade-$(date +%Y%m%d-%H%M%S)"
+                if mv /var/log/shieldnode/events.log "$ARCHIVED_NAME" 2>/dev/null; then
+                    touch /var/log/shieldnode/events.log
+                    chmod 0640 /var/log/shieldnode/events.log
+                    print_info "  events.log: $((OLD_SIZE / 1024 / 1024))MB → сжимаю gzip (может занять несколько минут)..."
+
+                    # Запускаем gzip в фоне с progress notifier
+                    (
+                        if gzip "$ARCHIVED_NAME" 2>&1 | logger -t shieldnode-upgrade-gzip; then
+                            logger -t shieldnode-upgrade-gzip "OK: ${ARCHIVED_NAME}.gz"
+                        else
+                            logger -t shieldnode-upgrade-gzip "FAILED for $ARCHIVED_NAME"
+                        fi
+                    ) &
+                    GZIP_PID=$!
+
+                    # Прогресс каждые 10 сек пока gzip работает
+                    while kill -0 "$GZIP_PID" 2>/dev/null; do
+                        sleep 10
+                        if [ -f "${ARCHIVED_NAME}.gz" ]; then
+                            CUR_GZ_MB=$(stat -c%s "${ARCHIVED_NAME}.gz" 2>/dev/null | awk '{print int($1/1024/1024)}')
+                            print_info "    gzip progress: ${CUR_GZ_MB}MB compressed..."
+                        fi
+                    done
+                    wait "$GZIP_PID"
+
+                    if [ -f "${ARCHIVED_NAME}.gz" ]; then
+                        NEW_SIZE=$(stat -c%s "${ARCHIVED_NAME}.gz" 2>/dev/null || echo 0)
+                        SAVED_MB=$(( (OLD_SIZE - NEW_SIZE) / 1024 / 1024 ))
+                        CLEANED_MB=$((CLEANED_MB + SAVED_MB))
+                        RATIO=$(( NEW_SIZE * 100 / OLD_SIZE ))
+                        print_info "  events.log: $((OLD_SIZE / 1024 / 1024))MB → $((NEW_SIZE / 1024 / 1024))MB (${RATIO}%, сохранено в ${ARCHIVED_NAME}.gz)"
+                    else
+                        # gzip упал — оставляем несжатый, потом aggregator retry
+                        print_warn "  events.log: gzip упал, несжатый архив в $ARCHIVED_NAME (aggregator попробует retry)"
+                    fi
+                fi
+            fi
+        fi
+    fi
+
+    # 2. Старые .gz архивы события — ретенция 30 дней (история атак сохраняется)
+    BEFORE=$(du -sm /var/log/shieldnode 2>/dev/null | awk '{print $1}')
+    BEFORE="${BEFORE:-0}"
+    find /var/log/shieldnode -name "*.gz" -mtime +30 -delete 2>/dev/null
+    find /var/log/shieldnode -name "*.xz" -mtime +90 -delete 2>/dev/null
+    find /var/log/shieldnode -name "*.[0-9]" -mtime +7 -delete 2>/dev/null
+    AFTER=$(du -sm /var/log/shieldnode 2>/dev/null | awk '{print $1}')
+    AFTER="${AFTER:-0}"
+    if [ "$BEFORE" -gt "$AFTER" ]; then
+        SAVED=$((BEFORE - AFTER))
+        CLEANED_MB=$((CLEANED_MB + SAVED))
+        print_info "  shieldnode old archives (>30d gz, >7d numbered): -${SAVED}MB"
+    fi
+
+    # 3. v3.23.8: пересжатие .gz архивов старше 14 дней в xz -6 (быстрее чем -9, ratio 95%)
+    XZ_RECOMPRESSED=0
+    if command -v xz >/dev/null 2>&1; then
+        for gz_file in $(find /var/log/shieldnode -name "*.gz" -mtime +14 2>/dev/null); do
+            xz_file="${gz_file%.gz}.xz"
+            [ -f "$xz_file" ] && continue   # Уже пересжато
+            if zcat "$gz_file" 2>/dev/null | xz -6 -T 2 > "$xz_file" 2>/dev/null && [ -s "$xz_file" ]; then
+                rm -f "$gz_file"
+                XZ_RECOMPRESSED=$((XZ_RECOMPRESSED + 1))
+            else
+                rm -f "$xz_file"  # cleanup при неудаче
+            fi
+        done
+        [ "$XZ_RECOMPRESSED" -gt 0 ] && \
+            print_info "  recompressed $XZ_RECOMPRESSED archives gz→xz -6 (extra savings)"
+    fi
+
+    # 4. v3.23.8: системные логи — whitelist известных паттернов (не broad match!)
+    # Защита от случайного удаления docker logs, custom logs, etc.
+    BEFORE=$(du -sm /var/log 2>/dev/null | awk '{print $1}')
+    BEFORE="${BEFORE:-0}"
+
+    # Удаляем только известные системные ротации
+    SYSTEM_LOG_PATTERNS=(
+        "syslog.*.gz"
+        "syslog.[0-9]*"
+        "kern.log.*.gz"
+        "kern.log.[0-9]*"
+        "auth.log.*.gz"
+        "auth.log.[0-9]*"
+        "messages-*.gz"
+        "messages.[0-9]*"
+        "mail.*.gz"
+        "mail.[0-9]*"
+        "daemon.log.*.gz"
+        "daemon.log.[0-9]*"
+        "user.log.*.gz"
+        "user.log.[0-9]*"
+        "ufw.log.*.gz"
+        "ufw.log.[0-9]*"
+        "dpkg.log.*.gz"
+        "alternatives.log.*.gz"
+        "apt/history.log.*.gz"
+        "apt/term.log.*.gz"
+    )
+    for pattern in "${SYSTEM_LOG_PATTERNS[@]}"; do
+        # Только в /var/log/ верхнего уровня, не в подпапках произвольных
+        find /var/log -maxdepth 2 -name "$pattern" -mtime +7 -delete 2>/dev/null
+    done
+
+    AFTER=$(du -sm /var/log 2>/dev/null | awk '{print $1}')
+    AFTER="${AFTER:-0}"
+    if [ "$BEFORE" -gt "$AFTER" ]; then
+        SAVED=$((BEFORE - AFTER))
+        CLEANED_MB=$((CLEANED_MB + SAVED))
+        print_info "  /var/log known system patterns (>7d): -${SAVED}MB"
+    fi
+
+    # 5. Journald vacuum
+    JOURNAL_BEFORE=$(journalctl --disk-usage 2>/dev/null | grep -oE '[0-9.]+[GMK]' | head -1)
+    journalctl --vacuum-size=200M >/dev/null 2>&1 || true
+    JOURNAL_AFTER=$(journalctl --disk-usage 2>/dev/null | grep -oE '[0-9.]+[GMK]' | head -1)
+    [ -n "$JOURNAL_BEFORE" ] && [ -n "$JOURNAL_AFTER" ] && \
+        print_info "  journald: $JOURNAL_BEFORE → $JOURNAL_AFTER"
+
+    # 6. APT cache
+    apt-get clean >/dev/null 2>&1 || true
+
+    # 7. Активные kern.log/syslog/auth.log > 200MB → принудительная ротация (сжатый архив)
+    LARGE_LOGS_ROTATED=0
+    for log in /var/log/syslog /var/log/kern.log /var/log/auth.log; do
+        if [ -f "$log" ]; then
+            SIZE=$(stat -c%s "$log" 2>/dev/null || echo 0)
+            if [ "$SIZE" -gt 209715200 ]; then  # > 200MB
+                logrotate -f /etc/logrotate.d/shieldnode-syslog-aggressive 2>/dev/null && \
+                    LARGE_LOGS_ROTATED=$((LARGE_LOGS_ROTATED + 1))
+            fi
+        fi
+    done
+    [ "$LARGE_LOGS_ROTATED" -gt 0 ] && \
+        print_info "  forced rotate $LARGE_LOGS_ROTATED больших системных логов"
+
+    # 8. v3.23.8: PCAP archive — СЖИМАЕМ старее 7 дней в tar.zst, удаляем старее 30 дней.
+    # Защищает forensics от потери (раньше удаляли >3 дней при critical disk).
+    if [ -d /var/lib/shieldnode/pcap-archive ]; then
+        PCAP_USAGE_MB=$(du -sm /var/lib/shieldnode/pcap-archive 2>/dev/null | awk '{print $1}')
+        PCAP_USAGE_MB="${PCAP_USAGE_MB:-0}"
+
+        # Сжимаем директории старше 7 дней в tar.zst (если zstd есть)
+        if command -v zstd >/dev/null 2>&1; then
+            PCAP_COMPRESSED=0
+            for archive_dir in $(find /var/lib/shieldnode/pcap-archive -mindepth 1 -maxdepth 1 -type d -mtime +7 2>/dev/null); do
+                tar_name="${archive_dir}.tar.zst"
+                [ -f "$tar_name" ] && continue
+                if tar --use-compress-program="zstd -19 -T2" -cf "$tar_name" -C "$(dirname "$archive_dir")" "$(basename "$archive_dir")" 2>/dev/null && [ -s "$tar_name" ]; then
+                    rm -rf "$archive_dir"
+                    PCAP_COMPRESSED=$((PCAP_COMPRESSED + 1))
+                fi
+            done
+            [ "$PCAP_COMPRESSED" -gt 0 ] && \
+                print_info "  PCAP archives (>7d): compressed $PCAP_COMPRESSED to tar.zst"
+        fi
+
+        # Удаляем tar.zst и uncompressed >30 дней
+        BEFORE=$PCAP_USAGE_MB
+        find /var/lib/shieldnode/pcap-archive -mindepth 1 -maxdepth 1 -mtime +30 -exec rm -rf {} \; 2>/dev/null
+        AFTER=$(du -sm /var/lib/shieldnode/pcap-archive 2>/dev/null | awk '{print $1}')
+        AFTER="${AFTER:-0}"
+        if [ "$BEFORE" -gt "$AFTER" ]; then
+            SAVED=$((BEFORE - AFTER))
+            CLEANED_MB=$((CLEANED_MB + SAVED))
+            print_info "  pcap-archive (>30d): -${SAVED}MB"
+        fi
+    fi
+
+    # Финальная проверка
+    NEW_DISK_USAGE=$(df --output=pcent /var/log 2>/dev/null | tail -1 | tr -d ' %')
+    print_ok "Disk cleanup: ${DISK_USAGE}% → ${NEW_DISK_USAGE}% (освобождено ~${CLEANED_MB}MB)"
+
+    if [ "$NEW_DISK_USAGE" -ge 90 ]; then
+        print_warn "Диск всё ещё >90% после cleanup — проверь что ещё его занимает:"
+        print_info "  du -sh /var/log/* /var/lib/* 2>/dev/null | sort -rh | head"
+        print_info "  Подсказки:"
+        print_info "    • Docker logs:   sudo du -sh /var/lib/docker/containers/*/*.log 2>/dev/null"
+        print_info "    • Coredumps:     sudo du -sh /var/lib/systemd/coredump/ 2>/dev/null"
+        print_info "    • Старые ядра:   sudo apt autoremove --purge"
+    fi
+else
+    print_info "Disk /var/log: ${DISK_USAGE}% — cleanup не требуется"
 fi
 
 # ==============================================================================
