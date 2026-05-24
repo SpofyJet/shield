@@ -81,6 +81,28 @@ sudo guard sync       # синк custom.txt прямо сейчас
 
 ## Версии
 
+- **v3.23.8** — COMPRESSION HARDENING (production-ready):
+  - **FIX**: gzip rotation error logging — раньше `2>/dev/null` глотал "no space"/"permission denied", теперь все ошибки в syslog (`shieldnode-gzip`, `shieldnode-agg-retry`).
+  - **FIX**: cleanup при upgrade имеет fallback на `truncate` если диск >=95% (gzip не уместится во временный файл). 80-94% → gzip (сохраняем историю), >=95% → truncate (быстро, но теряем старое).
+  - **FIX**: PCAP archive теперь СЖИМАЕТСЯ в `tar.zst -19` перед удалением (раньше при critical disk удалялись >3 дней — теряли forensics). Старее 7 дней → tar.zst, старее 30 дней → удалить.
+  - **FIX**: `xz -9` → `xz -6 -T 2` в cleanup'е (втрое быстрее, ratio 95% от -9). На 2GB архиве: 20 минут → 3 минуты.
+  - **FIX**: системные logs cleanup использует whitelist известных паттернов (syslog.*.gz, kern.log.*.gz, auth.log.*.gz, messages-*.gz, etc) вместо broad-match `*.gz` — защита от случайного удаления docker logs, custom logs.
+  - **FIX**: aggregator retry для leftover архивов — если предыдущий gzip упал и оставил `events.log.<TS>` без .gz суффикса, следующий тик пробует сжать ещё раз.
+- **v3.23.7** — COMPRESSION (no data loss):
+  - **CRIT FIX**: events.log при заполнении теперь СЖИМАЕТСЯ (gzip), а не truncate. Раньше >500MB → tail -c 100MB → ТЕРЯЛИ 400MB истории. Теперь >100MB → mv → events.log.<TS> → gzip в фоне → новый пустой events.log. История полностью сохранена, читается через `zless`. На 37GB → ~2GB архив (95% компрессии).
+  - **FEATURE**: автоматическая ретенция архивов — .gz старее 14 дней пересжимаются в xz, старее 30 дней удаляются (раньше 1 день — слишком агрессивно).
+  - **FIX**: logrotate config: maxsize 50M → 100M (меньше частых ротаций), rotate 30 дней с compress + delaycompress.
+- **v3.23.6** — DEDUP CORRECTNESS (FIX блокирующего бага в v3.23.5):
+  - **CRIT FIX**: should_log() в aggregator использовал `grep -F "^${key}|"` — это fixed-string режим, где `^` ищется БУКВАЛЬНО, не как anchor начала строки. Эффект: state lookup ВСЕГДА возвращал empty → каждое событие писалось как "впервые видим" → дедуп **НЕ РАБОТАЛ**. Главная фича v3.23.5 была сломана. Fix: in-memory bash associative array (`declare -A LAST_COUNT LAST_TS`), load на старте, atomic dump через `trap save_state EXIT`.
+  - **CRIT FIX**: race condition в aggregator. Timer запускается каждую минуту, тики могли пересекаться. Теперь `flock` защищает.
+  - **PERF FIX**: state-операции были O(N×12) grep/sed на каждом тике. Теперь O(1) bash hash lookup. На 4000 IP: 5-10 сек → 50-100 ms за тик (разница в 100x по CPU).
+- **v3.23.5** — DISK-PROOF + SELF-TEST (отброшен v3.23.6 фиксом):
+  - **CRIT FIX**: events.log больше не заполняет диск при длительных атаках через state-based logging (writes только если событие "значимое": новый IP/type, count вырос на 1000, прошёл час).
+  - **CRIT FIX**: hard cap 500MB на events.log с auto-rotate.
+  - **FIX**: logrotate config теперь с `copytruncate` (раньше падал с status=1).
+  - **FIX**: systemd Restart=on-failure для shieldnode-nftables/events/pcap.
+  - **FIX**: aggregator detect MY_IP в suspect_v4 → log WARNING + skip. Self-flood случаи (loopback через public_ip в nginx/proxy_pass) больше не зацикливают CPU.
+  - **FEATURE**: `guard self-test` — 11 проверок ноды (services, disk, conntrack, MY_IP, threat feed health).
 - **v3.23.4** — POST-INCIDENT FINAL (на основе DDoS-инцидента 2026-05-24):
   - **REMOVED**: /24 subnet aggregator + whois install (был в v3.23.3-rc, удалён до stable). CrowdSec community blocklist + threat-feeds покрывают ~90% datacenter ботнетов, дополнительная сложность не оправдана. Auto-promote events.db → custom-local + ручной custom.txt — достаточно.
   - **FEATURE**: idempotent cleanup в начале установщика (ШАГ 12.6). При upgrade с v3.23.3-rc автоматически удаляет legacy `shieldnode-subnet-aggregator.{service,timer}` + nft set `datacenter_subnet_bans_v4` + whois cache. Чистый upgrade без ручной очистки.
