@@ -1,7 +1,31 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.23.8 (Commercial Edition) — COMPRESSION HARDENING
+#  VPN NODE DDoS PROTECTION v3.23.10 (Commercial Edition) — PCAP NAME FIX
+#
+#  Что нового vs v3.23.9:
+#    - CRIT FIX: в v3.23.9 heredoc для shieldnode-pcap.service использовал
+#      `<<PCAP_UNIT_EOF` без quotes (для подстановки $TCPDUMP_BIN). Это
+#      привело к двойному %% в фильтре tcpdump (`%%Y%%m%%d-%%H%%M%%S`) —
+#      tcpdump получал буквальное имя файла "syn-%%Y%%m%%d-..." вместо
+#      рабочего timestamp. PCAP записи были бы сломаны на v3.23.9.
+#      Fix: переход на single-quote heredoc (literal) + sed замена ровно
+#      одного placeholder __TCPDUMP_BIN__ после создания файла. Никакого
+#      expand'а $VAR/%, всё literal до явной замены.
+#
+#  Что нового vs v3.23.8:
+#    - PERF FIX: shieldnode-whitelist-updater использовал 6 nft delete команд
+#      per-IP — каждая отдельный fork+exec+nft init. При 3 IP в TRUSTED_IPS
+#      это 18 nft процессов на каждый sync. На слабых VPS вызывало CPU spike
+#      до 90% при каждом запуске updater'а (path-watcher на whitelist-local.txt
+#      или N раз/час). Видно как `nft delete element ... { 213.165.55.166 }`
+#      висящие в top с 80-90% CPU.
+#      Fix: переход на batch `nft -f -` (один процесс для всех delete операций).
+#      Снижение CPU usage в 18x на nodes с whitelist'ом.
+#    - FIX: pcap.service status=203/EXEC на некоторых нодах (tcpdump не
+#      установлен или путь к binary неверный). Установщик теперь проверяет
+#      `command -v tcpdump` ПЕРЕД enable сервиса. Если tcpdump отсутствует —
+#      apt install с retry, log warning если не установился.
 #
 #  Что нового vs v3.23.7:
 #    - FIX: фоновый gzip в aggregator теперь логирует ошибки в syslog
@@ -268,7 +292,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.23.8"
+SHIELDNODE_VERSION="3.23.10"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -4167,15 +4191,20 @@ if [ -n "$IPS" ]; then
         done <<< "$IPS"
     } | nft -f - 2>&1
 
-    # Удаляем whitelisted IPs из drop sets — нельзя одновременно whitelist'ить и банить
-    while IFS= read -r ip; do
-        nft delete element $NFT_TABLE confirmed_attack_v4 "{ $ip }" 2>/dev/null || true
-        nft delete element $NFT_TABLE suspect_v4          "{ $ip }" 2>/dev/null || true
-        nft delete element $NFT_TABLE custom_blocklist_v4 "{ $ip }" 2>/dev/null || true
-        nft delete element $NFT_TABLE scanner_blocklist_v4 "{ $ip }" 2>/dev/null || true
-        nft delete element $NFT_TABLE threat_blocklist_v4  "{ $ip }" 2>/dev/null || true
-        nft delete element $NFT_TABLE tor_exit_blocklist_v4 "{ $ip }" 2>/dev/null || true
-    done <<< "$IPS"
+    # Удаляем whitelisted IPs из drop sets — нельзя одновременно whitelist'ить и банить.
+    # v3.23.9: batch nft -f - вместо 6 fork'ов на каждый IP.
+    # Раньше: 3 IP × 6 sets = 18 nft processes → CPU spike до 90%.
+    # Теперь: 1 nft process для всех операций.
+    {
+        while IFS= read -r ip; do
+            echo "delete element $NFT_TABLE confirmed_attack_v4 { $ip }"
+            echo "delete element $NFT_TABLE suspect_v4 { $ip }"
+            echo "delete element $NFT_TABLE custom_blocklist_v4 { $ip }"
+            echo "delete element $NFT_TABLE scanner_blocklist_v4 { $ip }"
+            echo "delete element $NFT_TABLE threat_blocklist_v4 { $ip }"
+            echo "delete element $NFT_TABLE tor_exit_blocklist_v4 { $ip }"
+        done <<< "$IPS"
+    } | nft -f - 2>/dev/null || true   # || true — некоторые элементы могут отсутствовать в set'ах
 
     COUNT=$(echo "$IPS" | wc -l)
     logger -t "$LOG_TAG" "Updated $NFT_SET: $COUNT IPs (cleaned from blocklists/attack sets)"
@@ -7998,14 +8027,35 @@ print_header "ШАГ 12.7: PCAP-CAPTURE (rolling SYN dump)"
 # Ring buffer: 20 файлов × 50MB = max 1GB, ротация по часу.
 # На нормальной нагрузке: ~100-200MB/сутки.
 
+# v3.23.9: tcpdump install с retry + проверка что binary реально доступен
+TCPDUMP_BIN=""
 if ! command -v tcpdump >/dev/null 2>&1; then
     print_status "Устанавливаю tcpdump..."
-    apt-get install -y tcpdump >/dev/null 2>&1 || print_warn "tcpdump install failed"
+    for try in 1 2 3; do
+        if apt-get install -y tcpdump >/dev/null 2>&1; then
+            break
+        fi
+        sleep $((try * 2))
+    done
+fi
+
+# Auto-detect tcpdump path (Ubuntu 22/24: /usr/bin, RHEL/Debian-old: /usr/sbin)
+TCPDUMP_BIN=$(command -v tcpdump 2>/dev/null)
+if [ -z "$TCPDUMP_BIN" ] || [ ! -x "$TCPDUMP_BIN" ]; then
+    print_warn "tcpdump НЕ установлен или недоступен — PCAP capture будет disabled"
+    print_info "  Ручная установка: sudo apt update && sudo apt install -y tcpdump"
+    TCPDUMP_AVAILABLE=0
+else
+    TCPDUMP_AVAILABLE=1
+    print_info "tcpdump найден: $TCPDUMP_BIN"
 fi
 
 mkdir -p /var/log/pcap
 chmod 755 /var/log/pcap
 
+if [ "$TCPDUMP_AVAILABLE" = "1" ]; then
+# Используем single-quote heredoc (literal) чтобы $VAR и % не expand'ились,
+# затем sed подставляет ровно один placeholder __TCPDUMP_BIN__.
 cat > /etc/systemd/system/shieldnode-pcap.service <<'PCAP_UNIT_EOF'
 [Unit]
 Description=Shieldnode rolling SYN packet capture for DDoS forensics
@@ -8014,7 +8064,7 @@ Wants=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/sbin/tcpdump -i any -nn -s 128 \
+ExecStart=__TCPDUMP_BIN__ -i any -nn -s 128 \
     -w /var/log/pcap/syn-%Y%m%d-%H%M%S.pcap \
     -W 20 -C 50 -G 3600 -Z root \
     '(tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack == 0)'
@@ -8026,6 +8076,9 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 PCAP_UNIT_EOF
+
+# Подставляем actual путь к tcpdump
+sed -i "s|__TCPDUMP_BIN__|$TCPDUMP_BIN|g" /etc/systemd/system/shieldnode-pcap.service
 
 systemctl daemon-reload
 systemctl enable shieldnode-pcap.service >/dev/null 2>&1
@@ -8051,6 +8104,14 @@ if systemctl is-active --quiet shieldnode-pcap.service; then
     print_ok "PCAP capture запущен (ring 1GB, /var/log/pcap/syn-*.pcap)"
 else
     print_warn "PCAP capture не стартовал — проверь: systemctl status shieldnode-pcap"
+fi
+
+else
+    # tcpdump не доступен — пропускаем установку pcap service
+    # Если был установлен ранее — disable чтобы не было crashes status=203/EXEC
+    systemctl disable --now shieldnode-pcap.service 2>/dev/null || true
+    rm -f /etc/systemd/system/shieldnode-pcap.service 2>/dev/null
+    print_warn "PCAP capture skipped — tcpdump не установлен (apt не сработал)"
 fi
 
 # Note: logrotate для /var/log/pcap НЕ нужен — tcpdump сам ротирует через -W 20 -C 50.
