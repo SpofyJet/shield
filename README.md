@@ -81,6 +81,12 @@ sudo guard sync       # синк custom.txt прямо сейчас
 
 ## Версии
 
+- **v3.23.12** — COSMETIC FIX:
+  - **FIX**: финальное сообщение установщика и Settings menu показывали `ct=50000` (legacy hardcoded text). Реальный лимит в nft = 15000 с v3.23.3+, но текст не был обновлён. Поправлено.
+- **v3.23.11** — SYSTEMD ESCAPE FIX (hotfix к v3.23.10):
+  - **CRIT FIX**: pcap-service не работал в v3.23.10. systemd unit использует `%` как СВОИ specifiers (`%H`=hostname, `%m`=machineid, `%Y`=hash). В v3.23.10 я написал `%Y%m%d` для tcpdump strftime, но systemd подставлял свои значения ДО tcpdump. Результат: tcpdump получал имя файла `syn-/etc/systemd/system07397.../sweden2.../var/lib.pcap` и падал каждые 10 секунд (`No such file or directory`).
+  - Fix: вернуть `%%Y%%m%%d-%%H%%M%%S` в unit-файле. Внутри single-quote heredoc `%%` сохраняется literal → systemd получает `%%` → даёт tcpdump один `%` для strftime → правильное имя файла `syn-20260524-185857.pcap`.
+  - **FIX**: `guard self-test` "integer expression expected" на line 130. `grep -c ... || echo 0` приклеивал второй "0" к выводу когда grep возвращал 0 → `[ "0\n0" -gt 5 ]` падал. Заменено на `${X:-0}` default.
 - **v3.23.10** — PCAP NAME FIX (hotfix к v3.23.9):
   - **CRIT FIX**: в v3.23.9 heredoc для `shieldnode-pcap.service` использовал `<<PCAP_UNIT_EOF` без quotes (для подстановки `$TCPDUMP_BIN`), и в strftime-pattern удвоились `%` → tcpdump получал буквальное имя файла `syn-%%Y%%m%%d-%%H%%M%%S.pcap` вместо timestamp. PCAP записи были бы сломаны.
   - Fix: single-quote heredoc (literal) + targeted `sed` замена ровно одного placeholder `__TCPDUMP_BIN__` после создания файла. Никакого expand'а `$VAR`/`%`, всё literal до явной замены.
