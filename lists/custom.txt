@@ -1,5 +1,10 @@
-# === shieldnode custom.txt blocklist v5 (FINAL after double-pass RDAP) ===
+# === shieldnode custom.txt blocklist v6 ===
 # Every single CIDR verified through RIPE/ARIN RDAP API
+# Added (v6 vs v5):
+# - 45.151.62.199 (Global Internet Solutions LLC RU - active attacker 2026-05-24)
+# - 138.124.88.15 (Baykov Ilya Sergeevich FI - small bulletproof)
+# - 80.66.76.31 (Gening Nikita Dmitrievich RU - small bulletproof)
+# - 91.227.114.132 (Shereverov Marat Ahmedovich FI - small bulletproof)
 # Removed (v5 vs v4):
 # - 180.93.36.0/24 (Vietnam SPT-VN ISP - may contain legit users)
 # - 74.208.217.0/24 (IONOS 1and1 - legit hosting)
@@ -15,7 +20,7 @@
 # - All RU/CIS broadband: МТС, Дом.ру, Билайн, Уфанет, Skytel, ER-Telecom
 # - Microsoft 52.123.128.0/19
 # - DigitalOcean /16 umbrellas
-# Total: 46 CIDR blocks
+# Total: 50 entries (46 CIDR blocks + 4 single IPs)
 # Confidence: HIGH — only confirmed bulletproof hosters and scanners
 
 85.217.140.0/23
@@ -64,3 +69,8 @@
 193.32.162.0/24
 193.143.0.0/22
 92.63.197.0/24
+45.151.62.199
+138.124.88.15
+80.66.76.31
+91.227.114.132
+31.14.32.0/24
