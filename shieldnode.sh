@@ -598,9 +598,40 @@ if [ -f "$SHIELD_LIMITS_FILE" ]; then
     if shield_safe_source "$SHIELD_LIMITS_FILE" 2>/dev/null; then
         :
     else
-        print_warn "limits.conf failed safe-source check, using defaults"
+        echo "WARN: limits.conf failed safe-source check, using defaults" >&2
     fi
 fi
+
+# v3.23.13 SR-FIX-7: validate SHIELD_* numeric vars before use in nft heredoc.
+# Defense-in-depth: если оператор поставил в limits.conf не-число (например,
+# случайный пробел или комментарий), используем default вместо silent fail.
+shield_ensure_numeric() {
+    local varname="$1" default="$2"
+    local val="${!varname}"
+    if ! [[ "$val" =~ ^[0-9]+$ ]]; then
+        echo "WARN: $varname='$val' is not numeric, using default=$default" >&2
+        eval "$varname=\"\$default\""
+    fi
+}
+shield_ensure_numeric SHIELD_CT_CONN_FLOOD 15000
+shield_ensure_numeric SHIELD_RATE_NEWCONN_BURST 60000
+shield_ensure_numeric SHIELD_RATE_SYN_BURST 3000
+shield_ensure_numeric SHIELD_RATE_UDP_BURST 20000
+shield_ensure_numeric SHIELD_SSH_CT_LIMIT 5
+shield_ensure_numeric SHIELD_SSH_NEWCONN_BURST 20
+shield_ensure_numeric SHIELD_AUTOPROMOTE_THRESHOLD 2000
+shield_ensure_numeric SHIELD_AUTOPROMOTE_WINDOW_HOURS 24
+shield_ensure_numeric SHIELD_CUSTOM_LOCAL_TTL_DAYS 90
+shield_ensure_numeric SHIELD_EVENTS_DB_RETENTION_DAYS 90
+shield_ensure_numeric SHIELD_PCAP_TRIGGER_DROPS 10000
+shield_ensure_numeric SHIELD_PCAP_RETENTION_DAYS 30
+shield_ensure_numeric SHIELD_AGG_JOURNAL_LINES 200000
+shield_ensure_numeric SHIELD_AGG_MAX_UNIQUE_IPS 50000
+
+# Pre-compute derived values to avoid $((...)) inside heredoc (some bash
+# versions on certain platforms had issues with arithmetic expansion inside
+# unquoted heredoc when var contains unexpected chars).
+SHIELD_CT_CONN_FLOOD_MINUS_1=$((SHIELD_CT_CONN_FLOOD - 1))
 
 # nft set names — для совместимости с v3.11.x state на проде сохраняем
 # имя tor_exit_blocklist_v4 (старое). Маппинг: имя в updater'е → реальный nft set.
@@ -2496,6 +2527,17 @@ else
     print_info "Using existing $SHIELD_LIMITS_FILE"
 fi
 
+# v3.23.13 SR-FIX-7: re-validate numerics after limits.conf re-source
+# (на случай если оператор положил мусор в файл).
+shield_ensure_numeric SHIELD_CT_CONN_FLOOD 15000
+shield_ensure_numeric SHIELD_RATE_NEWCONN_BURST 60000
+shield_ensure_numeric SHIELD_RATE_SYN_BURST 3000
+shield_ensure_numeric SHIELD_RATE_UDP_BURST 20000
+shield_ensure_numeric SHIELD_SSH_CT_LIMIT 5
+shield_ensure_numeric SHIELD_SSH_NEWCONN_BURST 20
+# Re-compute derived (после возможной правки SHIELD_CT_CONN_FLOOD)
+SHIELD_CT_CONN_FLOOD_MINUS_1=$((SHIELD_CT_CONN_FLOOD - 1))
+
 # v3.8: подготовка conditional-правил для nft template.
 # fib anti-spoofing — только на single-homed VPS.
 # v3.23.0: log prefix в правиле fib_spoof тоже опционален (SHIELDNODE_VERBOSE_LOGS=1).
@@ -3025,7 +3067,7 @@ $SHIELD_LOG_TCP_INVALID
         #   (2) Drop rule (как в v3.23.12): atomic match-add-counter-drop.
         #       Counter показывает реальные дропы.
         tcp dport @protected_ports_tcp ct state new \\
-            ct count over $((SHIELD_CT_CONN_FLOOD - 1)) \\
+            ct count over $SHIELD_CT_CONN_FLOOD_MINUS_1 \\
             meter shield_conn_flood_log { ip saddr limit rate 1/minute burst 5 packets } \\
             log prefix "[shield:conn_flood] " level info flags ip options
         tcp dport @protected_ports_tcp ct state new \\
