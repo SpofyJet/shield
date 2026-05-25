@@ -9,49 +9,56 @@
 #        sudo mkdir -p /etc/shieldnode
 #        sudo cp shieldnode.conf.example /etc/shieldnode/shieldnode.conf
 #   2. Раскомментируй и измени нужные значения.
-#   3. Запусти reinstall: sudo guard upgrade
+#   3. Запусти reinstall: sudo bash <(curl -sL https://raw.githubusercontent.com/abcproxy70-ops/shield/main/shieldnode.sh)
 #
 # Также большинство этих настроек можно менять через interactive menu:
 #   sudo guard → settings (клавиша [s])
 # ==============================================================================
+
 
 # === Tor exit nodes blocklist (опционально) ===
 # По умолчанию 0 — Tor не блокируется (Reality/Xray может legitimately ходить через Tor).
 # Включи если на ноде только VPN-traffic и Tor однозначно враждебный.
 #BLOCK_TOR=1
 
+
 # === Custom blocklist sync с GitHub ===
-# По умолчанию 1 — нода каждые 6ч качает lists/custom.txt из github репо.
+# По умолчанию 1 — нода каждые 6ч качает lists/custom.txt из github репо
+# (raw.githubusercontent.com/abcproxy70-ops/shield/main/lists/custom.txt).
 # Локальные дополнения хранятся в /etc/shieldnode/lists/custom-local.txt —
 # они НЕ перезаписываются при sync.
 # Отключи если работаешь полностью оффлайн или ведёшь свой forked-репо.
 #ENABLE_GITHUB_SYNC=0
 
+
 # === Trusted IPs (manual whitelist) ===
 # Список IP/CIDR через запятую — будут добавлены в:
 #   1. shieldnode manual_whitelist_v4 (обходит все наши rate-limits)
 #   2. UFW: ufw allow from <IP> (comment 'Trusted (TRUSTED_IPS)')
-#   3. CrowdSec whitelist + postoverflow (parser-level, scenarios не триггерятся)
-# Использовать для: management-серверов, мониторинга, личных IP, bridge-подсетей.
-# Поддерживает CIDR (например 10.0.0.0/24).
-#TRUSTED_IPS="1.2.3.4,5.6.7.0/24"
+#   3. CrowdSec whitelist (decisions delete --type ban для этих IP)
+# Использовать для: management-серверов, мониторинга, личных IP.
+#TRUSTED_IPS="77.239.107.190,213.165.55.166,138.124.88.15"
+
 
 # === Bridge/upstream nodes ===
-# Если эта нода — front для bridge-связки (front → bridge),
+# Если эта нода — front для bridge-связки (RU-front → FI-bridge),
 # укажи IP моста. Он будет автоматически whitelist'ен.
 #BRIDGE_IPS="1.2.3.4,5.6.7.8"
 
+
 # === Panel detection (override) ===
-# По умолчанию: PANEL_TYPE=none (standalone, prerouting priority -100).
+# По умолчанию v3.20.5: PANEL_TYPE=none (standalone, prerouting priority -100).
 # Если на ноде установлена VPN-панель с собственными nft-правилами на
 # priority -100 (например Remnawave plugin) — выставь явно для compat:
-#   none      → prerouting -100 (standalone, default)
-#   remnawave → prerouting -150 (compat с remnawave/marzban/3x-ui)
+#   none      → prerouting -100  (standalone, default)
+#   remnawave → prerouting -150  (compat с remnawave/marzban/3x-ui)
 #PANEL_TYPE=remnawave
 
+
 # === Custom blocklist sources (advanced) ===
-# По умолчанию shieldnode скачивает blocklist'ы из публичных источников.
-# Если хочешь свои источники, раскомментируй и измени массивы ниже.
+# По умолчанию shieldnode скачивает blocklist'ы из публичных источников
+# (Spamhaus, FireHOL, Shodan-fingerprints и т.д.). Если хочешь свои
+# источники, раскомментируй и измени массивы ниже.
 #
 # Формат: ENTRY="имя_set=URL1,URL2,URL3"
 # Файлы доступа: HTTP/HTTPS GET, текстовый формат (IP или CIDR по строке).
@@ -65,16 +72,14 @@
 #    "custom=/etc/shieldnode/lists/custom.txt,/etc/shieldnode/lists/custom-local.txt"
 #)
 
-# Удалённые источники (формат: URL).
-# Дефолтный threat — 5 источников. blocklist.de отфильтровывает SYN-flood ложняки
-# (на их стороне используется fail2ban-валидация), feodotracker — botnet C2,
-# ipsum level 3 — агрегатор 30+ источников с низким false-positive.
+# Удалённые источники (формат: URL):
 #REMOTE_BLOCKLISTS=(
-#    "scanner=https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/antiscanner.list,https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/government_networks.list,https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_cidr.txt"
-#    "threat=https://www.spamhaus.org/drop/drop.txt,https://iplists.firehol.org/files/firehol_level1.netset,https://lists.blocklist.de/lists/all.txt,https://feodotracker.abuse.ch/downloads/ipblocklist.txt,https://raw.githubusercontent.com/stamparm/ipsum/master/levels/3.txt"
+#    "scanner=https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/main/public/antiscanner.list,https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_cidr.txt"
+#    "threat=https://www.spamhaus.org/drop/drop.txt,https://iplists.firehol.org/files/firehol_level1.netset"
 #    "tor=https://check.torproject.org/torbulkexitlist"
 #    "custom=https://raw.githubusercontent.com/MY_ORG/MY_FORK/main/lists/custom.txt"
 #)
+
 
 # === Update intervals (advanced) ===
 # Интервалы обновления blocklist'ов (формат: systemd timer — 1h, 6h, 1d).
@@ -83,14 +88,16 @@
 #TOR_UPDATE_INTERVAL=1h
 #CUSTOM_UPDATE_INTERVAL=6h
 
+
 # === Min entries threshold (sanity check) ===
 # Если updater получает менее N записей в blocklist'е — считаем что
 # источник битый и не применяем (защита от пустых апдейтов которые
 # могут разморозить рейтлимиты на проде).
 #MIN_ENTRIES_SCANNER=100
-#MIN_ENTRIES_THREAT=5000
+#MIN_ENTRIES_THREAT=500
 #MIN_ENTRIES_TOR=100
 #MIN_ENTRIES_CUSTOM=0
+
 
 # === Failure threshold ===
 # Сколько подряд неудачных update-попыток до alarm в guard CLI.
