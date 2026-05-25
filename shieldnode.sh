@@ -755,7 +755,13 @@ if [ "${1:-}" = "--uninstall" ]; then
     # v3.5: human-readable логи + logrotate
     rm -rf /var/log/shieldnode
     rm -f /etc/logrotate.d/shieldnode
-    rm -f /etc/logrotate.d/shieldnode-syslog-aggressive  # v3.20.3
+    rm -f /etc/logrotate.d/shieldnode-syslog-aggressive  # v3.20.3 legacy
+    # v3.23.13 SR-FIX-8: убираем наш patch (маркер + maxsize 100M) из rsyslog conf
+    if [ -f /etc/logrotate.d/rsyslog ]; then
+        sed -i -E '/^\s*# shieldnode-aggressive-marker\s*$/{N;d;}' /etc/logrotate.d/rsyslog 2>/dev/null || true
+    fi
+    # Cleanup нашего state файла
+    rm -f /var/lib/shieldnode/logrotate-hourly.state /var/lib/shieldnode/logrotate.state /var/lib/shieldnode/logrotate-syslog.state 2>/dev/null
     print_ok "Логи и logrotate-конфиг удалены"
 
     # v3.21.3: rsyslog kern.* dedup (restore from backup) и journald limit drop-in
@@ -2893,7 +2899,7 @@ $SHIELD_LOG_TCP_INVALID
         # источник нежелательного трафика, отсекаем сразу.
         # v3.23.13 BUG-004 FIX: log ВСЕГДА активен.
         # v3.23.13 SR-FIX-1: meter (per-IP rate-limit) вместо global limit.
-        # Раньше `limit rate 1/sec` был GLOBAL — под массивной атакой
+        # Раньше 'limit rate 1/sec' был GLOBAL — под массивной атакой
         # залогировался бы только один IP в секунду. С meter — 1/min per IP,
         # каждый атакующий получит attribution хотя бы раз в минуту.
         # Лимит per-IP × timeout 1h автоматически собирает только активных.
@@ -3061,7 +3067,7 @@ $SHIELD_LOG_TCP_INVALID
         # massive ботнете (каждый атакующий хоть раз логируется в минуту).
         #
         # Архитектура:
-        #   (1) Log-rule: `ct count over <X-1>` БЕЗ `add @set` — match только.
+        #   (1) Log-rule: 'ct count over <X-1>' БЕЗ 'add @set' — match только.
         #       meter per-IP rate-limit (1/min). Counter+drop НЕТ — пакет идёт
         #       дальше в правило (2).
         #   (2) Drop rule (как в v3.23.12): atomic match-add-counter-drop.
@@ -3140,7 +3146,7 @@ $SHIELD_LOG_TCP_INVALID
         # v3.15.3 / v3.23.0: log prefix [shield:syn_escalate] на момент ESCALATION
         # в confirmed_attack_v4. v3.23.13 BUG-004 + SR-FIX-1 + SR-FIX-6: log
         # ВСЕГДА активен, per-IP rate-limit через meter, БЕЗ дублирующего
-        # `add @confirmed_attack_v4` (второе правило это делает).
+        # 'add @confirmed_attack_v4' (второе правило это делает).
         # Это escalation-event (suspect → confirmed), очень low-volume:
         # один IP escalate'ится один раз, дальше дропается через @confirmed_attack_v4.
         ip saddr @suspect_v4 \\
@@ -5397,32 +5403,41 @@ cat > /etc/logrotate.d/shieldnode <<'LOGROTATE_EOF'
 LOGROTATE_EOF
 print_ok "Logrotate: /etc/logrotate.d/shieldnode (daily, rotate 30, maxsize 100M, compress)"
 
-# v3.20.3: Aggressive logrotate для /var/log/syslog и /var/log/kern.log
+# v3.20.3 / v3.23.13 SR-FIX-8: aggressive ротация для /var/log/syslog/kern.log/auth.log.
 # Причина: shieldnode/nftables/CrowdSec пишут много drop-events в kern.log.
 # Дефолтный rsyslog ротирует ежедневно — но за день может накопиться 1-2 GB.
-# Этот конфиг добавляет maxsize 100M — ротация happens при любом превышении,
-# не дожидаясь конца дня. Дополнительно ограничивает rotate 3 (вместо 7 default)
-# чтобы экономить место.
-cat > /etc/logrotate.d/shieldnode-syslog-aggressive <<'LOGROTATE_EOF'
-/var/log/syslog
-/var/log/kern.log
-/var/log/auth.log
-{
-    rotate 3
-    daily
-    maxsize 100M
-    compress
-    delaycompress
-    missingok
-    notifempty
-    create 0640 syslog adm
-    sharedscripts
-    postrotate
-        /usr/lib/rsyslog/rsyslog-rotate 2>/dev/null || true
-    endscript
-}
-LOGROTATE_EOF
-print_ok "Logrotate: /etc/logrotate.d/shieldnode-syslog-aggressive (rotate 3, maxsize 100M)"
+#
+# Старая стратегия (v3.20.3-v3.23.12): отдельный /etc/logrotate.d/shieldnode-syslog-aggressive
+# с теми же путями что и /etc/logrotate.d/rsyslog → DUPLICATE LOG ENTRY error.
+# Logrotate hourly падал status=1 на каждом тике (24 ошибки/сутки).
+#
+# Новая стратегия (v3.23.13+): патчим САМ /etc/logrotate.d/rsyslog добавив
+# maxsize 100M в каждый блок. Это устраняет дубликат и сохраняет owner-семантику
+# rsyslog'а. Если файл недоступен (другой distro?) — fallback к старому подходу
+# но БЕЗ /var/log/syslog и /var/log/kern.log (чтобы не конфликтовать).
+RSYSLOG_LOGROTATE="/etc/logrotate.d/rsyslog"
+if [ -f "$RSYSLOG_LOGROTATE" ] && ! grep -q '# shieldnode-aggressive-marker' "$RSYSLOG_LOGROTATE" 2>/dev/null; then
+    # Бэкап оригинала
+    cp -a "$RSYSLOG_LOGROTATE" "$RSYSLOG_LOGROTATE.shieldnode-bak.$(date +%s)" 2>/dev/null || true
+    # Добавляем maxsize 100M после каждого `rotate N`. Маркер на отдельной строке
+    # (logrotate не поддерживает inline comments после value).
+    sed -i -E '/^\s*rotate\s+[0-9]+\s*$/a\    # shieldnode-aggressive-marker\n    maxsize 100M' "$RSYSLOG_LOGROTATE"
+    print_ok "Logrotate: добавлен maxsize 100M в $RSYSLOG_LOGROTATE (aggressive rotation)"
+elif [ -f "$RSYSLOG_LOGROTATE" ]; then
+    print_info "Logrotate: $RSYSLOG_LOGROTATE уже патчен (maxsize 100M)"
+else
+    # Fallback: rsyslog logrotate config отсутствует (не Debian/Ubuntu? minimal install?)
+    # Создаём наш файл БЕЗ системных путей — только наш events.log уже покрыт
+    # /etc/logrotate.d/shieldnode выше.
+    print_info "Logrotate: /etc/logrotate.d/rsyslog не найден — aggressive rotation skipped"
+fi
+
+# v3.23.13 SR-FIX-8: удаляем legacy /etc/logrotate.d/shieldnode-syslog-aggressive
+# (если есть с v3.20.x — v3.23.12). Он дублировал /etc/logrotate.d/rsyslog.
+if [ -f /etc/logrotate.d/shieldnode-syslog-aggressive ]; then
+    rm -f /etc/logrotate.d/shieldnode-syslog-aggressive
+    print_info "Removed legacy /etc/logrotate.d/shieldnode-syslog-aggressive (duplicate entries with rsyslog)"
+fi
 
 # v3.20.3: Hourly logrotate timer (вместо daily cron)
 # Дефолтный logrotate cron запускается раз в день. При активной ноде с DDoS
@@ -5435,12 +5450,16 @@ After=multi-user.target
 
 [Service]
 Type=oneshot
-# v3.23.5: запускаем только shieldnode-конфиги (не системный logrotate.conf
-# который может зависеть от сторонних broken-конфигов в /etc/logrotate.d/).
-# --state в /var/lib/shieldnode/ изолирует наш state от системного.
-ExecStart=/usr/sbin/logrotate --state /var/lib/shieldnode/logrotate.state /etc/logrotate.d/shieldnode
-ExecStartPost=/usr/sbin/logrotate --state /var/lib/shieldnode/logrotate-syslog.state /etc/logrotate.d/shieldnode-syslog-aggressive
-# Failures игнорируем (exit code от logrotate непредсказуем при многих файлах)
+# v3.23.13 SR-FIX-8: hourly logrotate теперь использует ГЛОБАЛЬНЫЙ конфиг
+# /etc/logrotate.conf (который сам подтягивает /etc/logrotate.d/*).
+# Это даёт maxsize 100M ротацию для rsyslog logs ПОСЛЕ нашего патча
+# /etc/logrotate.d/rsyslog (с aggressive maxsize 100M).
+# Старый подход (ExecStart + ExecStartPost разными конфигами) ломался на
+# duplicate entries и давал 24 ошибки/сутки.
+# State файл /var/lib/shieldnode/logrotate-hourly.state — отдельный от
+# системного /var/lib/logrotate/status чтобы daily cron работал независимо.
+ExecStart=/usr/sbin/logrotate --state /var/lib/shieldnode/logrotate-hourly.state /etc/logrotate.conf
+# Failures игнорируем — exit code 1 (skipped logs) считается успехом
 SuccessExitStatus=0 1 2
 
 Restart=on-failure
@@ -8463,7 +8482,9 @@ if [ "$DISK_USAGE" -ge 80 ]; then
         if [ -f "$log" ]; then
             SIZE=$(stat -c%s "$log" 2>/dev/null || echo 0)
             if [ "$SIZE" -gt 209715200 ]; then  # > 200MB
-                logrotate -f /etc/logrotate.d/shieldnode-syslog-aggressive 2>/dev/null && \
+                # v3.23.13 SR-FIX-8: используем /etc/logrotate.d/rsyslog
+                # (наш патч добавил maxsize 100M туда)
+                logrotate -f /etc/logrotate.d/rsyslog 2>/dev/null && \
                     LARGE_LOGS_ROTATED=$((LARGE_LOGS_ROTATED + 1))
             fi
         fi
