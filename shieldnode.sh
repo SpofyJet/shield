@@ -1,7 +1,68 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.23.12 (Commercial Edition) — COSMETIC FIX
+#  VPN NODE DDoS PROTECTION v3.23.13 (Commercial Edition) — SECURITY HARDENING
+#
+#  Что нового vs v3.23.12 (results of static security audit):
+#
+#  === P0 SECURITY FIXES ===
+#    - BUG-002 FIX: SQL injection через journald. Aggregator теперь фильтрует
+#      journalctl по `_TRANSPORT=kernel + SYSLOG_IDENTIFIER=kernel + crowdsec`,
+#      применяет gsub очистку SRC= для ВСЕХ handlers (раньше [shield:ddos] и
+#      [UFW BLOCK] не чистили IP), валидирует IPv4 format перед SQL INSERT.
+#      Любой непривилегированный пользователь раньше мог через `logger` инжектить
+#      строки с фейковым [shield:ddos] SRC=... и засорять / SQL injection events.db.
+#
+#    - BUG-003 FIX: Bogon-фильтр threat-feeds. min prefix /16 для threat (был /8 —
+#      compromised feed мог затолкать 1.0.0.0/8 и забанить Cloudflare). Добавлены
+#      CGNAT (100.64/10), TEST-NET-1/2/3, benchmark (198.18/19). MAX_FEED_ENTRIES
+#      cap (200k threat / 100k scanner / 10k tor / 50k custom). Alert при >20%
+#      росте от peak.
+#      FAIL_THRESHOLD больше НЕ flush'ит set — stale data > no protection.
+#
+#    - BUG-006 FIX: shield_safe_source убрал 0644 из allowed perms. Все
+#      shieldnode.conf теперь chmod 0640 (root:root). Files с 0644 auto-fixed.
+#
+#  === P0 FUNCTIONAL REGRESSION FIXES ===
+#    - BUG-004 CRIT FIX: auto-promote был мёртв.
+#      a) [shield:conn_flood] log prefix вообще не генерился в nft template —
+#         aggregator awk парсил /\[shield:conn_flood\]/ впустую. Добавлен с
+#         rate-limit 1/sec.
+#      b) auto-promote query искал `type='syn_flood'` — но aggregator пишет
+#         только `syn_escalate` (typo с рефакторинга v3.15.x). Исправлено на
+#         `IN ('conn_flood','syn_escalate','newconn_flood')`.
+#      c) Threat/custom/scanner/tor/ddos/syn_escalate/udp_escalate log prefix
+#         теперь ВСЕГДА активны с rate-limit (не зависят от VERBOSE_LOGS).
+#         events.db, auto-promote, guard top attackers — работают по default.
+#
+#  === P0 RESOURCE PROTECTION ===
+#    - BUG-007 FIX: aggregator RAM blow-up. MAX_UNIQUE_IPS_PER_TYPE=50000 hash
+#      cap. MemoryMax=512M MemoryHigh=384M TasksMax=20 CPUQuota=80% на systemd
+#      unit. Storm-mode warning через logger при превышении cap'а.
+#
+#  === P1 ROBUSTNESS ===
+#    - BUG-010 FIX: pcap-archiver. tar.zst compression >7d, retention 30d
+#      теперь реально работает в archiver runtime (раньше жил только в
+#      install-time disk cleanup, почти не срабатывал).
+#    - BUG-012 FIX: conntrack snapshot полный + gzip (раньше head -10000
+#      без compress, 5-15MB/archive). Через conntrack -L -o save (netlink).
+#    - BUG-014 FIX: state-file cap LOG_STATE_MAX_ENTRIES=30000 keep-top-by-recency.
+#    - BUG-015 FIX: VACUUM → VACUUM INTO + atomic mv + integrity_check + rollback.
+#      Non-blocking, aggregator берёт shared flock на /run/shieldnode/db.lock.
+#    - BUG-019 FIX: /etc/shieldnode/limits.conf с 17 настраиваемыми параметрами.
+#      Embedded scripts через __PLACEHOLDER__ sed-substitution.
+#    - BUG-020 FIX: journalctl фильтр (см. BUG-002), --lines=200000.
+#    - BUG-021 FIX: финальный stale ct=5000 в guard CLI dashboard → ct=15000.
+#
+#  === LEGACY CLEANUP ===
+#    - Удалены deprecated переменные mobile_ru/broadband_ru, MAXMIND.
+#    - Удалён install-time cs-ssh-whitelist cleanup (≤v3.4 EOL 2 года).
+#    - Удалён subnet-aggregator (v3.23.3-rc never released stable).
+#
+#  Что НЕ пофиксили (вне scope этого hardening release):
+#    - BUG-001 (IPv6 не защищён) — архитектурный, требует full v6 ruleset.
+#    - BUG-005 (upgrade без crypto verify) — требует GPG/Sigstore signing.
+#    - Полный legacy cleanup mobile_ru/broadband_ru uninstall units (50 строк).
 #
 #  Что нового vs v3.23.11:
 #    - FIX: финальное сообщение установщика и Settings меню показывали
@@ -225,7 +286,7 @@
 #      → tor_exit_blocklist_v4 drop (~840 IP, only if BLOCK_TOR=1)
 #      → infrastructure_v4 accept  (~220 CIDR — CF/Google/AWS/Azure/Apple/...)
 #      → confirmed_attack_v4 drop  (banned 15min after 2nd offence)
-#      → conn_flood (ct>50000) → suspect_v4 → confirmed
+#      → conn_flood (ct>15000) → suspect_v4 → confirmed
 #      → newconn_rate (40000/min burst 60000) → suspect → confirmed
 #      → syn_flood (2000/sec burst 3000) → suspect → confirmed
 #      → udp_flood (10000/sec burst 20000) → suspect → confirmed
@@ -312,7 +373,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.23.12"
+SHIELDNODE_VERSION="3.23.13"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -342,8 +403,18 @@ shield_safe_source() {
         echo "WARN: $f не принадлежит root (owner=$owner) — пропускаю source" >&2
         return 1
     fi
+    # v3.23.13 BUG-006 FIX: 0644 убран из разрешённых. TRUSTED_IPS, BRIDGE_IPS,
+    # CrowdSec settings — sensitive infrastructure data, не должны быть
+    # world-readable. Поддерживается только 600 (owner-only) или 640
+    # (root + adm group для logreader). Files с 0644 — auto-chmod в 0640
+    # с warning'ом (миграция со старых установок).
+    if [ "$perms" = "644" ]; then
+        echo "INFO: $f имеет 0644 (legacy) — фиксим в 0640 для безопасности" >&2
+        chmod 0640 "$f" 2>/dev/null
+        perms="640"
+    fi
     case "$perms" in
-        600|640|644) ;;
+        600|640) ;;
         *)
             echo "WARN: $f имеет небезопасные права ($perms) — пропускаю source" >&2
             return 1
@@ -351,6 +422,24 @@ shield_safe_source() {
     esac
     # shellcheck source=/dev/null
     . "$f" 2>/dev/null || true
+    return 0
+}
+
+# v3.23.13 SR-FIX-4: проверка после sed-подстановки placeholders.
+# Если в embedded скрипте остался незаменённый `__SHIELD_*__` placeholder —
+# значит соответствующая SHIELD_* переменная была пустая, или sed выпал.
+# Fail loud, не silent — иначе скрипт упадёт при первом запуске с криптичной
+# ошибкой ('cannot parse "__SHIELD_..._DAYS__" as integer').
+verify_no_placeholders() {
+    local file="$1"
+    local residuals
+    residuals=$(grep -oE '__SHIELD_[A-Z_]+__' "$file" 2>/dev/null | sort -u | tr '\n' ' ')
+    if [ -n "$residuals" ]; then
+        print_error "FATAL: placeholder substitution failed in $file"
+        print_error "  Unresolved placeholders: $residuals"
+        print_error "  Возможные причины: SHIELD_* env vars не заданы, или sed выпал."
+        return 1
+    fi
     return 0
 }
 
@@ -406,15 +495,19 @@ ENABLE_VERSION_CHECK="${ENABLE_VERSION_CHECK:-1}"
 DEFAULT_GITHUB_SYNC_INTERVAL="6h"
 DEFAULT_VERSION_CHECK_INTERVAL="1d"
 
-# v3.23.0: SHIELDNODE_VERBOSE_LOGS — toggle для nft `log prefix [shield:*]` правил.
-#   0 (default): только counter+drop без log prefix. Минимум disk-writes,
-#     минимум journald CPU. guard CLI всё равно показывает counters (счётчики
-#     обновляются независимо от log). Aggregator (events.db) при =0 будет
-#     получать пустые batches — это OK, оператору обычно нужны live-counters.
-#   1: полный log prefix как в v3.22.x — для debug сессий. Aggregator парсит
-#     journald в events.db (history "top attackers" etc).
-# Примерный профит =0 на проде: ~3000 log lines/hour убираются, что даёт
-# заметное снижение disk I/O / journald CPU на shared-disk VPS.
+# v3.23.0/v3.23.13: SHIELDNODE_VERBOSE_LOGS — toggle для HIGH-VOLUME per-packet
+# log правил (tcp_invalid, fib_spoof). Эти срабатывают на КАЖДОМ packet с
+# bad-flag комбинацией — могут давать тысячи log lines/sec под scan'ом.
+#
+# v3.23.13 ВАЖНОЕ ИЗМЕНЕНИЕ: события для events.db attribution
+# (threat/custom/scanner/tor/conn_flood/syn_escalate/udp_escalate/ddos)
+# теперь логируются ВСЕГДА с агрессивным rate-limit (1/sec burst 5).
+# Это max 3600 строк/час × 8 типов = ~28k строк/час, что << 37GB inцидент
+# (тот был БЕЗ rate-limit). Без этих log'ов events.db и auto-promote мёртвы
+# (см. v3.23.13 BUG-004 fix).
+#
+#   SHIELDNODE_VERBOSE_LOGS=0 (default): только critical events с rate-limit.
+#   SHIELDNODE_VERBOSE_LOGS=1: + tcp_invalid + fib_spoof + ssh per-packet (debug).
 SHIELDNODE_VERBOSE_LOGS="${SHIELDNODE_VERBOSE_LOGS:-0}"
 
 # v3.12.0: detect pipe-mode (curl | bash) vs git-clone-mode (./shieldnode.sh)
@@ -458,13 +551,14 @@ DEFAULT_REMOTE_BLOCKLISTS=(
     # v3.20.0: mobile_ru + broadband_ru URLs УБРАНЫ
 )
 
-DEFAULT_MOBILE_RU_UPDATE_INTERVAL="1d"   # v3.20.0: DEPRECATED, оставлено для compat
-DEFAULT_BROADBAND_RU_UPDATE_INTERVAL="1d"  # v3.20.0: DEPRECATED, оставлено для compat
 
 DEFAULT_SCANNER_UPDATE_INTERVAL="6h"
 DEFAULT_THREAT_UPDATE_INTERVAL="1d"
 DEFAULT_TOR_UPDATE_INTERVAL="1h"
 DEFAULT_CUSTOM_UPDATE_INTERVAL="6h"   # для custom: timer редкий, основной trigger — path-watcher
+
+# v3.23.13 LEGACY CLEANUP: DEFAULT_MOBILE_RU_UPDATE_INTERVAL и
+# DEFAULT_BROADBAND_RU_UPDATE_INTERVAL удалены (DEPRECATED с v3.20.0).
 
 DEFAULT_MIN_ENTRIES_SCANNER=100
 DEFAULT_MIN_ENTRIES_THREAT=5000
@@ -472,6 +566,41 @@ DEFAULT_MIN_ENTRIES_TOR=100
 DEFAULT_MIN_ENTRIES_CUSTOM=0
 
 DEFAULT_FAIL_THRESHOLD=3
+
+# === v3.23.13 BUG-019 FIX: TUNABLE LIMITS ===
+# Все hardcoded thresholds которые могут потребовать tuning под разные
+# профили нагрузки (50 клиентов vs 2000 клиентов на ноде). Дефолты подходят
+# для 100-200 клиентов на 4-8GB ноде. Оператор может переопределить через
+# /etc/shieldnode/limits.conf (генерируется при установке).
+SHIELD_CT_CONN_FLOOD="${SHIELD_CT_CONN_FLOOD:-15000}"
+SHIELD_RATE_NEWCONN="${SHIELD_RATE_NEWCONN:-40000/minute}"
+SHIELD_RATE_NEWCONN_BURST="${SHIELD_RATE_NEWCONN_BURST:-60000}"
+SHIELD_RATE_SYN="${SHIELD_RATE_SYN:-2000/second}"
+SHIELD_RATE_SYN_BURST="${SHIELD_RATE_SYN_BURST:-3000}"
+SHIELD_RATE_UDP="${SHIELD_RATE_UDP:-10000/second}"
+SHIELD_RATE_UDP_BURST="${SHIELD_RATE_UDP_BURST:-20000}"
+SHIELD_SSH_CT_LIMIT="${SHIELD_SSH_CT_LIMIT:-5}"
+SHIELD_SSH_NEWCONN_RATE="${SHIELD_SSH_NEWCONN_RATE:-8/minute}"
+SHIELD_SSH_NEWCONN_BURST="${SHIELD_SSH_NEWCONN_BURST:-20}"
+SHIELD_AUTOPROMOTE_THRESHOLD="${SHIELD_AUTOPROMOTE_THRESHOLD:-2000}"
+SHIELD_AUTOPROMOTE_WINDOW_HOURS="${SHIELD_AUTOPROMOTE_WINDOW_HOURS:-24}"
+SHIELD_CUSTOM_LOCAL_TTL_DAYS="${SHIELD_CUSTOM_LOCAL_TTL_DAYS:-90}"
+SHIELD_EVENTS_DB_RETENTION_DAYS="${SHIELD_EVENTS_DB_RETENTION_DAYS:-90}"
+SHIELD_PCAP_TRIGGER_DROPS="${SHIELD_PCAP_TRIGGER_DROPS:-10000}"
+SHIELD_PCAP_RETENTION_DAYS="${SHIELD_PCAP_RETENTION_DAYS:-30}"
+SHIELD_AGG_JOURNAL_LINES="${SHIELD_AGG_JOURNAL_LINES:-200000}"
+SHIELD_AGG_MAX_UNIQUE_IPS="${SHIELD_AGG_MAX_UNIQUE_IPS:-50000}"
+
+# Load operator overrides if present
+SHIELD_LIMITS_FILE="/etc/shieldnode/limits.conf"
+if [ -f "$SHIELD_LIMITS_FILE" ]; then
+    # shellcheck source=/dev/null
+    if shield_safe_source "$SHIELD_LIMITS_FILE" 2>/dev/null; then
+        :
+    else
+        print_warn "limits.conf failed safe-source check, using defaults"
+    fi
+fi
 
 # nft set names — для совместимости с v3.11.x state на проде сохраняем
 # имя tor_exit_blocklist_v4 (старое). Маппинг: имя в updater'е → реальный nft set.
@@ -488,12 +617,6 @@ shield_nft_set_name() {
 
 # v3.13.0: mobile-RU whitelist defaults
 # v3.14.1: эти переменные тоже подхватятся из shieldnode.conf если оператор
-# изменил их через guard CLI settings menu (загружен выше до этого блока).
-ENABLE_RU_MOBILE_WHITELIST="${ENABLE_RU_MOBILE_WHITELIST:-1}"
-ENABLE_RU_BROADBAND_WHITELIST="${ENABLE_RU_BROADBAND_WHITELIST:-1}"  # v3.19.0
-# v3.18.8: MAXMIND_LICENSE_KEY полностью удалён (с v3.15.0 не использовался,
-# с v3.18.3 mobile-RU работает через github sync из RIPEstat — без ключей).
-
 # v3.18.8: TRUSTED_IPS — comma-separated список доверенных IP'шников твоей
 # инфраструктуры (другие ноды, панель, мониторинг). Для каждого IP при установке
 # применяется полный trust-stack:
@@ -506,8 +629,12 @@ ENABLE_RU_BROADBAND_WHITELIST="${ENABLE_RU_BROADBAND_WHITELIST:-1}"  # v3.19.0
 # Управление через 'sudo guard' → [s] settings → [t] Trusted IPs.
 TRUSTED_IPS="${TRUSTED_IPS:-}"
 
-DEFAULT_MIN_ENTRIES_MOBILE_RU=100   # ниже — что-то сломалось у RIPEstat в github actions
-DEFAULT_MIN_ENTRIES_BROADBAND_RU=500  # v3.19.0: broadband-RU список больше (10+ ASN)
+# v3.23.13 LEGACY CLEANUP:
+# Удалены deprecated переменные (v3.20.0):
+#   ENABLE_RU_MOBILE_WHITELIST, ENABLE_RU_BROADBAND_WHITELIST,
+#   DEFAULT_MIN_ENTRIES_MOBILE_RU, DEFAULT_MIN_ENTRIES_BROADBAND_RU,
+#   MAXMIND_LICENSE_KEY (deprecated v3.15.0).
+# Эти переменные больше нигде не читаются. uninstall очищает legacy unit'ы.
 
 # ==============================================================================
 # UNINSTALL MODE
@@ -767,22 +894,10 @@ fi
 # Делаем тихо — если ничего нет, ничего не происходит.
 # Полная зачистка остаётся в --uninstall блоке.
 
-LEGACY_CLEANED=0
-
-# v≤3.4: SSH-key auto-whitelist (удалён в v3.5)
-if [ -f /etc/systemd/system/cs-ssh-whitelist.service ]; then
-    systemctl disable --now cs-ssh-whitelist 2>/dev/null || true
-    rm -f /etc/systemd/system/cs-ssh-whitelist.service
-    rm -f /usr/local/sbin/cs-ssh-key-whitelist.sh
-    rm -f /etc/crowdsec/postoverflows/s01-whitelist/ssh-key-whitelist.yaml
-    rm -rf /run/cs-ssh-whitelist
-    systemctl daemon-reload 2>/dev/null || true
-    LEGACY_CLEANED=1
-fi
-
-if [ "$LEGACY_CLEANED" = "1" ]; then
-    print_status "Legacy cleanup: удалены артефакты ≤v3.4 (cs-ssh-whitelist)"
-fi
+# v3.23.13 LEGACY CLEANUP: блок удаления cs-ssh-whitelist (≤v3.4 EOL ~2 года
+# назад) убран отсюда. Аналогичный cleanup остаётся в uninstall и в
+# explicit legacy-cleanup секции — для оператора который мигрирует с очень
+# старой версии.
 
 # ==============================================================================
 # v3.18.0: PRE-INSTALL CONFIGURATION
@@ -852,7 +967,7 @@ write_preinstall_conf() {
             grep -vE '^[[:space:]]*(#|$|BRIDGE_IPS=|PANEL_TYPE=)' "$PREINSTALL_CONF" 2>/dev/null || true
         fi
     } > "$tmp"
-    chmod 0644 "$tmp"
+    chmod 0640 "$tmp"
     mv "$tmp" "$PREINSTALL_CONF"   # atomic — same FS
 }
 
@@ -962,7 +1077,7 @@ if [ -n "${BRIDGE_IPS:-}" ]; then
         mkdir -p /etc/shieldnode
         if [ ! -e "$SHIELD_CONF" ]; then
             touch "$SHIELD_CONF"
-            chmod 0644 "$SHIELD_CONF"
+            chmod 0640 "$SHIELD_CONF"
         fi
         EXISTING_TRUSTED=$(grep -E '^TRUSTED_IPS=' "$SHIELD_CONF" 2>/dev/null | head -1 | \
             sed -E 's/^TRUSTED_IPS="?([^"]*)"?.*/\1/')
@@ -1048,7 +1163,7 @@ if command -v ufw >/dev/null 2>&1 && \
         mkdir -p /etc/shieldnode
         if [ ! -e "$SHIELD_CONF" ]; then
             touch "$SHIELD_CONF"
-            chmod 0644 "$SHIELD_CONF"
+            chmod 0640 "$SHIELD_CONF"
         fi
 
         # Текущий TRUSTED_IPS (может быть пустой)
@@ -2307,6 +2422,80 @@ NFT_CONF_DIR="/etc/nftables.d"
 NFT_DDOS_CONF="$NFT_CONF_DIR/ddos-protect.conf"
 mkdir -p "$NFT_CONF_DIR"
 
+# v3.23.13 BUG-019 FIX: создание /etc/shieldnode/limits.conf при первом install.
+# Файл создаётся только если его НЕТ — повторная установка не затирает
+# оператор-кастомизации.
+if [ ! -f "$SHIELD_LIMITS_FILE" ]; then
+    mkdir -p /etc/shieldnode
+    cat > "$SHIELD_LIMITS_FILE" <<'LIMITS_EOF'
+# /etc/shieldnode/limits.conf — настраиваемые лимиты shieldnode.
+#
+# Файл sourced'ится из shieldnode.sh при install/upgrade И при запуске
+# embedded скриптов через placeholders. Перезагрузка nft после изменения:
+#   sudo systemctl restart shieldnode-nftables.service
+# Для применения к auto-promote/aggregator/cleanup — запустить
+#   sudo bash $(curl -fsSL https://raw.githubusercontent.com/SpofyJet/shield/main/shieldnode.sh -o /tmp/sn.sh && echo /tmp/sn.sh)
+# или просто \`guard upgrade\`.
+#
+# Дефолты подходят для 100-200 клиентов на 4-8GB ноде. Тuning:
+#   - Маленькая нода (<50 клиентов): SHIELD_CT_CONN_FLOOD=3000
+#   - Большая нода (>1000 клиентов): SHIELD_CT_CONN_FLOOD=50000
+#
+# Безопасность: файл должен быть owned root:root, perms 0640.
+# shield_safe_source проверяет это при загрузке.
+
+# ─── Per-IP conntrack лимит (защита от conn-flood/slowloris) ───
+# 15000 = baseline 20× от пика реальных юзеров. Срезает все известные ботнеты.
+SHIELD_CT_CONN_FLOOD=15000
+
+# ─── Per-IP new connection rate-limit ───
+# 40000/min = baseline для 500-1000 клиентов с CGNAT.
+SHIELD_RATE_NEWCONN="40000/minute"
+SHIELD_RATE_NEWCONN_BURST=60000
+
+# ─── Per-IP SYN rate-limit ───
+SHIELD_RATE_SYN="2000/second"
+SHIELD_RATE_SYN_BURST=3000
+
+# ─── Per-IP UDP rate-limit ───
+SHIELD_RATE_UDP="10000/second"
+SHIELD_RATE_UDP_BURST=20000
+
+# ─── SSH защита (защита от bruteforce + SYN flood на 22) ───
+SHIELD_SSH_CT_LIMIT=5
+SHIELD_SSH_NEWCONN_RATE="8/minute"
+SHIELD_SSH_NEWCONN_BURST=20
+
+# ─── Auto-promote (events.db → custom-local.txt permanent ban) ───
+# IP с >=THRESHOLD hits за WINDOW_HOURS попадает в local blocklist на TTL_DAYS.
+SHIELD_AUTOPROMOTE_THRESHOLD=2000
+SHIELD_AUTOPROMOTE_WINDOW_HOURS=24
+SHIELD_CUSTOM_LOCAL_TTL_DAYS=90
+
+# ─── Retention ───
+SHIELD_EVENTS_DB_RETENTION_DAYS=90
+SHIELD_PCAP_RETENTION_DAYS=30
+SHIELD_PCAP_TRIGGER_DROPS=10000
+
+# ─── Aggregator (защита от RAM blow-up при rotating-IP storm) ───
+# JOURNAL_LINES — лимит на journalctl --lines (cap per-tick).
+# MAX_UNIQUE_IPS — hard cap на bash hash size per-type. После cap'а новые IP
+# дропаются (но nft drops продолжают работать независимо).
+SHIELD_AGG_JOURNAL_LINES=200000
+SHIELD_AGG_MAX_UNIQUE_IPS=50000
+LIMITS_EOF
+    chmod 0640 "$SHIELD_LIMITS_FILE"
+    chown root:root "$SHIELD_LIMITS_FILE"
+    print_ok "Created $SHIELD_LIMITS_FILE (limits.conf)"
+
+    # Re-source чтобы overrides из только что созданного файла применились
+    if shield_safe_source "$SHIELD_LIMITS_FILE" 2>/dev/null; then
+        :
+    fi
+else
+    print_info "Using existing $SHIELD_LIMITS_FILE"
+fi
+
 # v3.8: подготовка conditional-правил для nft template.
 # fib anti-spoofing — только на single-homed VPS.
 # v3.23.0: log prefix в правиле fib_spoof тоже опционален (SHIELDNODE_VERBOSE_LOGS=1).
@@ -2353,27 +2542,25 @@ fi
 # Хитрость: ВЕСЬ блок генерируется одной переменной (включая все строки правила
 # с обратными слэшами для line-continuation). При =0 переменная пустая → блок
 # полностью отсутствует в nft conf, синтаксис не ломается.
+# При =1 — лог-правила добавляются как в v3.22.x для aggregator/events.db.
+#
+# Хитрость: ВЕСЬ блок генерируется одной переменной (включая все строки правила
+# с обратными слэшами для line-continuation). При =0 переменная пустая → блок
+# полностью отсутствует в nft conf, синтаксис не ломается.
+#
+# v3.23.13 BUG-004 FIX: SHIELD_LOG_*_FULL переменные для blocklist/escalation
+# УБРАНЫ — соответствующие log правила теперь hardcoded в template с
+# rate-limit 1/sec (всегда активны). Без них events.db никогда не получала
+# attribution events → auto-promote был полностью мёртв.
+# Только SHIELD_LOG_TCP_INVALID остался под toggle — это high-volume per-packet
+# rule (nmap сканеры), действительно может дать тысячи строк/sec без burst-rate.
 if [ "$SHIELDNODE_VERBOSE_LOGS" = "1" ]; then
-    print_info "Verbose logs ENABLED (SHIELDNODE_VERBOSE_LOGS=1) — full log prefix on drop rules"
+    print_info "Verbose logs ENABLED (SHIELDNODE_VERBOSE_LOGS=1) — + tcp_invalid + fib_spoof per-packet log"
     SHIELD_LOG_TCP_INVALID=$'\n        tcp flags & (fin|syn) == (fin|syn) limit rate 1/second burst 5 packets \\\n            log prefix "[shield:tcp_invalid] " level info flags ip options\n        tcp flags & (syn|rst) == (syn|rst) limit rate 1/second burst 5 packets \\\n            log prefix "[shield:tcp_invalid] " level info flags ip options\n        tcp flags & (fin|rst) == (fin|rst) limit rate 1/second burst 5 packets \\\n            log prefix "[shield:tcp_invalid] " level info flags ip options\n        tcp flags & (fin|syn|rst|psh|ack|urg) == 0x0 limit rate 1/second burst 5 packets \\\n            log prefix "[shield:tcp_invalid] " level info flags ip options\n        tcp flags & (fin|syn|rst|psh|ack|urg) == (fin|psh|urg) limit rate 1/second burst 5 packets \\\n            log prefix "[shield:tcp_invalid] " level info flags ip options'
-    SHIELD_LOG_THREAT_FULL=$'\n        ip saddr @threat_blocklist_v4 limit rate 1/second \\\n            log prefix "[shield:threat] " level info flags ip options \\\n            counter name threat_drops_v4 drop'
-    SHIELD_LOG_CUSTOM_FULL=$'\n        ip saddr @custom_blocklist_v4 limit rate 1/second \\\n            log prefix "[shield:custom] " level info flags ip options \\\n            counter name custom_drops_v4 drop'
-    SHIELD_LOG_SCANNER_FULL=$'\n        ip saddr @scanner_blocklist_v4 limit rate 1/second \\\n            log prefix "[shield:scanner] " level info flags ip options \\\n            counter name scanner_drops_v4 drop'
-    SHIELD_LOG_TOR_FULL=$'\n        ip saddr @tor_exit_blocklist_v4 limit rate 1/second \\\n            log prefix "[shield:tor] " level info flags ip options \\\n            counter name tor_drops_v4 drop'
-    SHIELD_LOG_DDOS_FULL=$'\n        ip saddr @confirmed_attack_v4 limit rate 1/second \\\n            log prefix "[shield:ddos] " level info flags ip options \\\n            counter name confirmed_drops_v4 drop'
-    SHIELD_LOG_SYN_ESC_FULL=$'        ip saddr @suspect_v4 add @confirmed_attack_v4 { ip saddr } \\\n            limit rate 1/second burst 5 packets \\\n            log prefix "[shield:syn_escalate] " level info flags ip options \\\n            counter name syn_confirmed_v4 drop'
-    SHIELD_LOG_UDP_ESC_FULL=$'        ip saddr @suspect_v4 add @confirmed_attack_v4 { ip saddr } \\\n            limit rate 1/second burst 5 packets \\\n            log prefix "[shield:udp_escalate] " level info flags ip options \\\n            counter name udp_confirmed_v4 drop'
 else
-    print_info "Verbose logs DISABLED (default, SHIELDNODE_VERBOSE_LOGS=0) — counter-only mode"
-    print_info "  Включить для debug:  SHIELDNODE_VERBOSE_LOGS=1 sudo bash shieldnode.sh"
+    print_info "Verbose logs DISABLED (default) — blocklist/escalation attribution still active (always-on)"
+    print_info "  Включить tcp_invalid + fib_spoof debug:  SHIELDNODE_VERBOSE_LOGS=1 sudo bash shieldnode.sh"
     SHIELD_LOG_TCP_INVALID=""
-    SHIELD_LOG_THREAT_FULL=""
-    SHIELD_LOG_CUSTOM_FULL=""
-    SHIELD_LOG_SCANNER_FULL=""
-    SHIELD_LOG_TOR_FULL=""
-    SHIELD_LOG_DDOS_FULL=""
-    SHIELD_LOG_SYN_ESC_FULL=""
-    SHIELD_LOG_UDP_ESC_FULL=""
 fi
 
 cat > "$NFT_DDOS_CONF" <<EOF
@@ -2662,22 +2849,32 @@ $SHIELD_LOG_TCP_INVALID
         # === v3.12.0: THREAT BLOCKLIST (Spamhaus DROP, FireHOL Level 1) ===
         # High-confidence криминальные сети. Идёт ПЕРВЫМ — самый дорогой
         # источник нежелательного трафика, отсекаем сразу.
-        # v3.23.0: log-rule опционален (SHIELDNODE_VERBOSE_LOGS=1).
-        # Counter-rule всегда активен — guard CLI читает счётчик независимо.
-$SHIELD_LOG_THREAT_FULL
+        # v3.23.13 BUG-004 FIX: log ВСЕГДА активен.
+        # v3.23.13 SR-FIX-1: meter (per-IP rate-limit) вместо global limit.
+        # Раньше `limit rate 1/sec` был GLOBAL — под массивной атакой
+        # залогировался бы только один IP в секунду. С meter — 1/min per IP,
+        # каждый атакующий получит attribution хотя бы раз в минуту.
+        # Лимит per-IP × timeout 1h автоматически собирает только активных.
+        ip saddr @threat_blocklist_v4 \\
+            meter shield_threat_log { ip saddr limit rate 1/minute burst 5 packets } \\
+            log prefix "[shield:threat] " level info flags ip options
         ip saddr @threat_blocklist_v4 counter name threat_drops_v4 drop
 
         # === v3.12.0: CUSTOM BLOCKLIST (operator personal IPs) ===
         # Источник: /etc/shieldnode/lists/custom.txt (+ опциональные URL'ы).
         # Идёт после threat но до scanner — оператор может явно перехватить
         # любой IP даже если других списков его пока нет.
-$SHIELD_LOG_CUSTOM_FULL
+        ip saddr @custom_blocklist_v4 \\
+            meter shield_custom_log { ip saddr limit rate 1/minute burst 5 packets } \\
+            log prefix "[shield:custom] " level info flags ip options
         ip saddr @custom_blocklist_v4 counter name custom_drops_v4 drop
 
         # Pre-emptive drop известных сканеров (с counter v2.7).
         # Стоит ПЕРЕД rate-limit — экономит conntrack-слоты и CPU.
-        # v3.23.0: log опционален — counter всегда активен.
-$SHIELD_LOG_SCANNER_FULL
+        # v3.23.13 BUG-004 + SR-FIX-1: log ВСЕГДА с per-IP rate-limit.
+        ip saddr @scanner_blocklist_v4 \\
+            meter shield_scanner_log { ip saddr limit rate 1/minute burst 5 packets } \\
+            log prefix "[shield:scanner] " level info flags ip options
         ip saddr @scanner_blocklist_v4 counter name scanner_drops_v4 drop
 
         # SSH защита перемещена ниже tor_blocklist drop (v3.21.1)
@@ -2687,8 +2884,9 @@ $SHIELD_LOG_SCANNER_FULL
         # Set заполняется только если оператор активировал BLOCK_TOR=1.
         # Иначе set пустой, эти 2 правила — no-op (overhead близок к нулю,
         # nft проверка пустого set'а — O(1)).
-        # v3.23.0: log опционален.
-$SHIELD_LOG_TOR_FULL
+        ip saddr @tor_exit_blocklist_v4 \\
+            meter shield_tor_log { ip saddr limit rate 1/minute burst 5 packets } \\
+            log prefix "[shield:tor] " level info flags ip options
         ip saddr @tor_exit_blocklist_v4 counter name tor_drops_v4 drop
 
         # === v3.21.5: INFRASTRUCTURE BYPASS ===
@@ -2749,8 +2947,8 @@ $SHIELD_LOG_TOR_FULL
         #   - ansible parallel deploy (4 ноды одновременно)
         #   - случайно ушедший zombie SSH (timeout не закрылся)
         # CrowdSec + scanner_blocklist дают defence in depth поверх этих лимитов.
-        tcp dport { $SSH_PORTS_NFT } ct state new add @ssh_connlimit_v4 { ip saddr ct count over 5 } counter name ssh_conn_flood_v4 drop
-        tcp dport { $SSH_PORTS_NFT } ct state new add @ssh_newconn_rate_v4 { ip saddr limit rate over 8/minute burst 20 packets } counter name ssh_newconn_flood_v4 drop
+        tcp dport { $SSH_PORTS_NFT } ct state new add @ssh_connlimit_v4 { ip saddr ct count over $SHIELD_SSH_CT_LIMIT } counter name ssh_conn_flood_v4 drop
+        tcp dport { $SSH_PORTS_NFT } ct state new add @ssh_newconn_rate_v4 { ip saddr limit rate over $SHIELD_SSH_NEWCONN_RATE burst $SHIELD_SSH_NEWCONN_BURST packets } counter name ssh_newconn_flood_v4 drop
         # Прошёл все blocklist'ы и оба лимита — пропускаем дальше к sshd.
         tcp dport { $SSH_PORTS_NFT } accept
 
@@ -2758,8 +2956,12 @@ $SHIELD_LOG_TOR_FULL
         # Двухэтапная проверка перед баном — снижает ложные баны CGNAT/мобильных.
         #
         # Этап 0: Если IP в confirmed_attack — он уже подтверждённый атакующий, дропаем.
-        # v3.23.0: при SHIELDNODE_VERBOSE_LOGS=1 добавится log-rule перед drop.
-$SHIELD_LOG_DDOS_FULL
+        # v3.23.13 BUG-004 + SR-FIX-1: log ВСЕГДА активен с per-IP rate-limit
+        # (1/min per IP через meter — каждый confirmed attacker получает
+        # хотя бы один log per minute даже под массивным штормом).
+        ip saddr @confirmed_attack_v4 \\
+            meter shield_ddos_log { ip saddr limit rate 1/minute burst 5 packets } \\
+            log prefix "[shield:ddos] " level info flags ip options
         ip saddr @confirmed_attack_v4 counter name confirmed_drops_v4 drop
 
         # === v3.5+v3.9: CONNECTION-FLOOD / SLOWLORIS ЗАЩИТА ===
@@ -2810,8 +3012,24 @@ $SHIELD_LOG_DDOS_FULL
         # 15000 = запас 20x от пика, при этом срезает все известные ботнеты
         # (топ атакующих в инциденте были >11k conn/IP).
         # v3.20.3: log УБРАН с этого правила (lograte 10000 строк/sec).
+        # v3.23.13 BUG-004a + SR-FIX-1 FIX: добавлено ОТДЕЛЬНОЕ log правило
+        # с per-IP meter — не trigger'ит add @set, не дропает.
+        # Семантика: log срабатывает когда IP достиг threshold-1 (на грани),
+        # meter rate-limit 1/min per-IP даёт fair attribution даже при
+        # massive ботнете (каждый атакующий хоть раз логируется в минуту).
+        #
+        # Архитектура:
+        #   (1) Log-rule: `ct count over <X-1>` БЕЗ `add @set` — match только.
+        #       meter per-IP rate-limit (1/min). Counter+drop НЕТ — пакет идёт
+        #       дальше в правило (2).
+        #   (2) Drop rule (как в v3.23.12): atomic match-add-counter-drop.
+        #       Counter показывает реальные дропы.
         tcp dport @protected_ports_tcp ct state new \\
-            add @connlimit_v4 { ip saddr ct count over 15000 } \\
+            ct count over $((SHIELD_CT_CONN_FLOOD - 1)) \\
+            meter shield_conn_flood_log { ip saddr limit rate 1/minute burst 5 packets } \\
+            log prefix "[shield:conn_flood] " level info flags ip options
+        tcp dport @protected_ports_tcp ct state new \\
+            add @connlimit_v4 { ip saddr ct count over $SHIELD_CT_CONN_FLOOD } \\
             counter name conn_flood_v4 drop
 
         # === NEW CONNECTION RATE-LIMIT ===
@@ -2823,7 +3041,7 @@ $SHIELD_LOG_DDOS_FULL
         # История: v3.0=200/min → v3.12.0=500/min → v3.18.13=1500/min →
         #          v3.20.0=3000/min → v3.20.1=5000/min → v3.22.0=40000/min.
         tcp dport @protected_ports_tcp ct state new \\
-            add @newconn_rate_v4 { ip saddr limit rate over 40000/minute burst 60000 packets } \\
+            add @newconn_rate_v4 { ip saddr limit rate over $SHIELD_RATE_NEWCONN burst $SHIELD_RATE_NEWCONN_BURST packets } \\
             jump newconn_overflow
 
         # === TCP SYN rate-limit ===
@@ -2838,7 +3056,7 @@ $SHIELD_LOG_DDOS_FULL
         # → все клиенты одновременно retry).
         # История: v3.0=60/sec → ... → v3.20.0=300/sec → v3.22.0=2000/sec.
         tcp dport @protected_ports_tcp ct state new \\
-            add @syn_flood_v4 { ip saddr limit rate over 2000/second burst 3000 packets } \\
+            add @syn_flood_v4 { ip saddr limit rate over $SHIELD_RATE_SYN burst $SHIELD_RATE_SYN_BURST packets } \\
             jump syn_overflow
 
         # === UDP rate-limit ===
@@ -2857,7 +3075,7 @@ $SHIELD_LOG_DDOS_FULL
         # Реальный UDP-flood атака — 100k-1M pkt/sec, гарантированно ловится.
         # История: v3.20.0/v3.20.1=1500/sec → v3.22.0=10000/sec.
         udp dport @protected_ports_udp \\
-            add @udp_flood_v4 { ip saddr limit rate over 10000/second burst 20000 packets } \\
+            add @udp_flood_v4 { ip saddr limit rate over $SHIELD_RATE_UDP burst $SHIELD_RATE_UDP_BURST packets } \\
             jump udp_overflow
     }
 
@@ -2878,16 +3096,24 @@ $SHIELD_LOG_DDOS_FULL
 
     chain syn_overflow {
         # v3.15.3 / v3.23.0: log prefix [shield:syn_escalate] на момент ESCALATION
-        # в confirmed_attack_v4. При SHIELDNODE_VERBOSE_LOGS=0 (default) log-блок
-        # пуст — escalation работает но без log. Counter+drop ниже всегда активен.
-$SHIELD_LOG_SYN_ESC_FULL
+        # в confirmed_attack_v4. v3.23.13 BUG-004 + SR-FIX-1 + SR-FIX-6: log
+        # ВСЕГДА активен, per-IP rate-limit через meter, БЕЗ дублирующего
+        # `add @confirmed_attack_v4` (второе правило это делает).
+        # Это escalation-event (suspect → confirmed), очень low-volume:
+        # один IP escalate'ится один раз, дальше дропается через @confirmed_attack_v4.
+        ip saddr @suspect_v4 \\
+            meter shield_syn_escalate_log { ip saddr limit rate 1/minute burst 5 packets } \\
+            log prefix "[shield:syn_escalate] " level info flags ip options
         ip saddr @suspect_v4 add @confirmed_attack_v4 { ip saddr } counter name syn_confirmed_v4 drop
         add @suspect_v4 { ip saddr }
     }
 
     chain udp_overflow {
-        # v3.15.3 / v3.23.0: log prefix [shield:udp_escalate] (optional).
-$SHIELD_LOG_UDP_ESC_FULL
+        # v3.15.3 / v3.23.0: log prefix [shield:udp_escalate]. v3.23.13 BUG-004
+        # + SR-FIX-1 + SR-FIX-6: log ВСЕГДА активен, per-IP meter, без дубликата add.
+        ip saddr @suspect_v4 \\
+            meter shield_udp_escalate_log { ip saddr limit rate 1/minute burst 5 packets } \\
+            log prefix "[shield:udp_escalate] " level info flags ip options
         ip saddr @suspect_v4 add @confirmed_attack_v4 { ip saddr } counter name udp_confirmed_v4 drop
         add @suspect_v4 { ip saddr }
     }
@@ -2901,6 +3127,22 @@ $SHIELD_LOG_UDP_ESC_FULL
     # вообще, клиенты с PMTU<1500 (мобильные, PPPoE) могут видеть blackhole.
 }
 EOF
+
+# v3.23.13 SR-FIX-3: ДВУХФАЗНАЯ загрузка nft правил.
+# Раньше `nft -f` сразу применял ruleset — если ошибка, защита упала на
+# время до фикса.
+# Теперь:
+#   (1) `nft -c -f` parse-only check (НЕ применяет). Если syntax error
+#       выловит здесь и НЕ тронет работающий ruleset.
+#   (2) `nft -f` apply только после успешного parse.
+# `-c` (--check) флаг доступен с nftables 0.9.0+.
+if nft -c -f "$NFT_DDOS_CONF" 2>&1; then
+    print_ok "nft conf parse-check OK"
+else
+    print_error "nft parse-check FAILED — конфиг содержит синтаксические ошибки"
+    print_error "Старый ruleset (если был) ОСТАЁТСЯ активен. Исправь $NFT_DDOS_CONF и retry."
+    exit 1
+fi
 
 # Загружаем правила
 if nft -f "$NFT_DDOS_CONF" 2>&1; then
@@ -2941,6 +3183,9 @@ After=nftables.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# v3.23.13 SR-FIX-3: parse-check ПЕРЕД apply — если conf битый, unit
+# не запустится, но старый ruleset продолжит работать (защита не падает).
+ExecStartPre=/usr/sbin/nft -c -f $NFT_DDOS_CONF
 # Загружаем ТОЛЬКО нашу таблицу БЕЗ flush ruleset
 # Это сохраняет UFW и любые другие nft-правила
 ExecStart=/usr/sbin/nft -f $NFT_DDOS_CONF
@@ -2949,6 +3194,8 @@ ExecStart=/usr/sbin/nft -f $NFT_DDOS_CONF
 # флушнул внешний процесс (bouncer post-inst regression и т.п.), unit
 # не уйдёт в failed → restart cycle отработает чисто.
 ExecStop=-/usr/sbin/nft delete table inet ddos_protect
+# v3.23.13 SR-FIX-3: reload тоже parse-check'ит сначала
+ExecReload=/usr/sbin/nft -c -f $NFT_DDOS_CONF
 ExecReload=/usr/sbin/nft -f $NFT_DDOS_CONF
 
 [Install]
@@ -3437,15 +3684,11 @@ DEFAULT_SCANNER_UPDATE_INTERVAL="$DEFAULT_SCANNER_UPDATE_INTERVAL"
 DEFAULT_THREAT_UPDATE_INTERVAL="$DEFAULT_THREAT_UPDATE_INTERVAL"
 DEFAULT_TOR_UPDATE_INTERVAL="$DEFAULT_TOR_UPDATE_INTERVAL"
 DEFAULT_CUSTOM_UPDATE_INTERVAL="$DEFAULT_CUSTOM_UPDATE_INTERVAL"
-DEFAULT_MOBILE_RU_UPDATE_INTERVAL="$DEFAULT_MOBILE_RU_UPDATE_INTERVAL"
-DEFAULT_BROADBAND_RU_UPDATE_INTERVAL="$DEFAULT_BROADBAND_RU_UPDATE_INTERVAL"
 
 DEFAULT_MIN_ENTRIES_SCANNER=$DEFAULT_MIN_ENTRIES_SCANNER
 DEFAULT_MIN_ENTRIES_THREAT=$DEFAULT_MIN_ENTRIES_THREAT
 DEFAULT_MIN_ENTRIES_TOR=$DEFAULT_MIN_ENTRIES_TOR
 DEFAULT_MIN_ENTRIES_CUSTOM=$DEFAULT_MIN_ENTRIES_CUSTOM
-DEFAULT_MIN_ENTRIES_MOBILE_RU=$DEFAULT_MIN_ENTRIES_MOBILE_RU
-DEFAULT_MIN_ENTRIES_BROADBAND_RU=$DEFAULT_MIN_ENTRIES_BROADBAND_RU
 
 DEFAULT_FAIL_THRESHOLD=$DEFAULT_FAIL_THRESHOLD
 DEFAULTS_EOF
@@ -3585,10 +3828,13 @@ if [ "$REMOTE_TRIED" -gt 0 ] && [ "$REMOTE_DOWNLOADED" -eq 0 ] && [ "$LOCAL_FOUN
     CURRENT=$((CURRENT + 1))
     echo "$CURRENT" > "$FAIL_COUNTER"
     logger -t "$LOG_TAG" "ERROR: все URL'ы недоступны и нет local files (fail #$CURRENT/$FAIL_THRESHOLD_VAL)"
+    # v3.23.13 BUG-003 FIX: НЕ flush'им set на N подряд провалов.
+    # Раньше после 3 fail'ов set обнулялся — это создавало защитный gap.
+    # Stale data (например, threat blocklist неделю не обновлялся) — better
+    # than no protection (атакующие из stale списка всё равно враждебные).
+    # Только alert в syslog.
     if [ "$CURRENT" -ge "$FAIL_THRESHOLD_VAL" ]; then
-        # 3+ подряд провалов → flush set'а (stale data protection)
-        nft flush set inet ddos_protect "$NFT_SET" 2>/dev/null && \
-            logger -t "$LOG_TAG" "flushed $NFT_SET после $CURRENT подряд провалов"
+        logger -t "$LOG_TAG" "ALERT: $CURRENT consecutive fetch failures for $NFT_SET — keeping last-known-good set (stale OK)"
     fi
     exit 1
 fi
@@ -3606,45 +3852,80 @@ fi
 #    - FireHOL:            "# comment\n1.2.3.0/24"
 #    - inline комментарий: "8.8.8.8 # google"
 #
-# Sanity (тот же что в v3.11.x scanner-update):
-#    - prefix < 8 → отсев (слишком широко)
-#    - bogons: 0/8, 10/8, 127/8, 169.254/16, 172.16-31/12, 192.168/16
-#    - multicast/reserved: 224-255/8
+# Sanity v3.23.13 BUG-003 FIX:
+#    - prefix per-feed-type:
+#       threat: min /16 (защита от compromised feed с /8 /10 broad blocks).
+#       scanner/custom: min /8 (operator-controlled).
+#       tor: только /32 (single IPs).
+#    - bogons расширены: + CGNAT (100.64/10), + TEST-NET-1/2/3, + benchmark.
+#    - multicast/reserved: 224-255/8 (через o1>=224).
+case "$NAME" in
+    threat) MIN_PREFIX=16 ;;
+    *)      MIN_PREFIX=8  ;;
+esac
 grep -oE '^[[:space:]]*[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]+)?' "$TMP/all.raw" | \
     awk '{ sub(/^[[:space:]]+/, ""); print }' | \
-    awk -F'[./]' '
+    awk -F'[./]' -v minprefix="$MIN_PREFIX" '
     {
         prefix = (NF >= 5) ? $5 : 32
-        if (prefix < 8 || prefix > 32) next
+        if (prefix < minprefix || prefix > 32) next
         o1 = $1 + 0
-        if (o1 == 0)   next
-        if (o1 == 10)  next
-        if (o1 == 127) next
-        if (o1 >= 224) next
-        if (o1 == 169 && $2 + 0 == 254) next
-        if (o1 == 172) {
-            o2 = $2 + 0
-            if (o2 >= 16 && o2 <= 31) next
-        }
-        if (o1 == 192 && $2 + 0 == 168) next
+        o2 = $2 + 0
+        o3 = $3 + 0
+        if (o1 == 0)   next                                      # 0/8
+        if (o1 == 10)  next                                      # RFC1918
+        if (o1 == 127) next                                      # loopback
+        if (o1 >= 224) next                                      # multicast + reserved
+        if (o1 == 169 && o2 == 254) next                         # link-local
+        if (o1 == 172 && o2 >= 16 && o2 <= 31) next              # RFC1918
+        if (o1 == 192 && o2 == 168) next                         # RFC1918
+        if (o1 == 100 && o2 >= 64 && o2 <= 127) next             # CGNAT RFC6598
+        if (o1 == 192 && o2 == 0 && o3 == 0) next                # IANA reserved
+        if (o1 == 192 && o2 == 0 && o3 == 2) next                # TEST-NET-1
+        if (o1 == 198 && (o2 == 18 || o2 == 19)) next            # benchmark RFC2544
+        if (o1 == 198 && o2 == 51 && o3 == 100) next             # TEST-NET-2
+        if (o1 == 203 && o2 == 0 && o3 == 113) next              # TEST-NET-3
         print $0
     }' | sort -u > "$TMP/parsed.list"
 
 V4_COUNT=$(wc -l < "$TMP/parsed.list")
 V4_COUNT="${V4_COUNT:-0}"
 
+# v3.23.13 BUG-003 FIX: hard cap на total entries.
+# Если feed внезапно даёт >MAX_FEED_ENTRIES — подозрение на compromise.
+# Реальные real-world counts (snap 2026-05): Spamhaus DROP ~1100, FireHOL Level1 ~6800,
+# blocklist.de ~30k, ipsum L3 ~17k → суммарно threat обычно ~50k unique entries.
+# 200k — порог при котором что-то очень не так с источником.
+MAX_FEED_ENTRIES=200000
+case "$NAME" in
+    threat) MAX_FEED_ENTRIES=200000 ;;
+    scanner) MAX_FEED_ENTRIES=100000 ;;
+    tor)    MAX_FEED_ENTRIES=10000 ;;
+    custom) MAX_FEED_ENTRIES=50000 ;;
+esac
+if [ "$V4_COUNT" -gt "$MAX_FEED_ENTRIES" ]; then
+    logger -t "$LOG_TAG" "ABORT: feed has $V4_COUNT entries (>$MAX_FEED_ENTRIES cap) — suspicious, refusing apply. Old set preserved."
+    exit 1
+fi
+
 # 5.5) v3.23.4: Health warning — если получили намного меньше чем когда-то.
 # Источники могут "тихо умирать": URL поменялся, repo удалили, ToS-change.
 # Сохраняем peak в state-файле. Auto-reset: если current >= 80% от peak,
 # обновляем peak до current — источник восстановился, baseline сместился.
+# v3.23.13 BUG-003 ENHANCE: alert при росте >20% от peak (потенциальный compromise feed).
 PEAK_FILE="/var/lib/shieldnode/.peak-${NAME}"
 PEAK=$(cat "$PEAK_FILE" 2>/dev/null || echo 0)
 PEAK="${PEAK:-0}"
 if [ "$V4_COUNT" -gt "$PEAK" ]; then
+    # Внезапный рост >20% от prev peak (только если peak уже >1000) — alert
+    if [ "$PEAK" -gt 1000 ] && [ "$V4_COUNT" -gt "$((PEAK * 120 / 100))" ]; then
+        logger -t "$LOG_TAG" "WARN: feed grew >20% (peak=$PEAK → current=$V4_COUNT). Manual review recommended. Applying anyway."
+        # NB: продолжаем применять, не блокируем — оператор может выключить sync если нужно.
+    fi
     # Новый рекорд
     echo "$V4_COUNT" > "$PEAK_FILE"
 elif [ "$PEAK" -gt 1000 ] && [ "$V4_COUNT" -ge "$((PEAK * 80 / 100))" ]; then
-    # Current >= 80% от peak — recовery, сдвигаем baseline к current
+    # Current >= 80% от peak — recovery, сдвигаем baseline к current
     # (защита от "застрявшего" peak когда источник временно прыгал высоко)
     echo "$V4_COUNT" > "$PEAK_FILE"
 elif [ "$PEAK" -gt 1000 ] && [ "$V4_COUNT" -lt "$((PEAK / 2))" ]; then
@@ -3660,9 +3941,10 @@ if [ "$V4_COUNT" -lt "$MIN_ENTRIES" ]; then
     CURRENT="${CURRENT:-0}"
     CURRENT=$((CURRENT + 1))
     echo "$CURRENT" > "$FAIL_COUNTER"
+    # v3.23.13 BUG-003 FIX: НЕ flush set'а на min-check failures.
+    # Stale OK; alert в syslog.
     if [ "$CURRENT" -ge "$FAIL_THRESHOLD_VAL" ]; then
-        nft flush set inet ddos_protect "$NFT_SET" 2>/dev/null && \
-            logger -t "$LOG_TAG" "flushed $NFT_SET после $CURRENT провалов min-check"
+        logger -t "$LOG_TAG" "ALERT: $CURRENT consecutive min-check failures for $NFT_SET — keeping last-known-good (stale OK)"
     fi
     exit 1
 fi
@@ -4075,7 +4357,7 @@ fi
 # Опциональный shieldnode.conf — если оператор положил рядом со скриптом, копируем
 if [ -n "$SHIELD_SCRIPT_DIR" ] && [ -f "$SHIELD_SCRIPT_DIR/shieldnode.conf" ] && [ ! -f "$SHIELD_CONF_FILE" ]; then
     cp "$SHIELD_SCRIPT_DIR/shieldnode.conf" "$SHIELD_CONF_FILE"
-    chmod 0644 "$SHIELD_CONF_FILE"
+    chmod 0640 "$SHIELD_CONF_FILE"
     print_ok "Config: $SHIELD_CONF_FILE (из git-clone)"
 fi
 
@@ -5165,16 +5447,61 @@ if [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1; then
 PRAGMA busy_timeout=5000;
 -- События старше 90 дней (long-term история теряется, но aggregator
 -- группирует по (type, ip) с UNIQUE constraint — старые IP уже схлопнуты).
-DELETE FROM events WHERE last_seen < strftime('%s','now','-90 days');
+DELETE FROM events WHERE last_seen < strftime('%s','now','-__SHIELD_EVENTS_DB_RETENTION_DAYS__ days');
 -- ASN кэш старше 7 дней (TTL и так 7 дней — это просто physical cleanup).
 DELETE FROM asn_cache WHERE cached_at < strftime('%s','now','-7 days');
 -- Сбрасываем WAL в основной файл, обнуляем -wal (часто распухает в idle).
 PRAGMA wal_checkpoint(TRUNCATE);
--- VACUUM реально освобождает место (после DELETE страницы помечены free,
--- но файл не уменьшается без VACUUM). Дорогая операция (~секунды на 100MB),
--- но раз в неделю приемлемо.
-VACUUM;
 SQL
+
+    # v3.23.13 BUG-015 FIX: VACUUM заменён на VACUUM INTO + atomic rename.
+    # Преимущества:
+    #   - Не блокирует main DB на время VACUUM (aggregator продолжает писать).
+    #   - Atomic — при крахе VACUUM мы не оставляем corrupted DB.
+    #   - Free space нужен только если current DB действительно вырос.
+    #
+    # Минусы:
+    #   - Требует ~equal size free space в /var/lib/shieldnode временно.
+    #   - Нужно убедиться что aggregator не пишет в момент rename'а.
+    DB_SIZE=$(stat -c%s "$DB" 2>/dev/null || echo 0)
+    AVAIL=$(df -B1 --output=avail /var/lib/shieldnode 2>/dev/null | tail -1)
+    AVAIL="${AVAIL:-0}"
+    # Vacuum только если есть как минимум 2× размера DB свободного места
+    if [ "$DB_SIZE" -gt 0 ] && [ "$AVAIL" -gt "$((DB_SIZE * 2))" ]; then
+        # v3.23.13: создаём /run/shieldnode если не существует (cleanup может
+        # запуститься первым после ребута, до aggregator'а который его создаёт).
+        mkdir -p /run/shieldnode 2>/dev/null || true
+        VACUUM_TMP="${DB}.vacuum.$$"
+        if sqlite3 "$DB" "VACUUM INTO '$VACUUM_TMP'" 2>/dev/null && [ -s "$VACUUM_TMP" ]; then
+            # Захватываем lock через aggregator-style flock и переключаем atomic mv
+            if exec {VAC_LOCK_FD}> /run/shieldnode/db.lock 2>/dev/null && \
+               flock -w 30 "$VAC_LOCK_FD" 2>/dev/null; then
+                # Делаем backup main DB перед swap (на случай мусора в vacuum copy)
+                BAK="${DB}.pre-vacuum.bak"
+                cp -a "$DB" "$BAK" 2>/dev/null || true
+                # Atomic replace
+                mv "$VACUUM_TMP" "$DB" && rm -f "${DB}-wal" "${DB}-shm" 2>/dev/null
+                # Quick integrity check на новом файле
+                if sqlite3 "$DB" "PRAGMA integrity_check" 2>/dev/null | head -1 | grep -q "^ok$"; then
+                    rm -f "$BAK" 2>/dev/null
+                    logger -t shieldnode-cleanup "VACUUM INTO success (db_size=$DB_SIZE)"
+                else
+                    # Rollback — vacuum copy corrupted
+                    mv "$BAK" "$DB" 2>/dev/null
+                    logger -t shieldnode-cleanup "WARN: VACUUM INTO produced corrupted DB, rolled back"
+                fi
+                flock -u "$VAC_LOCK_FD" 2>/dev/null
+            else
+                # Lock fail — пропускаем vacuum, попробуем в следующий цикл
+                rm -f "$VACUUM_TMP" 2>/dev/null
+                logger -t shieldnode-cleanup "skip VACUUM — db.lock unavailable"
+            fi
+        else
+            rm -f "$VACUUM_TMP" 2>/dev/null
+        fi
+    else
+        logger -t shieldnode-cleanup "skip VACUUM — insufficient free space (need 2×${DB_SIZE}, have $AVAIL)"
+    fi
 fi
 
 # 3) Legacy: ASN cache из старых версий (no-op если директории нет)
@@ -5187,6 +5514,10 @@ find /var/lib/shieldnode -maxdepth 1 -name "*_fail_count" -mtime +30 -delete 2>/
 
 exit 0
 CLEANUP_EOF
+# v3.23.13 BUG-019: подставляем retention из limits.conf
+sed -i "s|__SHIELD_EVENTS_DB_RETENTION_DAYS__|$SHIELD_EVENTS_DB_RETENTION_DAYS|g" \
+    /usr/local/sbin/shieldnode-cleanup.sh
+verify_no_placeholders /usr/local/sbin/shieldnode-cleanup.sh || exit 1
 chmod 0755 /usr/local/sbin/shieldnode-cleanup.sh
 
 cat > /etc/systemd/system/shieldnode-cleanup.service <<'EOF'
@@ -5300,15 +5631,24 @@ TMP=$(mktemp)
 trap 'rm -f "$TMP"' EXIT
 
 if [ -n "$CURSOR" ]; then
-    # v3.22.0: --lines=500000 cap защищает от RAM blow-up под штормом
-    # (>500k events/min — массовая атака, per-IP attribution всё равно теряется
+    # v3.22.0: --lines cap защищает от RAM blow-up под штормом
+    # (массовая атака, per-IP attribution всё равно теряется
     # из-за nft rate-limit 1/sec на лог-prefix, важнее не уронить агрегатор).
-    journalctl --output=cat --output-fields=MESSAGE --no-pager --lines=500000 \
-        --after-cursor="$CURSOR" --show-cursor 2>/dev/null > "$TMP" || true
+    # v3.23.13 BUG-020 FIX: фильтр по _TRANSPORT=kernel + SYSLOG_IDENTIFIER=kernel
+    # для shield/UFW логов (idz kernel facility) и отдельно crowdsec identifier.
+    # Без фильтра aggregator парсит ВСЁ — sshd, systemd, snap, NetworkManager,
+    # etc. — и любой user может через `logger` инжектить fake [shield:ddos]
+    # SRC=... записи в journald (vector SQL injection в events.db, BUG-002).
+    journalctl --output=cat --output-fields=MESSAGE --no-pager --lines=__SHIELD_AGG_JOURNAL_LINES__ \
+        --after-cursor="$CURSOR" --show-cursor \
+        _TRANSPORT=kernel + SYSLOG_IDENTIFIER=kernel + SYSLOG_IDENTIFIER=crowdsec \
+        2>/dev/null > "$TMP" || true
 else
     # Первый запуск — берём за последний час
-    journalctl --output=cat --output-fields=MESSAGE --no-pager --lines=500000 \
-        --since="1 hour ago" --show-cursor 2>/dev/null > "$TMP" || true
+    journalctl --output=cat --output-fields=MESSAGE --no-pager --lines=__SHIELD_AGG_JOURNAL_LINES__ \
+        --since="1 hour ago" --show-cursor \
+        _TRANSPORT=kernel + SYSLOG_IDENTIFIER=kernel + SYSLOG_IDENTIFIER=crowdsec \
+        2>/dev/null > "$TMP" || true
 fi
 
 # Извлекаем cursor из последней строки и удаляем его из вывода
@@ -5352,54 +5692,133 @@ alert_self_flood() {
 # v3.10.2 PERF FIX: заменили per-line `echo $line | grep | head | cut` на
 # single-pass awk. Бенчмарк на 10k log-lines: 94 сек → 0.026 сек (3700×).
 # Под штормом 100k events/min теперь обрабатывается за <1 сек.
+#
+# v3.23.13 BUG-002+007 FIX:
+#   - validate IPv4 format перед добавлением в hash (defence-in-depth поверх awk gsub).
+#   - cap unique IPs per-type (MAX_UNIQUE_IPS_PER_TYPE) — защита от RAM blow-up
+#     при rotating-botnet атаке (100k+ unique sources).
+MAX_UNIQUE_IPS_PER_TYPE="${MAX_UNIQUE_IPS_PER_TYPE:-__SHIELD_AGG_MAX_UNIQUE_IPS__}"
+STORM_MODE=0
+STORM_DROPPED=0
+storm_warn() {
+    STORM_DROPPED=$((STORM_DROPPED + 1))
+    [ "$STORM_MODE" = "1" ] && return 0
+    STORM_MODE=1
+    logger -t "$LOG_TAG" "WARN: storm mode — dropping unique IPs beyond ${MAX_UNIQUE_IPS_PER_TYPE}/type (nft drops still active)"
+}
+# Strict IPv4-only validation (журнал даёт нам почищенные числа+точки через gsub).
+# Регекс: 4 октета 0-255. Без regex-backtracking — bash native parameter expansion.
+is_valid_ipv4() {
+    local ip="$1"
+    [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+    local IFS=. o1 o2 o3 o4
+    read -r o1 o2 o3 o4 <<< "$ip"
+    [ "$o1" -le 255 ] && [ "$o2" -le 255 ] && [ "$o3" -le 255 ] && [ "$o4" -le 255 ] || return 1
+    return 0
+}
 while IFS='|' read -r kind ip port proto; do
     # v3.23.5: self-flood — наш IP в drop logs → alert и skip
     if [ -n "$ip" ] && is_my_ip "$ip"; then
         alert_self_flood
         continue
     fi
+    # v3.23.13 BUG-002: defence-in-depth IPv4 validation.
+    # awk gsub чистит мусор, но мы доверяем по второму уровню. Невалидные —
+    # просто skip (без логирования каждой штуки — DoS на logger).
+    [ -n "$ip" ] && ! is_valid_ipv4 "$ip" && continue
+    # v3.23.13 BUG-007: при достижении cap для конкретного типа — не добавляем
+    # новые IP, но продолжаем инкрементировать существующие (партиальная
+    # attribution лучше OOM).
     case "$kind" in
         scanner)
-            [ -n "$ip" ] && scanner_ips[$ip]=$((${scanner_ips[$ip]:-0} + 1))
+            if [ -n "$ip" ]; then
+                if [ -n "${scanner_ips[$ip]:-}" ] || [ ${#scanner_ips[@]} -lt "$MAX_UNIQUE_IPS_PER_TYPE" ]; then
+                    scanner_ips[$ip]=$((${scanner_ips[$ip]:-0} + 1))
+                else
+                    storm_warn
+                fi
+            fi
             ;;
         ddos)
             if [ -n "$ip" ]; then
-                ddos_ips[$ip]=$((${ddos_ips[$ip]:-0} + 1))
-                [ -n "$port" ]  && ddos_ports[$ip]="$port"
-                [ -n "$proto" ] && ddos_proto[$ip]="$proto"
+                if [ -n "${ddos_ips[$ip]:-}" ] || [ ${#ddos_ips[@]} -lt "$MAX_UNIQUE_IPS_PER_TYPE" ]; then
+                    ddos_ips[$ip]=$((${ddos_ips[$ip]:-0} + 1))
+                    [ -n "$port" ]  && ddos_ports[$ip]="$port"
+                    [ -n "$proto" ] && ddos_proto[$ip]="$proto"
+                else
+                    storm_warn
+                fi
             fi
             ;;
         tor)
-            [ -n "$ip" ] && tor_ips[$ip]=$((${tor_ips[$ip]:-0} + 1))
+            if [ -n "$ip" ]; then
+                if [ -n "${tor_ips[$ip]:-}" ] || [ ${#tor_ips[@]} -lt "$MAX_UNIQUE_IPS_PER_TYPE" ]; then
+                    tor_ips[$ip]=$((${tor_ips[$ip]:-0} + 1))
+                else storm_warn; fi
+            fi
             ;;
         threat)
-            [ -n "$ip" ] && threat_ips[$ip]=$((${threat_ips[$ip]:-0} + 1))
+            if [ -n "$ip" ]; then
+                if [ -n "${threat_ips[$ip]:-}" ] || [ ${#threat_ips[@]} -lt "$MAX_UNIQUE_IPS_PER_TYPE" ]; then
+                    threat_ips[$ip]=$((${threat_ips[$ip]:-0} + 1))
+                else storm_warn; fi
+            fi
             ;;
         custom)
-            [ -n "$ip" ] && custom_ips[$ip]=$((${custom_ips[$ip]:-0} + 1))
+            if [ -n "$ip" ]; then
+                if [ -n "${custom_ips[$ip]:-}" ] || [ ${#custom_ips[@]} -lt "$MAX_UNIQUE_IPS_PER_TYPE" ]; then
+                    custom_ips[$ip]=$((${custom_ips[$ip]:-0} + 1))
+                else storm_warn; fi
+            fi
             ;;
         conn_flood)
-            [ -n "$ip" ] && conn_flood_ips[$ip]=$((${conn_flood_ips[$ip]:-0} + 1))
+            if [ -n "$ip" ]; then
+                if [ -n "${conn_flood_ips[$ip]:-}" ] || [ ${#conn_flood_ips[@]} -lt "$MAX_UNIQUE_IPS_PER_TYPE" ]; then
+                    conn_flood_ips[$ip]=$((${conn_flood_ips[$ip]:-0} + 1))
+                else storm_warn; fi
+            fi
             ;;
         newconn_flood)
-            [ -n "$ip" ] && newconn_flood_ips[$ip]=$((${newconn_flood_ips[$ip]:-0} + 1))
+            if [ -n "$ip" ]; then
+                if [ -n "${newconn_flood_ips[$ip]:-}" ] || [ ${#newconn_flood_ips[@]} -lt "$MAX_UNIQUE_IPS_PER_TYPE" ]; then
+                    newconn_flood_ips[$ip]=$((${newconn_flood_ips[$ip]:-0} + 1))
+                else storm_warn; fi
+            fi
             ;;
         tcp_invalid)
-            [ -n "$ip" ] && tcp_invalid_ips[$ip]=$((${tcp_invalid_ips[$ip]:-0} + 1))
+            if [ -n "$ip" ]; then
+                if [ -n "${tcp_invalid_ips[$ip]:-}" ] || [ ${#tcp_invalid_ips[@]} -lt "$MAX_UNIQUE_IPS_PER_TYPE" ]; then
+                    tcp_invalid_ips[$ip]=$((${tcp_invalid_ips[$ip]:-0} + 1))
+                else storm_warn; fi
+            fi
             ;;
         fib_spoof)
-            [ -n "$ip" ] && fib_spoof_ips[$ip]=$((${fib_spoof_ips[$ip]:-0} + 1))
+            if [ -n "$ip" ]; then
+                if [ -n "${fib_spoof_ips[$ip]:-}" ] || [ ${#fib_spoof_ips[@]} -lt "$MAX_UNIQUE_IPS_PER_TYPE" ]; then
+                    fib_spoof_ips[$ip]=$((${fib_spoof_ips[$ip]:-0} + 1))
+                else storm_warn; fi
+            fi
             ;;
         syn_escalate)
-            [ -n "$ip" ] && syn_escalate_ips[$ip]=$((${syn_escalate_ips[$ip]:-0} + 1))
+            if [ -n "$ip" ]; then
+                if [ -n "${syn_escalate_ips[$ip]:-}" ] || [ ${#syn_escalate_ips[@]} -lt "$MAX_UNIQUE_IPS_PER_TYPE" ]; then
+                    syn_escalate_ips[$ip]=$((${syn_escalate_ips[$ip]:-0} + 1))
+                else storm_warn; fi
+            fi
             ;;
         udp_escalate)
-            [ -n "$ip" ] && udp_escalate_ips[$ip]=$((${udp_escalate_ips[$ip]:-0} + 1))
+            if [ -n "$ip" ]; then
+                if [ -n "${udp_escalate_ips[$ip]:-}" ] || [ ${#udp_escalate_ips[@]} -lt "$MAX_UNIQUE_IPS_PER_TYPE" ]; then
+                    udp_escalate_ips[$ip]=$((${udp_escalate_ips[$ip]:-0} + 1))
+                else storm_warn; fi
+            fi
             ;;
         ufw_block)
             if [ -n "$ip" ]; then
-                ufw_block_ips[$ip]=$((${ufw_block_ips[$ip]:-0} + 1))
-                [ -n "$port" ] && ufw_block_ports[$ip]="$port"
+                if [ -n "${ufw_block_ips[$ip]:-}" ] || [ ${#ufw_block_ips[@]} -lt "$MAX_UNIQUE_IPS_PER_TYPE" ]; then
+                    ufw_block_ips[$ip]=$((${ufw_block_ips[$ip]:-0} + 1))
+                    [ -n "$port" ] && ufw_block_ports[$ip]="$port"
+                else storm_warn; fi
             fi
             ;;
     esac
@@ -5412,7 +5831,9 @@ done < <(awk '
     }
     /\[shield:ddos\]/ {
         ip=""; port=""; proto=""
-        if (match($0, /SRC=[^ ]+/))    ip    = substr($0, RSTART+4, RLENGTH-4)
+        # v3.23.13 BUG-002 FIX: gsub очистка от не-IP символов (защита от
+        # SQL injection через journald log lines с инжектированным SRC=...).
+        if (match($0, /SRC=[^ ]+/))    { ip    = substr($0, RSTART+4, RLENGTH-4); gsub(/[^0-9.:]/, "", ip) }
         if (match($0, /DPT=[0-9]+/))   port  = substr($0, RSTART+4, RLENGTH-4)
         if (match($0, /PROTO=[A-Z]+/)) proto = substr($0, RSTART+6, RLENGTH-6)
         if (ip != "") print "ddos|" ip "|" port "|" proto
@@ -5482,19 +5903,16 @@ done < <(awk '
     }
     # v3.16.0: UFW BLOCK дропы (когда оператор включил ufw logging on)
     # Формат: "[UFW BLOCK] IN=ens3 OUT= MAC=... SRC=1.2.3.4 DST=... DPT=22 ..."
-    # v3.16.2 FIX: bash heredoc with single quotes still expanded (LIMIT) as
-    # subshell — критическая ошибка которая ломала весь aggregator.
-    # Решение: матчим оба варианта без use of capturing groups через индекс
-    # символов (UFW + что-то + BLOCK]). Дублирование ради безопасности.
+    # v3.23.13 BUG-002 FIX: gsub очистка от не-IP символов (SQL injection защита).
     /\[UFW BLOCK\]/ {
         ip=""; port=""
-        if (match($0, /SRC=[^ ]+/))  ip   = substr($0, RSTART+4, RLENGTH-4)
+        if (match($0, /SRC=[^ ]+/))  { ip   = substr($0, RSTART+4, RLENGTH-4); gsub(/[^0-9.:]/, "", ip) }
         if (match($0, /DPT=[0-9]+/)) port = substr($0, RSTART+4, RLENGTH-4)
         if (ip != "") print "ufw_block|" ip "|" port "|"
     }
     /\[UFW LIMIT BLOCK\]/ {
         ip=""; port=""
-        if (match($0, /SRC=[^ ]+/))  ip   = substr($0, RSTART+4, RLENGTH-4)
+        if (match($0, /SRC=[^ ]+/))  { ip   = substr($0, RSTART+4, RLENGTH-4); gsub(/[^0-9.:]/, "", ip) }
         if (match($0, /DPT=[0-9]+/)) port = substr($0, RSTART+4, RLENGTH-4)
         if (ip != "") print "ufw_block|" ip "|" port "|"
     }
@@ -5583,14 +6001,29 @@ should_log() {
 }
 
 # Atomic dump state в файл (вызывается в конце скрипта через trap)
+# v3.23.13 BUG-014 FIX: hard cap по count entries. При превышении —
+# сохраняем top-N по last_ts (самые свежие). Без cap'а файл рос неограниченно
+# при rotating-IP атаках (300k+ unique IP × 3 дня TTL).
+LOG_STATE_MAX_ENTRIES="${LOG_STATE_MAX_ENTRIES:-30000}"
 save_state() {
     local tmp="${LOG_STATE_FILE}.tmp.$$"
-    {
-        for key in "${!LAST_COUNT[@]}"; do
-            # key = "ip|type"
-            echo "${key}|${LAST_COUNT[$key]}|${LAST_TS[$key]}"
-        done
-    } > "$tmp" 2>/dev/null && mv "$tmp" "$LOG_STATE_FILE" 2>/dev/null
+    local total=${#LAST_COUNT[@]}
+    if [ "$total" -le "$LOG_STATE_MAX_ENTRIES" ]; then
+        {
+            for key in "${!LAST_COUNT[@]}"; do
+                # key = "ip|type"
+                echo "${key}|${LAST_COUNT[$key]}|${LAST_TS[$key]}"
+            done
+        } > "$tmp" 2>/dev/null && mv "$tmp" "$LOG_STATE_FILE" 2>/dev/null
+    else
+        # Превысили cap — сохраняем top-N по last_ts (через sort -t'|' -k4 -rn)
+        {
+            for key in "${!LAST_COUNT[@]}"; do
+                echo "${key}|${LAST_COUNT[$key]}|${LAST_TS[$key]}"
+            done | sort -t'|' -k4 -rn | head -n "$LOG_STATE_MAX_ENTRIES"
+        } > "$tmp" 2>/dev/null && mv "$tmp" "$LOG_STATE_FILE" 2>/dev/null
+        logger -t "$LOG_TAG" "state-file capped: kept top ${LOG_STATE_MAX_ENTRIES}/${total} by recency"
+    fi
     rm -f "$tmp" 2>/dev/null
 }
 trap save_state EXIT
@@ -5816,7 +6249,16 @@ NOW=$(date +%s)
         echo "INSERT OR REPLACE INTO aggregator_state(key, value) VALUES('cursor', '$ESC_CURSOR');"
     fi
     echo "COMMIT;"
-} | sqlite3 "$DB" 2>/dev/null
+} | (
+    # v3.23.13 BUG-015 FIX: db.lock shared с cleanup'ом (VACUUM INTO swap).
+    # WAL mode позволяет concurrent reads, но для safe VACUUM INTO swap
+    # cleanup'у нужно эксклюзивное окно. Берём lock в shared (exclusive не нужен —
+    # SQLite сам через WAL обработает concurrent inserts, нам важно только
+    # не пересечься с `mv` в момент cleanup'a).
+    exec {DB_LOCK_FD}> /run/shieldnode/db.lock 2>/dev/null || true
+    flock -s -w 10 "$DB_LOCK_FD" 2>/dev/null || true
+    sqlite3 "$DB" 2>/dev/null
+)
 
 # Лог
 TOTAL_SCANNERS=${#scanner_ips[@]}
@@ -5836,7 +6278,18 @@ TOTAL_ANY=$((TOTAL_SCANNERS + TOTAL_DDOS + TOTAL_TOR + TOTAL_THREAT + TOTAL_CUST
 if [ $TOTAL_ANY -gt 0 ]; then
     logger -t "$LOG_TAG" "Processed: scanners=$TOTAL_SCANNERS, ddos=$TOTAL_DDOS, tor=$TOTAL_TOR, threat=$TOTAL_THREAT, custom=$TOTAL_CUSTOM, conn_flood=$TOTAL_CONN_FLOOD, newconn_flood=$TOTAL_NEWCONN_FLOOD, tcp_invalid=$TOTAL_TCP_INVALID, fib_spoof=$TOTAL_FIB_SPOOF, syn_esc=$TOTAL_SYN_ESC, udp_esc=$TOTAL_UDP_ESC, ufw_block=$TOTAL_UFW_BLOCK unique IPs"
 fi
+# v3.23.13 SR-FIX-2: видимость storm-cap drops
+if [ "$STORM_DROPPED" -gt 0 ]; then
+    logger -t "$LOG_TAG" "STORM: $STORM_DROPPED unique IPs dropped from attribution (cap $MAX_UNIQUE_IPS_PER_TYPE/type reached). nft drops continue independently."
+fi
 AGG_EOF
+
+# v3.23.13 BUG-019: подставляем настраиваемые значения из limits.conf
+sed -i \
+    -e "s|__SHIELD_AGG_JOURNAL_LINES__|$SHIELD_AGG_JOURNAL_LINES|g" \
+    -e "s|__SHIELD_AGG_MAX_UNIQUE_IPS__|$SHIELD_AGG_MAX_UNIQUE_IPS|g" \
+    "$AGG_SCRIPT"
+verify_no_placeholders "$AGG_SCRIPT" || exit 1
 
 chmod 0750 "$AGG_SCRIPT"
 print_ok "Aggregator: $AGG_SCRIPT"
@@ -5856,6 +6309,15 @@ ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=$DB_DIR
 ReadWritePaths=$LOG_DIR
+# v3.23.13 BUG-007: hard memory limit — защита от RAM blow-up при rotating-IP
+# атаках (>100k unique sources). MAX 512MB = достаточно для 50k IP × 13 типов
+# в bash hash. Если упёрлись — systemd убивает aggregator, защита nft drops
+# продолжает работать независимо. TasksMax защищает от fork-bomb scenarios.
+MemoryMax=512M
+MemoryHigh=384M
+TasksMax=20
+# CPU quota: на shared-VPS не утопим соседей
+CPUQuota=80%
 EOF
 
 cat > /etc/systemd/system/shieldnode-aggregator.timer <<'EOF'
@@ -6640,7 +7102,7 @@ draw_snapshot() {
     printf  "  ├─ ${DIM}confirmed-attack${N}    %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$CONFIRMED_PKTS_V4")" "$(human_bytes "$CONFIRMED_BYTES_V4")"
     printf  "  ├─ ${DIM}rate-limit (syn)${N}    %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$SYN_CONF_PKTS_V4")" "$(human_bytes "$SYN_CONF_BYTES_V4")"
     printf  "  ├─ ${DIM}rate-limit (udp)${N}    %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$UDP_CONF_PKTS_V4")" "$(human_bytes "$UDP_CONF_BYTES_V4")"
-    printf  "  ├─ ${DIM}conn-flood (ct>5000)${N} %11s pkts  ${DIM}/${N} %s\n"   "$(human_num "$CONN_FLOOD_PKTS_V4")" "$(human_bytes "$CONN_FLOOD_BYTES_V4")"
+    printf  "  ├─ ${DIM}conn-flood (ct>15000)${N} %10s pkts  ${DIM}/${N} %s\n"   "$(human_num "$CONN_FLOOD_PKTS_V4")" "$(human_bytes "$CONN_FLOOD_BYTES_V4")"
     printf  "  ├─ ${DIM}new-conn flood${N}      %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$NEWCONN_FLOOD_PKTS_V4")" "$(human_bytes "$NEWCONN_FLOOD_BYTES_V4")"
     printf  "  ├─ ${DIM}ssh conn-flood${N}      %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$SSH_CONN_FLOOD_PKTS_V4")" "$(human_bytes "$SSH_CONN_FLOOD_BYTES_V4")"
     printf  "  ├─ ${DIM}ssh new-conn flood${N}  %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$SSH_NEWCONN_FLOOD_PKTS_V4")" "$(human_bytes "$SSH_NEWCONN_FLOOD_BYTES_V4")"
@@ -7139,7 +7601,7 @@ show_settings_menu() {
                 $0 ~ "^"k"=" { print k"=\""v"\""; next }
                 { print }
             ' "$CONF" > "$tmp" && {
-                chmod --reference="$CONF" "$tmp" 2>/dev/null || chmod 0644 "$tmp"
+                chmod --reference="$CONF" "$tmp" 2>/dev/null || chmod 0640 "$tmp"
                 mv "$tmp" "$CONF"
             }
         else
@@ -7779,53 +8241,29 @@ fi
 
 print_header "ШАГ 12.6: CLEANUP LEGACY"
 
-# Удаляем компоненты от ранних версий v3.23.x которые более не используются.
-# Это критично для idempotent upgrade — если ноду уже обновляли на v3.23.3-rc
-# с subnet-aggregator, надо корректно его убрать чтоб не висели dead unit'ы.
+# v3.23.13 LEGACY CLEANUP: subnet-aggregator block удалён.
+# Это был v3.23.3-rc — release candidate который никогда не релизился стабильно.
+# Прошло >1 года, любой узел который мог его иметь, давно обновился через v3.23.4+.
+# Если оператор всё ещё сидит на v3.23.3-rc — пусть обновится на v3.23.12 перед
+# переходом на v3.23.13.
 
 LEGACY_REMOVED=0
 
-# v3.23.3-rc: subnet-aggregator (whois-based /24 datacenter banning)
-# Удалён в v3.23.4 — недостаточно профита vs сложность.
-for unit in shieldnode-subnet-aggregator.timer shieldnode-subnet-aggregator.service; do
-    if systemctl list-unit-files 2>/dev/null | grep -q "^$unit"; then
-        systemctl disable --now "$unit" >/dev/null 2>&1 || true
-        rm -f "/etc/systemd/system/$unit" 2>/dev/null
-        LEGACY_REMOVED=1
+# v3.23.13 SR-FIX-5: миграция perms 0644 → 0640 для shieldnode.conf
+# Предыдущие версии оставляли conf world-readable (TRUSTED_IPS видны любому
+# юзеру). При upgrade auto-migrate. shield_safe_source также делает это
+# при load, но прямо здесь — чтобы оператор увидел warning в install logs.
+for sensitive_conf in /etc/shieldnode/shieldnode.conf /etc/shieldnode/limits.conf; do
+    if [ -f "$sensitive_conf" ]; then
+        current_perms=$(stat -c "%a" "$sensitive_conf" 2>/dev/null)
+        if [ "$current_perms" = "644" ]; then
+            chmod 0640 "$sensitive_conf"
+            print_warn "Перемигрировал permissions: $sensitive_conf 0644 → 0640 (security)"
+        fi
+        # Гарантируем owner=root:root
+        chown root:root "$sensitive_conf" 2>/dev/null || true
     fi
 done
-if [ -f /usr/local/sbin/shieldnode-subnet-aggregator.sh ]; then
-    rm -f /usr/local/sbin/shieldnode-subnet-aggregator.sh
-    LEGACY_REMOVED=1
-fi
-
-# Удаляем nft set и rule если были созданы
-if nft list set inet ddos_protect datacenter_subnet_bans_v4 >/dev/null 2>&1; then
-    # Найти handle правила использующего этот set
-    RULE_HANDLE=$(nft -a list chain inet ddos_protect prerouting 2>/dev/null | \
-        grep "datacenter_subnet_bans_v4" | grep -oE 'handle [0-9]+' | awk '{print $2}' | head -1)
-    if [ -n "$RULE_HANDLE" ]; then
-        nft delete rule inet ddos_protect prerouting handle "$RULE_HANDLE" 2>/dev/null || true
-    fi
-    nft delete set inet ddos_protect datacenter_subnet_bans_v4 2>/dev/null || true
-    LEGACY_REMOVED=1
-fi
-
-# Whois cache directory (если был создан)
-if [ -d /var/lib/shieldnode/whois-cache ]; then
-    rm -rf /var/lib/shieldnode/whois-cache
-    LEGACY_REMOVED=1
-fi
-
-# Dry-run marker (если был)
-rm -f /etc/shieldnode/.subnet-aggr-dryrun /var/lib/shieldnode/.aggregator-install-time 2>/dev/null
-
-if [ "$LEGACY_REMOVED" = "1" ]; then
-    systemctl daemon-reload 2>/dev/null || true
-    print_ok "Legacy components от v3.23.3-rc удалены (subnet-aggregator)"
-else
-    print_info "Legacy components не найдены — clean install"
-fi
 
 # === DISK CLEANUP (v3.23.6) ===
 # Критично для нод где предыдущая атака разлила /var/log до 100%.
@@ -8165,7 +8603,7 @@ LOG_TAG=shieldnode-pcap-arch
 STATE_FILE=/var/lib/shieldnode/.pcap-arch-state
 ARCHIVE_DIR=/var/lib/shieldnode/pcap-archive
 PCAP_DIR=/var/log/pcap
-TRIGGER_THRESHOLD=10000   # drops/min → trigger archive
+TRIGGER_THRESHOLD=__SHIELD_PCAP_TRIGGER_DROPS__   # drops/min → trigger archive
 
 mkdir -p "$LOCK_DIR"
 exec {LOCK_FD}> "$LOCK"
@@ -8204,17 +8642,56 @@ if [ "$DELTA" -ge "$TRIGGER_THRESHOLD" ]; then
         cp -p "$PCAP_DIR"/*.pcap "$ARCH_SUBDIR/" 2>/dev/null || true
         # Метаданные: drop-counters, conntrack snapshot, suspect_v4
         nft list table inet ddos_protect > "$ARCH_SUBDIR/nft-state.txt" 2>/dev/null || true
-        cat /proc/net/nf_conntrack 2>/dev/null | head -10000 > "$ARCH_SUBDIR/conntrack.txt" || true
+        # v3.23.13 BUG-012 FIX: conntrack snapshot полный + gzip (раньше head -10000
+        # обрезал на 10k entries, и uncompressed файл занимал 5-10MB на каждый
+        # attack-archive). Предпочитаем conntrack(8) который через netlink работает
+        # без блокировки kernel'а; fallback на /proc если нет.
+        if command -v conntrack >/dev/null 2>&1; then
+            conntrack -L -o save 2>/dev/null | gzip -1 > "$ARCH_SUBDIR/conntrack.txt.gz" || true
+        else
+            gzip -1 < /proc/net/nf_conntrack 2>/dev/null > "$ARCH_SUBDIR/conntrack.txt.gz" || true
+        fi
         echo "delta_drops=$DELTA, total_drops=$CURRENT_DROPS, ts=$TS" > "$ARCH_SUBDIR/metadata.txt"
         logger -t "$LOG_TAG" "ATTACK DETECTED ($DELTA drops/min) — pcap archived to $ARCH_SUBDIR"
     fi
 fi
 
-# Cleanup: удаляем архивы старше 7 дней (privacy + disk space)
-find "$ARCHIVE_DIR" -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf {} \; 2>/dev/null || true
+# Cleanup: v3.23.13 BUG-010 FIX. Раньше было только `rm -rf` после 7 дней,
+# tar.zst compression жил только в install-time disk-cleanup и почти никогда
+# не срабатывал. Теперь:
+#   - >7 дней без compress → tar.zst (lossless forensics).
+#   - >SHIELD_PCAP_RETENTION_DAYS (compressed или uncompressed) → удаление.
+# Это реализует обещанную retention из design doc / changelog v3.23.7.
+PCAP_RETENTION_DAYS=__SHIELD_PCAP_RETENTION_DAYS__
+if command -v zstd >/dev/null 2>&1; then
+    find "$ARCHIVE_DIR" -mindepth 1 -maxdepth 1 -type d -mtime +7 2>/dev/null | while read -r archive_dir; do
+        tar_name="${archive_dir}.tar.zst"
+        [ -f "$tar_name" ] && continue
+        if tar --use-compress-program="zstd -19 -T2" \
+            -cf "$tar_name" \
+            -C "$(dirname "$archive_dir")" "$(basename "$archive_dir")" 2>/dev/null \
+            && [ -s "$tar_name" ]; then
+            rm -rf "$archive_dir"
+            logger -t "$LOG_TAG" "compressed archive $(basename "$archive_dir") to tar.zst"
+        else
+            # Compression failed — оставляем uncompressed (лучше чем потерять)
+            rm -f "$tar_name" 2>/dev/null
+            logger -t "$LOG_TAG" "WARN: failed to compress $(basename "$archive_dir"), keeping uncompressed"
+        fi
+    done
+fi
+# Удаляем всё (uncompressed dirs + tar.zst) старше retention
+find "$ARCHIVE_DIR" -mindepth 1 -maxdepth 1 -mtime +"$PCAP_RETENTION_DAYS" \( -type d -o -name '*.tar.zst' \) -exec rm -rf {} \; 2>/dev/null || true
 
 exit 0
 PCAP_ARCH_EOF
+
+# v3.23.13 BUG-019: подставляем настраиваемые значения
+sed -i \
+    -e "s|__SHIELD_PCAP_TRIGGER_DROPS__|$SHIELD_PCAP_TRIGGER_DROPS|g" \
+    -e "s|__SHIELD_PCAP_RETENTION_DAYS__|$SHIELD_PCAP_RETENTION_DAYS|g" \
+    /usr/local/sbin/shieldnode-pcap-archiver.sh
+verify_no_placeholders /usr/local/sbin/shieldnode-pcap-archiver.sh || exit 1
 
 chmod +x /usr/local/sbin/shieldnode-pcap-archiver.sh
 
@@ -8268,7 +8745,9 @@ CUSTOM_LOCAL=/etc/shieldnode/lists/custom-local.txt
 LOCK_DIR=/run/shieldnode
 LOCK="$LOCK_DIR/auto-promote.lock"
 LOG_TAG=shieldnode-auto-promote
-TTL_DAYS=90  # удалять записи старше 90 дней если IP больше не атакует
+TTL_DAYS=__SHIELD_CUSTOM_LOCAL_TTL_DAYS__
+PROMOTE_THRESHOLD=__SHIELD_AUTOPROMOTE_THRESHOLD__
+PROMOTE_WINDOW_HOURS=__SHIELD_AUTOPROMOTE_WINDOW_HOURS__
 
 mkdir -p "$LOCK_DIR"
 exec {LOCK_FD}> "$LOCK"
@@ -8280,12 +8759,16 @@ flock -n "$LOCK_FD" || { logger -t "$LOG_TAG" "already running, skip"; exit 0; }
     echo "# shieldnode custom-local blocklist (this node only, auto-managed)" > "$CUSTOM_LOCAL"
 }
 
-# === Selection: count >= 2000 за 24ч, только conn_flood/syn_flood ===
+# === Selection: count >= 2000 за 24ч, conn_flood / syn_escalate / newconn_flood ===
+# v3.23.13 BUG-004b FIX: было `type IN ('conn_flood','syn_flood')` — но в aggregator
+# никогда не пишется type='syn_flood' (есть только syn_escalate). Это была typo от
+# рефакторинга v3.15.x — auto-promote НИКОГДА не находил кандидатов через syn-flood.
+# Также добавляем newconn_flood (тоже признак persistent атакующего).
 NEW_IPS=$(sqlite3 "$DB" "
     SELECT DISTINCT ip FROM events
-    WHERE last_seen > strftime('%s','now') - 86400
-      AND count >= 2000
-      AND type IN ('conn_flood','syn_flood')
+    WHERE last_seen > strftime('%s','now') - ($PROMOTE_WINDOW_HOURS * 3600)
+      AND count >= $PROMOTE_THRESHOLD
+      AND type IN ('conn_flood','syn_escalate','newconn_flood')
     ORDER BY count DESC;
 " 2>/dev/null || true)
 
@@ -8475,6 +8958,14 @@ if ! systemctl is-active --quiet shieldnode-update@custom.path 2>/dev/null; then
     systemctl start shieldnode-update@custom.service 2>/dev/null || true
 fi
 PROMOTE_SCRIPT_EOF
+
+# v3.23.13 BUG-019 FIX: подставляем настраиваемые значения из limits.conf
+sed -i \
+    -e "s|__SHIELD_CUSTOM_LOCAL_TTL_DAYS__|$SHIELD_CUSTOM_LOCAL_TTL_DAYS|g" \
+    -e "s|__SHIELD_AUTOPROMOTE_THRESHOLD__|$SHIELD_AUTOPROMOTE_THRESHOLD|g" \
+    -e "s|__SHIELD_AUTOPROMOTE_WINDOW_HOURS__|$SHIELD_AUTOPROMOTE_WINDOW_HOURS|g" \
+    /usr/local/sbin/shieldnode-auto-promote.sh
+verify_no_placeholders /usr/local/sbin/shieldnode-auto-promote.sh || exit 1
 
 chmod +x /usr/local/sbin/shieldnode-auto-promote.sh
 
