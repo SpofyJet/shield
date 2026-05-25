@@ -5416,13 +5416,16 @@ print_ok "Logrotate: /etc/logrotate.d/shieldnode (daily, rotate 30, maxsize 100M
 # rsyslog'а. Если файл недоступен (другой distro?) — fallback к старому подходу
 # но БЕЗ /var/log/syslog и /var/log/kern.log (чтобы не конфликтовать).
 RSYSLOG_LOGROTATE="/etc/logrotate.d/rsyslog"
-if [ -f "$RSYSLOG_LOGROTATE" ] && ! grep -q '# shieldnode-aggressive-marker' "$RSYSLOG_LOGROTATE" 2>/dev/null; then
-    # Бэкап оригинала
-    cp -a "$RSYSLOG_LOGROTATE" "$RSYSLOG_LOGROTATE.shieldnode-bak.$(date +%s)" 2>/dev/null || true
+# v3.23.13 SR-FIX-8.1: backup ВНЕ /etc/logrotate.d/ (иначе logrotate подхватит
+# backup-файл как ещё один config → DUPLICATE LOG ENTRY).
+RSYSLOG_BACKUP_DIR="/var/lib/shieldnode/backup"
+if [ -f "$RSYSLOG_LOGROTATE" ] && ! grep -q 'shieldnode-aggressive-marker' "$RSYSLOG_LOGROTATE" 2>/dev/null; then
+    mkdir -p "$RSYSLOG_BACKUP_DIR"
+    cp -a "$RSYSLOG_LOGROTATE" "$RSYSLOG_BACKUP_DIR/rsyslog.original.$(date +%s)" 2>/dev/null || true
     # Добавляем maxsize 100M после каждого `rotate N`. Маркер на отдельной строке
     # (logrotate не поддерживает inline comments после value).
     sed -i -E '/^\s*rotate\s+[0-9]+\s*$/a\    # shieldnode-aggressive-marker\n    maxsize 100M' "$RSYSLOG_LOGROTATE"
-    print_ok "Logrotate: добавлен maxsize 100M в $RSYSLOG_LOGROTATE (aggressive rotation)"
+    print_ok "Logrotate: добавлен maxsize 100M в $RSYSLOG_LOGROTATE (backup: $RSYSLOG_BACKUP_DIR/)"
 elif [ -f "$RSYSLOG_LOGROTATE" ]; then
     print_info "Logrotate: $RSYSLOG_LOGROTATE уже патчен (maxsize 100M)"
 else
@@ -5431,6 +5434,10 @@ else
     # /etc/logrotate.d/shieldnode выше.
     print_info "Logrotate: /etc/logrotate.d/rsyslog не найден — aggressive rotation skipped"
 fi
+
+# v3.23.13 SR-FIX-8.1: убираем старые битые backup'ы которые лежат в /etc/logrotate.d/
+# (от первой неудачной попытки SR-FIX-8 — они вызывали duplicate log entry errors).
+rm -f /etc/logrotate.d/rsyslog.shieldnode-bak.* 2>/dev/null || true
 
 # v3.23.13 SR-FIX-8: удаляем legacy /etc/logrotate.d/shieldnode-syslog-aggressive
 # (если есть с v3.20.x — v3.23.12). Он дублировал /etc/logrotate.d/rsyslog.
