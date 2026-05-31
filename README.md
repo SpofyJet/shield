@@ -13,21 +13,17 @@ icmp_*, tcp_rfc1337, log_martians, UDP conntrack timeouts) shieldnode пишет
 `/etc/sysctl.d/90-shieldnode.conf` — этот префикс позволяет оператору перекрыть
 наши значения через `99-z-*.conf` если нужно.
 
-**Лимиты v3.23.13 рассчитаны на ноду с 500-1000 VPN-клиентами** (настраиваются через `/etc/shieldnode/limits.conf` — v3.23.13+):
+**Лимиты v3.23.3 рассчитаны на ноду с 500-1000 VPN-клиентами:**
 
-- **conn_flood**: `ct count over 15000` per-IP — `SHIELD_CT_CONN_FLOOD`
-- **newconn rate**: 40000/min, burst 60000 — `SHIELD_RATE_NEWCONN` + `SHIELD_RATE_NEWCONN_BURST`
-- **SYN flood**: 2000/sec, burst 3000 — `SHIELD_RATE_SYN` + `SHIELD_RATE_SYN_BURST`
-- **UDP flood**: 10000/sec, burst 20000 — `SHIELD_RATE_UDP` + `SHIELD_RATE_UDP_BURST`
-- **SSH per-IP**: ct=5 + 8/min burst 20 — `SHIELD_SSH_CT_LIMIT`, `SHIELD_SSH_NEWCONN_RATE`
-- **Auto-promote**: hits >= 2000 за 24ч → permanent ban TTL 90d — `SHIELD_AUTOPROMOTE_THRESHOLD`, `SHIELD_AUTOPROMOTE_WINDOW_HOURS`, `SHIELD_CUSTOM_LOCAL_TTL_DAYS`
-- **Aggregator**: cap 50000 unique IP/type, journalctl --lines=200000 — `SHIELD_AGG_MAX_UNIQUE_IPS`, `SHIELD_AGG_JOURNAL_LINES`
-
-Для маленьких нод (<50 клиентов): `SHIELD_CT_CONN_FLOOD=3000`. Для больших (>1000 клиентов): `SHIELD_CT_CONN_FLOOD=50000`. После изменения: `sudo systemctl restart shieldnode-nftables`.
+- **conn_flood**: `ct count over 15000` per-IP (снижено с 50000 после DDoS-инцидента 2026-05-24 — атакующие держали 5k-128k conn/IP, проходили под старый лимит)
+- **newconn rate**: 40000/min, burst 60000 (массовый reconnect 200 юзеров × 50 retry/min = 10000/min sustained)
+- **SYN flood**: 2000/sec, burst 3000 (CGNAT × 200 юзеров × 1-2 SYN/sec = 200-400/sec baseline)
+- **UDP flood**: 10000/sec, burst 20000 (Hysteria2/QUIC 4K streaming + cloud gaming)
+- **SSH per-IP**: ct=5 + 8/min burst 20 (CGNAT-админы + ansible deploy на ≤5 нод параллельно)
 
 Реальные DDoS-атаки 50k+ SYN/sec, 100k+ connections — drop на kernel level. Ban-once архитектура: первое нарушение → suspect (30 мин наблюдения без drop), второе → confirmed (15 мин drop).
 
-**Auto-promote (v3.23.3+, оживлён в v3.23.13):** IP с count>=2000 за 24ч (conn_flood/syn_escalate/newconn_flood) автоматом попадает в `custom-local.txt` навсегда. TTL 90 дней: записи удаляются если IP не атакует >30 дней. CrowdSec whitelist cross-check. **До v3.23.13 был сломан typo + missing log prefix — теперь реально работает.**
+**Auto-promote (v3.23.3):** IP с count>=2000 за 24ч (conn_flood/syn_flood) автоматом попадает в `custom-local.txt` навсегда. TTL 90 дней: записи удаляются если IP не атакует >30 дней. CrowdSec whitelist cross-check.
 
 **PCAP capture (v3.23.3+):** rolling SYN-only ring buffer 1GB в `/var/log/pcap/` + attack-archiver: при скачке >10k drops/min копирует current ring в `/var/lib/shieldnode/pcap-archive/attack-<TS>/` (7-day retention). Для отправки хостеру при DDoS.
 
@@ -42,7 +38,7 @@ icmp_*, tcp_rfc1337, log_martians, UDP conntrack timeouts) shieldnode пишет
 - **Infrastructure bypass**: ~220 CIDR крупных CDN/cloud (Cloudflare, Google, AWS, Azure, Apple, Meta, Akamai, Fastly, GitHub, Telegram, Yandex, VK, Selectel) проходят без rate-limit и не попадают в events.db как "атакующие"
 - **4 blocklist'а**:
   - `scanner` — Shodan, Censys, госсканеры РФ (shadow-netlab + CyberOK_Skipa + MISP)
-  - `threat` — Spamhaus DROP + FireHOL Level 1 + blocklist.de + Feodotracker + IPSum L3 (5 источников high-confidence, ~40-50k unique IPs после dedup)
+  - `threat` — Spamhaus DROP + FireHOL Level 1 + Feodotracker (3 источника high-confidence, ~7-8k unique IP). **blocklist.de и IPSum L3 убраны в v3.23.14** — это агрегаторы abuse-репортов, ловили публичные CGNAT/PAT мобильных операторов → ложные баны обычных юзеров.
   - `tor` — Tor exit nodes (опционально, `BLOCK_TOR=1`)
   - `custom` — личный список оператора (file-based + URL union + auto-promote)
 - **GitHub auto-sync**: `lists/custom.txt` синкается с репо каждые 6ч. Локальные дополнения — в `custom-local.txt`, не перезаписываются.
@@ -85,63 +81,10 @@ sudo guard sync       # синк custom.txt прямо сейчас
 
 ## Версии
 
-- **v3.23.13** — SECURITY HARDENING (major release based on static security audit):
-
-  **🔒 P0 Security:**
-  - **BUG-002**: SQL injection через journald закрыт. Aggregator теперь фильтрует journalctl по `_TRANSPORT=kernel + SYSLOG_IDENTIFIER=kernel + SYSLOG_IDENTIFIER=crowdsec`, применяет gsub в awk для ВСЕХ SRC= handlers (раньше `[shield:ddos]` и `[UFW BLOCK]` не чистили IP), валидирует IPv4 format перед SQL INSERT. До этого любой unprivileged user мог через `logger` инжектить `[shield:ddos] SRC=...';DROP TABLE events;--` в журнал.
-  - **BUG-003**: bogon-фильтр threat-feeds: min prefix `/16` для `threat` (был `/8` — compromised feed мог затолкать `1.0.0.0/8` и забанить Cloudflare). Добавлены CGNAT (`100.64/10`), TEST-NET-1/2/3, benchmark (`198.18-19`). `MAX_FEED_ENTRIES` cap (200k threat / 100k scanner / 10k tor / 50k custom). Alert при росте feed >20% от peak. **FAIL_THRESHOLD больше НЕ flush'ит set** — stale data > no protection.
-  - **BUG-006**: `shield_safe_source` убрал 0644 из allowed perms. Все `shieldnode.conf` теперь `chmod 0640` (root:root). Auto-migration при upgrade с warning.
-
-  **⚙️ P0 Functional Regression (auto-promote был мёртв):**
-  - **BUG-004a**: `[shield:conn_flood]` log prefix вообще не генерился в nft template — aggregator awk парсил `/\[shield:conn_flood\]/` впустую. events.db никогда не содержала `type='conn_flood'`. Добавлен log prefix с per-IP meter rate-limit.
-  - **BUG-004b**: auto-promote query искал `type='syn_flood'` — но aggregator никогда не пишет такой type (есть только `syn_escalate`, typo с рефакторинга v3.15.x). Исправлено на `IN ('conn_flood','syn_escalate','newconn_flood')`.
-  - **BUG-004c**: Threat/custom/scanner/tor/ddos/syn_escalate/udp_escalate log prefix теперь **ВСЕГДА** активны (не зависят от `SHIELDNODE_VERBOSE_LOGS` toggle). events.db, auto-promote, guard top attackers — **работают по default**. `VERBOSE_LOGS=1` теперь касается только tcp_invalid + fib_spoof (real high-volume per-packet rules).
-
-  **🛡️ P0 Resource Protection:**
-  - **BUG-007**: aggregator защищён от RAM blow-up. `MAX_UNIQUE_IPS_PER_TYPE=50000` hash cap. `MemoryMax=512M MemoryHigh=384M TasksMax=20 CPUQuota=80%` на systemd unit. Под штормом 100k unique IP — раньше OOM-killer, теперь bounded.
-
-  **🔧 P1 Robustness:**
-  - **BUG-010**: pcap-archiver. tar.zst compression >7d, retention 30d теперь реально работает в archiver runtime (раньше compression жила только в install-time disk cleanup и почти никогда не срабатывала).
-  - **BUG-012**: conntrack snapshot полный через `conntrack -L -o save` (netlink) + gzip. Раньше `head -10000` + uncompressed (5-15MB/archive, обрезка теряла 90% данных при шторме).
-  - **BUG-014**: state-file cap `LOG_STATE_MAX_ENTRIES=30000` keep-top-by-recency через sort.
-  - **BUG-015**: `VACUUM` → `VACUUM INTO + atomic mv + integrity_check + rollback`. Non-blocking, aggregator берёт shared `flock` на `/run/shieldnode/db.lock`.
-  - **BUG-019**: `/etc/shieldnode/limits.conf` с **17 настраиваемыми параметрами**. Embedded скрипты через `__PLACEHOLDER__` sed-substitution. Поддерживает разные профили нагрузки без правки исходника.
-  - **BUG-020**: journalctl фильтр (см. BUG-002), `--lines=500000 → 200000`.
-  - **BUG-021**: финальный stale `ct=5000` в guard CLI dashboard → `ct=15000`.
-
-  **🎯 Self-review fixes:**
-  - **SR-FIX-1**: GLOBAL → **per-IP meter** для log правил (8 правил). Под массивной атакой раньше log'ировался **только 1 IP/sec total**. Теперь — каждый IP хотя бы раз в минуту через `meter NAME { ip saddr limit rate 1/min }`. **100-167× improvement** attribution fairness при ботнетах.
-  - **SR-FIX-2**: `STORM_DROPPED` counter в aggregator summary — видимость drop'ов из-за hash cap'а.
-  - **SR-FIX-3**: ДВУХФАЗНАЯ nft загрузка. `nft -c -f` parse-check ДО `nft -f` apply. `ExecStartPre=` в systemd unit. **Сломанный конфиг НЕ роняет защиту** — старый ruleset продолжит работать.
-  - **SR-FIX-4**: `verify_no_placeholders` helper — fail loud если sed substitution не сработал (вместо silent breakage).
-  - **SR-FIX-5**: explicit 0644→0640 migration step с warning в install logs.
-  - **SR-FIX-6**: убран дублирующий `add @confirmed_attack_v4` в escalation chains.
-
-  **🧹 Legacy cleanup:**
-  - Удалены deprecated `mobile_ru/broadband_ru` declare-only переменные, `MAXMIND_LICENSE_KEY` упоминания.
-  - Удалён install-time `cs-ssh-whitelist` cleanup (≤v3.4 EOL 2+ года, остаётся в uninstall).
-  - Удалён `subnet-aggregator` block (v3.23.3-rc never released stable, 1+ год).
-
-  **📊 Реальное улучшение для оператора:**
-  - Attribution coverage под штормом 10k unique IP: было 60 IP/min, стало 10000 IP/min (167×).
-  - Aggregator RAM под штормом 100k IP: было риск OOM при 2GB, стало bounded 512MB hard cap.
-  - PCAP retention: было 7 дней (обещано 30), стало реальные 30 дней через tar.zst.
-  - **auto-promote оживлён** — реально создаёт permanent bans для chronic attackers.
-  - `limits.conf` позволяет tuning под профиль нагрузки без правки исходника.
-
-  **⚠️ Limits & known issues:**
-  - IPv6 защита всё ещё не пофикшена (архитектурный, требует full v6 ruleset).
-  - `guard upgrade` без crypto verification (требует GPG/Sigstore signing).
-  - Перед prod rollout рекомендуется staging-нода × 24h. Используй `nft -c -f /etc/nftables.d/ddos-protect.conf` для parse-only проверки до apply.
-
-  Полные детали аудита: SELF-REVIEW.md и SELF-REVIEW-FIXES.md в репо.
-
-- **v3.23.12** — COSMETIC FIX:
-  - **FIX**: финальное сообщение установщика и Settings menu показывали `ct=50000` (legacy hardcoded text). Реальный лимит в nft = 15000 с v3.23.3+, но текст не был обновлён. Поправлено.
-- **v3.23.11** — SYSTEMD ESCAPE FIX (hotfix к v3.23.10):
-  - **CRIT FIX**: pcap-service не работал в v3.23.10. systemd unit использует `%` как СВОИ specifiers (`%H`=hostname, `%m`=machineid, `%Y`=hash). В v3.23.10 я написал `%Y%m%d` для tcpdump strftime, но systemd подставлял свои значения ДО tcpdump. Результат: tcpdump получал имя файла `syn-/etc/systemd/system07397.../sweden2.../var/lib.pcap` и падал каждые 10 секунд (`No such file or directory`).
-  - Fix: вернуть `%%Y%%m%%d-%%H%%M%%S` в unit-файле. Внутри single-quote heredoc `%%` сохраняется literal → systemd получает `%%` → даёт tcpdump один `%` для strftime → правильное имя файла `syn-20260524-185857.pcap`.
-  - **FIX**: `guard self-test` "integer expression expected" на line 130. `grep -c ... || echo 0` приклеивал второй "0" к выводу когда grep возвращал 0 → `[ "0\n0" -gt 5 ]` падал. Заменено на `${X:-0}` default.
+- **v3.23.14** — FALSE-POSITIVE + PIPE-DEADLOCK FIX:
+  - **FIX**: убраны шумные threat-фиды (blocklist.de/all, IPSum L3) — агрегаторы abuse-репортов с публичными CGNAT/PAT адресами операторов → дроп NEW-коннектов реальных юзеров. Остались Spamhaus DROP + FireHOL L1 + Feodo. `MIN_ENTRIES_THREAT` 5000→3000 под урезанный набор.
+  - **FIX**: self-reexec при `curl | bash` — ~480KB скрипт не влезал в pipe-буфер (64KB), bash блокировался на ожидании apt → curl обрывался (`curl: 23`), скрипт обрезался. Теперь в pipe-режиме качается копия в /tmp и exec'ается (stdin не pipe → дедлок невозможен).
+  - **FIX**: `wait_for_apt_lock` — убран широкий `pgrep -f` (ловил фантомы apt-daily/dpkg-query), теперь `fuser` по lock-файлам = авторитет + показывает кто держит. Таймаут → `SHIELDNODE_FORCE_APT=1` останавливает systemd apt-таймеры и снимает lock.
 - **v3.23.10** — PCAP NAME FIX (hotfix к v3.23.9):
   - **CRIT FIX**: в v3.23.9 heredoc для `shieldnode-pcap.service` использовал `<<PCAP_UNIT_EOF` без quotes (для подстановки `$TCPDUMP_BIN`), и в strftime-pattern удвоились `%` → tcpdump получал буквальное имя файла `syn-%%Y%%m%%d-%%H%%M%%S.pcap` вместо timestamp. PCAP записи были бы сломаны.
   - Fix: single-quote heredoc (literal) + targeted `sed` замена ровно одного placeholder `__TCPDUMP_BIN__` после создания файла. Никакого expand'а `$VAR`/`%`, всё literal до явной замены.
