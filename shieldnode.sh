@@ -1,7 +1,19 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.23.14 (Commercial Edition) — SECURITY HARDENING
+#  VPN NODE DDoS PROTECTION v3.23.16 (Commercial Edition) — SECURITY HARDENING
+#
+#  v3.23.16: SYNPROXY (default-on, SHIELD_SYNPROXY=1 default (opt-out: SHIELD_SYNPROXY=0 в shieldnode.conf)) — conntrack-exhaustion
+#    защита. SYN перехватывается до conntrack (syncookies). Отдельный модуль
+#    shieldnode-synproxy.sh / table inet shield_synproxy (ddos_protect не трогает).
+#    На enable: verify mss/wscale + проверка untracked с авто-откатом. Boot-unit.
+#    Ядро >=5.14. SSH не трогается. Включать на ноду после своей проверки.
+#
+#  v3.23.15 (security audit fixes):
+#    P0-2 SSH-блок выше infra-accept; IaaS убран из infra baseline (CDN/edge only).
+#    P0-1 базовая IPv6-защита (new-conn DROP на VPN-портах, SSH/v6 rate-limit).
+#    P1-1 auto-promote 2000->800; источники conn_flood/syn_escalate/udp_escalate.
+#    P2-1 octet<=255 в blocklist-updater. P2-2 ADMIN_IP -> whitelist (anti-lockout).
 #
 #  Что нового vs v3.23.12 (results of static security audit):
 #
@@ -373,7 +385,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.23.14"
+SHIELDNODE_VERSION="3.23.16"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -623,7 +635,9 @@ SHIELD_RATE_UDP_BURST="${SHIELD_RATE_UDP_BURST:-20000}"
 SHIELD_SSH_CT_LIMIT="${SHIELD_SSH_CT_LIMIT:-5}"
 SHIELD_SSH_NEWCONN_RATE="${SHIELD_SSH_NEWCONN_RATE:-8/minute}"
 SHIELD_SSH_NEWCONN_BURST="${SHIELD_SSH_NEWCONN_BURST:-20}"
-SHIELD_AUTOPROMOTE_THRESHOLD="${SHIELD_AUTOPROMOTE_THRESHOLD:-2000}"
+SHIELD_AUTOPROMOTE_THRESHOLD="${SHIELD_AUTOPROMOTE_THRESHOLD:-800}"
+# v3.23.16: SYNPROXY (conntrack-exhaustion защита). 1=вкл (дефолт), 0=выкл.
+SHIELD_SYNPROXY="${SHIELD_SYNPROXY:-1}"
 SHIELD_AUTOPROMOTE_WINDOW_HOURS="${SHIELD_AUTOPROMOTE_WINDOW_HOURS:-24}"
 SHIELD_CUSTOM_LOCAL_TTL_DAYS="${SHIELD_CUSTOM_LOCAL_TTL_DAYS:-90}"
 SHIELD_EVENTS_DB_RETENTION_DAYS="${SHIELD_EVENTS_DB_RETENTION_DAYS:-90}"
@@ -660,7 +674,8 @@ shield_ensure_numeric SHIELD_RATE_SYN_BURST 3000
 shield_ensure_numeric SHIELD_RATE_UDP_BURST 20000
 shield_ensure_numeric SHIELD_SSH_CT_LIMIT 5
 shield_ensure_numeric SHIELD_SSH_NEWCONN_BURST 20
-shield_ensure_numeric SHIELD_AUTOPROMOTE_THRESHOLD 2000
+shield_ensure_numeric SHIELD_AUTOPROMOTE_THRESHOLD 800
+shield_ensure_numeric SHIELD_SYNPROXY 1
 shield_ensure_numeric SHIELD_AUTOPROMOTE_WINDOW_HOURS 24
 shield_ensure_numeric SHIELD_CUSTOM_LOCAL_TTL_DAYS 90
 shield_ensure_numeric SHIELD_EVENTS_DB_RETENTION_DAYS 90
@@ -673,19 +688,6 @@ shield_ensure_numeric SHIELD_AGG_MAX_UNIQUE_IPS 50000
 # versions on certain platforms had issues with arithmetic expansion inside
 # unquoted heredoc when var contains unexpected chars).
 SHIELD_CT_CONN_FLOOD_MINUS_1=$((SHIELD_CT_CONN_FLOOD - 1))
-
-# nft set names — для совместимости с v3.11.x state на проде сохраняем
-# имя tor_exit_blocklist_v4 (старое). Маппинг: имя в updater'е → реальный nft set.
-shield_nft_set_name() {
-    case "$1" in
-        scanner)    echo "scanner_blocklist_v4" ;;
-        threat)     echo "threat_blocklist_v4"  ;;
-        tor)        echo "tor_exit_blocklist_v4" ;;   # legacy compat
-        custom)     echo "custom_blocklist_v4"  ;;
-        # v3.20.0: mobile_ru + broadband_ru УБРАНЫ
-        *) return 1 ;;
-    esac
-}
 
 # v3.13.0: mobile-RU whitelist defaults
 # v3.14.1: эти переменные тоже подхватятся из shieldnode.conf если оператор
@@ -754,7 +756,8 @@ if [ "${1:-}" = "--uninstall" ]; then
                 shieldnode-version-check.timer shieldnode-version-check.service \
                 shieldnode-logrotate.timer shieldnode-logrotate.service \
                 shieldnode-cleanup.timer shieldnode-cleanup.service \
-                shieldnode-whitelist.path shieldnode-whitelist.service; do
+                shieldnode-whitelist.path shieldnode-whitelist.service \
+                shieldnode-synproxy.service; do
         systemctl disable --now "$unit" 2>/dev/null || true
         rm -f "/etc/systemd/system/$unit"
     done
@@ -778,6 +781,7 @@ if [ "${1:-}" = "--uninstall" ]; then
     rm -f /usr/local/sbin/shieldnode-github-sync.sh
     rm -f /usr/local/sbin/shieldnode-version-check.sh
     rm -f /usr/local/sbin/shieldnode-whitelist-updater.sh
+    rm -f /usr/local/sbin/shieldnode-synproxy.sh /etc/shieldnode/synproxy.nft /etc/sysctl.d/99-shieldnode-synproxy.conf  # v3.23.16
     rm -f /usr/local/sbin/shieldnode-defaults.sh
     rm -f /usr/local/sbin/shieldnode-cleanup.sh  # v3.20.3
     rm -f /usr/local/bin/guard
@@ -889,6 +893,7 @@ if [ "${1:-}" = "--uninstall" ]; then
     print_ok "Postoverflow parser удалён"
 
     # nft table
+    nft delete table inet shield_synproxy 2>/dev/null || true   # v3.23.16 SYNPROXY
     nft delete table inet ddos_protect 2>/dev/null || true
     rm -f /etc/nftables.d/ddos-protect.conf
     # Убираем include из /etc/nftables.conf
@@ -2144,7 +2149,13 @@ fi
 # для нашей цели (НЕ банить случайно) это безопаснее. Точные диапазоны
 # подтягивает dynamic updater из официальных endpoint'ов.
 INFRASTRUCTURE_V4_CIDR=$(cat <<'INFRA_V4_EOF'
-# === Cloudflare (AS13335) — официальный list из ips-v4 ===
+# v3.23.15 P0-2: ТОЛЬКО CDN/edge провайдеры (контент-сети, IP арендовать нельзя).
+# IaaS-compute (AWS EC2 / Azure / GCP-compute 34-35 / Selectel / Yandex Cloud /
+# VK Cloud) УБРАНЫ из bypass — это типовой источник стресс/брут-ботов.
+# Bridge/upstream/mgmt ноды (даже на Selectel/Yandex) защищены manual_whitelist_v4
+# (проверяется ПЕРВЫМ) + TRUSTED_IPS — их этот trim не затрагивает.
+# Вернуть конкретный IaaS-блок при необходимости — добавь его в нижнюю секцию.
+# === Cloudflare (AS13335) ===
 103.21.244.0/22
 103.22.200.0/22
 103.31.4.0/22
@@ -2160,20 +2171,11 @@ INFRASTRUCTURE_V4_CIDR=$(cat <<'INFRA_V4_EOF'
 190.93.240.0/20
 197.234.240.0/22
 198.41.128.0/17
-# === Google (AS15169) ===
+# === Google EDGE/DNS (AS15169) — GCP-compute 34.x/35.x НАМЕРЕННО исключены ===
 8.8.4.0/24
 8.8.8.0/24
 8.34.208.0/20
 8.35.192.0/20
-34.0.0.0/15
-34.2.0.0/16
-35.184.0.0/13
-35.192.0.0/14
-35.196.0.0/15
-35.198.0.0/16
-35.199.0.0/17
-35.224.0.0/12
-35.240.0.0/13
 64.18.0.0/20
 64.233.160.0/19
 66.102.0.0/20
@@ -2188,7 +2190,7 @@ INFRASTRUCTURE_V4_CIDR=$(cat <<'INFRA_V4_EOF'
 216.58.192.0/19
 216.239.32.0/19
 192.178.0.0/16
-# === Apple (AS714) — весь /8 ===
+# === Apple (AS714) ===
 17.0.0.0/8
 # === Meta/Facebook (AS32934) ===
 31.13.24.0/21
@@ -2236,150 +2238,11 @@ INFRASTRUCTURE_V4_CIDR=$(cat <<'INFRA_V4_EOF'
 91.108.16.0/22
 91.108.56.0/22
 149.154.160.0/20
-# === Yandex (AS13238) ===
-5.45.192.0/18
-5.255.192.0/18
-77.88.0.0/18
-87.250.224.0/19
-93.158.128.0/18
-141.8.128.0/18
-178.154.128.0/17
-213.180.192.0/19
-# === VK / Mail.ru (AS47541, AS28709) ===
-87.240.128.0/18
-93.186.224.0/20
-95.142.192.0/20
-95.213.0.0/16
-# === Selectel (AS50340, AS49505) ===
-85.119.144.0/20
-92.53.96.0/19
-185.32.248.0/22
-188.93.16.0/22
-# === AWS (AS16509) — TIGHTLY-SCOPED supernets ===
-# ВАЖНО: НЕ /8 — AWS делит крупные блоки с другими.
-# Только подтверждённые supernets из официального ip-ranges.json.
-# Полное покрытие AWS — задача dynamic updater'а (v3.21.6+).
-3.2.0.0/16
-3.5.0.0/19
-13.34.0.0/15
-13.224.0.0/14
-15.177.0.0/18
-15.230.0.0/16
-18.32.0.0/14
-18.130.0.0/16
-18.144.0.0/15
-18.156.0.0/14
-18.184.0.0/13
-18.192.0.0/10
-18.230.0.0/15
-35.71.64.0/22
-35.71.96.0/22
-35.71.128.0/22
-50.16.0.0/15
-50.18.0.0/16
-52.4.0.0/14
-52.16.0.0/14
-52.32.0.0/11
-52.84.0.0/15
-52.94.0.0/22
-52.95.0.0/16
-52.119.128.0/17
-52.144.192.0/20
-52.192.0.0/11
-52.216.0.0/15
-52.218.0.0/15
-52.220.0.0/15
-52.222.0.0/16
-54.64.0.0/13
-54.72.0.0/15
-54.74.0.0/15
-54.144.0.0/12
-54.160.0.0/12
-54.176.0.0/12
-54.192.0.0/16
-54.198.0.0/15
-54.204.0.0/14
-54.208.0.0/13
-54.216.0.0/14
-54.220.0.0/15
-54.222.0.0/15
-54.224.0.0/12
-54.240.0.0/12
-99.78.0.0/18
-99.79.0.0/16
-99.80.0.0/15
-99.150.16.0/20
-# === Microsoft Azure (AS8075) — TIGHTLY-SCOPED ===
-# Подтверждённые блоки из Azure service tags JSON.
-13.64.0.0/11
-13.96.0.0/13
-13.104.0.0/14
-20.33.0.0/16
-20.34.0.0/15
-20.36.0.0/14
-20.40.0.0/13
-20.48.0.0/12
-20.64.0.0/10
-20.128.0.0/16
-20.135.0.0/16
-20.140.0.0/15
-20.143.0.0/16
-20.150.0.0/15
-20.157.0.0/16
-20.160.0.0/12
-20.176.0.0/14
-20.180.0.0/14
-20.184.0.0/13
-20.192.0.0/10
-40.64.0.0/10
-40.74.0.0/15
-40.76.0.0/14
-40.80.0.0/12
-40.96.0.0/12
-40.112.0.0/13
-40.120.0.0/14
-40.124.0.0/16
-40.125.0.0/17
-51.4.0.0/15
-51.8.0.0/16
-51.10.0.0/15
-51.11.0.0/16
-51.12.0.0/15
-51.18.0.0/16
-51.51.0.0/16
-51.103.0.0/16
-51.104.0.0/15
-51.107.0.0/16
-51.116.0.0/16
-51.120.0.0/15
-51.124.0.0/16
-51.132.0.0/16
-51.136.0.0/15
-51.138.0.0/16
-51.140.0.0/14
-51.144.0.0/15
-52.96.0.0/12
-52.112.0.0/14
-52.120.0.0/14
-52.125.0.0/16
-52.126.0.0/15
-52.130.0.0/15
-52.132.0.0/14
-52.136.0.0/13
-52.145.0.0/16
-52.146.0.0/15
-52.148.0.0/14
-52.152.0.0/13
-52.160.0.0/11
-52.224.0.0/11
-65.52.0.0/14
-70.37.0.0/17
-94.245.64.0/18
-104.40.0.0/13
-131.107.0.0/16
-137.116.0.0/15
-137.135.0.0/16
-138.91.0.0/16
+#
+# IaaS-compute УБРАНО из auto-bypass (P0-2): AWS/Azure/GCP-compute(34-35)/Selectel/
+# Yandex Cloud/VK Cloud — там тривиально арендуют ботов. Bridge/mgmt на этих сетях
+# защищены manual_whitelist_v4 (проверяется первым). Нужен конкретный блок — добавь
+# его CIDR'ы сюда вручную (из официальных ranges провайдера).
 INFRA_V4_EOF
 )
 
@@ -2396,10 +2259,7 @@ INFRASTRUCTURE_V6_CIDR=$(cat <<'INFRA_V6_EOF'
 2a00:1450::/32
 2402:9800::/32
 2404:6800::/32
-2406:da00::/24
-2600:1f00::/24
 2620:107:300f::/48
-2603:1000::/24
 2620:1ec::/36
 2a03:2880::/29
 2620:0:1c00::/40
@@ -2502,7 +2362,6 @@ print_header "ШАГ 3: ПРОВЕРКА КОНФИГА SSH"
 SSHD_PASSWORD_AUTH_ENABLED=0
 SSHD_PUBKEY_AUTH_ENABLED=1
 
-SSHD_CONFIG="/etc/ssh/sshd_config"
 SSHD_EFFECTIVE=$(sshd -T 2>/dev/null)
 
 if [ -z "$SSHD_EFFECTIVE" ]; then
@@ -2589,8 +2448,13 @@ SHIELD_SSH_NEWCONN_BURST=20
 
 # ─── Auto-promote (events.db → custom-local.txt permanent ban) ───
 # IP с >=THRESHOLD hits за WINDOW_HOURS попадает в local blocklist на TTL_DAYS.
-SHIELD_AUTOPROMOTE_THRESHOLD=2000
+# v3.23.15 P1-1: 800 (раньше 2000 — недостижимо за 24ч под log-meter 1/min).
+# Heavy-CGNAT нода? Подними обратно (conn_flood ложно срабатывает на CGNAT-пиках).
+SHIELD_AUTOPROMOTE_THRESHOLD=800
 SHIELD_AUTOPROMOTE_WINDOW_HOURS=24
+# v3.23.16: SYNPROXY (conntrack-exhaustion). 1=вкл (дефолт), 0=выкл.
+# Включать на ноду ТОЛЬКО после своей канарейка-проверки. Применяется на установке.
+SHIELD_SYNPROXY=1
 SHIELD_CUSTOM_LOCAL_TTL_DAYS=90
 
 # ─── Retention ───
@@ -2693,6 +2557,34 @@ else
     print_info "Verbose logs DISABLED (default) — blocklist/escalation attribution still active (always-on)"
     print_info "  Включить tcp_invalid + fib_spoof debug:  SHIELDNODE_VERBOSE_LOGS=1 sudo bash shieldnode.sh"
     SHIELD_LOG_TCP_INVALID=""
+fi
+
+# === v3.23.15 P0-1: базовая IPv6-защита (дешёвый вариант; полный v6-ruleset — 2-я волна) ===
+SHIELD_V6_SETS=""
+SHIELD_V6_RULES=""
+if ip -6 addr show scope global 2>/dev/null | grep -qE 'inet6 (2[0-9a-f]|3[0-9a-f])'; then
+    print_warn "Публичный IPv6 обнаружен — включаю базовую v6-защиту (P0-1)"
+    print_info "  VPN-порты: новые v6-соединения DROP (клиенты идут по v4/CGNAT)"
+    print_info "  SSH over v6: rate-limit как v4 (без hard-deny → без lockout)"
+    print_info "  Полноценный v6 rate-limit на VPN-портах — следующий релиз"
+    SHIELD_V6_SETS="    set ssh_connlimit_v6 {
+        type ipv6_addr
+        flags dynamic
+        size 16384
+    }
+    set ssh_newconn_v6 {
+        type ipv6_addr
+        flags dynamic, timeout
+        timeout 5m
+        size 16384
+    }
+    counter conn6_blocked { }
+    counter ssh6_flood { }"
+    SHIELD_V6_RULES="        # === v3.23.15 P0-1: базовая IPv6-защита (established уже принят выше) ===
+        meta nfproto ipv6 tcp dport @protected_ports_tcp ct state new counter name conn6_blocked drop
+        meta nfproto ipv6 udp dport @protected_ports_udp ct state new counter name conn6_blocked drop
+        meta nfproto ipv6 tcp dport { $SSH_PORTS_NFT } ct state new add @ssh_connlimit_v6 { ip6 saddr ct count over $SHIELD_SSH_CT_LIMIT } counter name ssh6_flood drop
+        meta nfproto ipv6 tcp dport { $SSH_PORTS_NFT } ct state new add @ssh_newconn_v6 { ip6 saddr limit rate over $SHIELD_SSH_NEWCONN_RATE burst $SHIELD_SSH_NEWCONN_BURST packets } counter name ssh6_flood drop"
 fi
 
 cat > "$NFT_DDOS_CONF" <<EOF
@@ -2837,6 +2729,7 @@ $XRAY_PORTS_UDP_INIT
         timeout 5m
         size 16384
     }
+$SHIELD_V6_SETS
 
     # --- v2.5: STAGE 2 — CONFIRMED ATTACK (бан 1 час) ---
     # Сюда IP попадает если уже сидел в suspect и опять превысил лимит.
@@ -3031,12 +2924,9 @@ $SHIELD_LOG_TCP_INVALID
         # Set заполняется embedded baseline на установке + dynamic updater.
         # Этот accept ПОСЛЕ blocklists (scanner/threat/tor) — если инфра-IP
         # каким-то чудом окажется в blocklist'е, всё равно дропнется раньше.
-        # Этот accept ДО SSH rate-limit и conn_flood — пакеты от CF/Google
-        # не считаются "флудом" даже если их много (что нормально для CDN).
-        # tcp_invalid и fib_spoof ВЫШЕ — они работают для всех включая инфра.
-        # Counter без log prefix — слишком высокий объём для логирования.
-        ip saddr @infrastructure_v4 counter name infrastructure_passes_v4 accept
-        ip6 saddr @infrastructure_v6 counter name infrastructure_passes_v6 accept
+        # tcp_invalid и fib_spoof ВЫШЕ — работают для всех включая инфра.
+        # v3.23.15 P0-2: infra-accept ПЕРЕМЕЩЁН НИЖЕ SSH-блока (см. ниже) +
+        # IaaS убран из baseline — облако не обходит SSH-лимит/rate-limit.
 
         # === SSH PRE-AUTH FLOOD PROTECTION (v3.21.0, перемещён в v3.21.1) ===
         # v3.10.2: поддержка нескольких SSH-портов (e.g. миграция 22 → 2222)
@@ -3083,6 +2973,13 @@ $SHIELD_LOG_TCP_INVALID
         tcp dport { $SSH_PORTS_NFT } ct state new add @ssh_newconn_rate_v4 { ip saddr limit rate over $SHIELD_SSH_NEWCONN_RATE burst $SHIELD_SSH_NEWCONN_BURST packets } counter name ssh_newconn_flood_v4 drop
         # Прошёл все blocklist'ы и оба лимита — пропускаем дальше к sshd.
         tcp dport { $SSH_PORTS_NFT } accept
+
+        # === INFRASTRUCTURE BYPASS (v3.23.15 P0-2: перемещён сюда, ПОСЛЕ SSH) ===
+        # CDN/edge accept без conn_flood/newconn/syn/udp (у них легит burst).
+        # SSH обработан ВЫШЕ → облачные источники не обходят SSH-лимит.
+        ip saddr @infrastructure_v4 counter name infrastructure_passes_v4 accept
+        ip6 saddr @infrastructure_v6 counter name infrastructure_passes_v6 accept
+$SHIELD_V6_RULES
 
         # === v2.5: BAN-ONCE АРХИТЕКТУРА ===
         # Двухэтапная проверка перед баном — снижает ложные баны CGNAT/мобильных.
@@ -3282,6 +3179,247 @@ if nft -f "$NFT_DDOS_CONF" 2>&1; then
 else
     print_error "Ошибка загрузки nft-правил — смотри вывод выше"
     exit 1
+fi
+
+# ============================================================================
+# v3.23.16: SYNPROXY модуль (default-on, conntrack-exhaustion защита)
+# ============================================================================
+# Изолированный модуль (отдельная nft table inet shield_synproxy, отдельный
+# процесс). Управляется флагом SHIELD_SYNPROXY (default 1). ddos_protect не
+# трогается. Запускаем ПОСЛЕ загрузки основной таблицы — модуль детектит
+# protected_ports_tcp из живого ruleset'а.
+cat > /usr/local/sbin/shieldnode-synproxy.sh <<'SYNPROXY_MODULE_EOF'
+#!/bin/bash
+# shieldnode-synproxy v0.2 — SYNPROXY default-on (защита от conntrack-exhaustion).
+# SYN перехватывается ДО conntrack (syncookies); запись в conntrack только после
+# завершённого 3-way → SYN-флуд не течёт таблицу. Изолированная table
+# inet shield_synproxy (ddos_protect не трогает, откат = удаление). SSH не трогает.
+# enable: verify mss/wscale против бэкенда + проверка untracked с авто-откатом
+# (если другой фаервол дропает untracked — иначе оборвало бы клиентов).
+set -euo pipefail
+
+TABLE="inet shield_synproxy"
+NFT_FILE="/etc/shieldnode/synproxy.nft"
+SYSCTL_FILE="/etc/sysctl.d/99-shieldnode-synproxy.conf"
+DDOS_TABLE="inet ddos_protect"
+VERIFY_SECS="${SHIELD_SYNPROXY_VERIFY_SECS:-6}"
+PROBE_SECS="${SHIELD_SYNPROXY_PROBE_SECS:-8}"
+
+log(){ printf '%s\n' "$*" >&2; }
+die(){ log "ERROR: $*"; exit 1; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+
+detect_dev(){
+    local d
+    d=$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
+    [ -n "${d:-}" ] || d=$(ip -o link show up 2>/dev/null | awk -F': ' '$2!="lo"{print $2;exit}')
+    echo "${d:-eth0}"
+}
+
+detect_ports(){
+    local raw
+    raw=$(nft list set $DDOS_TABLE protected_ports_tcp 2>/dev/null \
+          | tr '\n' ' ' | sed -n 's/.*elements = {\([^}]*\)}.*/\1/p' | tr -d ' \t')
+    [ -n "$raw" ] && { echo "$raw"; return; }
+    echo "443"
+}
+detect_mss(){ local m; m=$(cat "/sys/class/net/$(detect_dev)/mtu" 2>/dev/null || echo 1500); echo $((m-40)); }
+detect_wscale(){
+    local rmax space=65535 w=0
+    rmax=$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null | awk '{print $3}')
+    [ -n "${rmax:-}" ] || rmax=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 6291456)
+    while [ "$space" -lt "$rmax" ] && [ "$w" -lt 14 ]; do space=$((space*2)); w=$((w+1)); done
+    echo "$w"
+}
+
+PORTS="${SHIELD_SYNPROXY_PORTS:-$(detect_ports)}"
+MSS="${SHIELD_SYNPROXY_MSS:-$(detect_mss)}"
+WSCALE="${SHIELD_SYNPROXY_WSCALE:-$(detect_wscale)}"
+FIRST_PORT="$(echo "$PORTS" | tr ',' '\n' | head -1 | cut -d- -f1)"
+
+synproxy_syn_total(){
+    local s=0 syn rest hdr v
+    [ -r /proc/net/stat/synproxy ] || { echo 0; return; }
+    while read -r hdr syn rest; do
+        [ "$hdr" = "entries" ] && continue
+        v=$(( 16#${syn:-0} )) 2>/dev/null || v=0
+        s=$(( s + v ))
+    done < /proc/net/stat/synproxy
+    echo "$s"
+}
+
+cap_check(){
+    modprobe nf_synproxy 2>/dev/null || true
+    modprobe nf_conntrack 2>/dev/null || true
+    nft -c -f - >/dev/null 2>&1 <<'PROBE' || die "ядро/nft без SYNPROXY (нужен CONFIG_NFT_SYNPROXY / kernel >=5.14). Обнови ядро или используй обычную SYN-rate защиту."
+table inet __sp_probe {
+    chain c {
+        type filter hook input priority 0;
+        tcp dport 443 ct state invalid,untracked synproxy mss 1460 wscale 7 timestamp sack-perm
+    }
+}
+PROBE
+}
+
+verify_backend_mss_wscale(){
+    [ "${SHIELD_SYNPROXY_NOVERIFY:-0}" = "1" ] && { log "verify пропущен (NOVERIFY=1)"; return 0; }
+    have tcpdump || { log "tcpdump не найден — проверку mss/wscale пропускаю (авто-детект mss=$MSS wscale=$WSCALE)"; return 0; }
+    local dev cap mss_seen wscale_seen
+    dev=$(detect_dev)
+    log "Проверяю нативный SYN-ACK бэкенда на :$FIRST_PORT (${VERIFY_SECS}s, нужен живой трафик)…"
+    cap=$(timeout "$VERIFY_SECS" tcpdump -ni "$dev" -c1 -v \
+          "tcp src port $FIRST_PORT and tcp[tcpflags]=(tcp-syn|tcp-ack)" 2>/dev/null || true)
+    mss_seen=$(echo "$cap"    | grep -oE 'mss [0-9]+'    | head -1 | awk '{print $2}')
+    wscale_seen=$(echo "$cap" | grep -oE 'wscale [0-9]+' | head -1 | awk '{print $2}')
+    if [ -z "${mss_seen:-}" ]; then
+        log "  (живого SYN-ACK за окно нет — оставляю авто-детект mss=$MSS wscale=$WSCALE)"
+        return 0
+    fi
+    log "  нативный бэкенд: mss=$mss_seen wscale=${wscale_seen:-?}"
+    if [ "$mss_seen" != "$MSS" ]; then
+        log "  ⚠ MSS расходится (synproxy=$MSS, бэкенд=$mss_seen) → выставляю $mss_seen"
+        MSS="$mss_seen"
+    fi
+    if [ -n "${wscale_seen:-}" ] && [ "$wscale_seen" != "$WSCALE" ]; then
+        log "  ⚠ wscale расходится (synproxy=$WSCALE, бэкенд=$wscale_seen) → выставляю $wscale_seen"
+        WSCALE="$wscale_seen"
+    fi
+}
+
+verify_untracked_reaches(){
+    [ "${SHIELD_SYNPROXY_NOVERIFY:-0}" = "1" ] && return 0
+    have tcpdump || { log "tcpdump не найден — проверку доходимости untracked пропускаю"; return 0; }
+    local dev before after syn_in
+    dev=$(detect_dev)
+    before=$(synproxy_syn_total)
+    log "Проверяю что untracked SYN доходит до synproxy (${PROBE_SECS}s)…"
+    syn_in=$(timeout "$PROBE_SECS" tcpdump -ni "$dev" -c1 \
+             "tcp dst port $FIRST_PORT and tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack = 0" 2>/dev/null | wc -l)
+    after=$(synproxy_syn_total)
+    if [ "${syn_in:-0}" -eq 0 ]; then
+        log "  (входящих SYN на :$FIRST_PORT за окно нет — пропускаю; повтори под нагрузкой/nc)"
+        return 0
+    fi
+    if [ "$after" -le "$before" ]; then
+        log "  ✖ ВХОДЯЩИЕ SYN ЕСТЬ, но synproxy их не видит (syn_received не растёт)."
+        log "    Другой фаервол (UFW/firewalld/кастом) дропает UNTRACKED раньше synproxy."
+        log "    АВТО-ОТКАТ во избежание обрыва клиентов. Разбери конфликт слоёв и включи заново."
+        disable
+        exit 3
+    fi
+    log "  ✔ untracked SYN доходит (syn_received растёт) — слои уживаются."
+}
+
+write_conf(){
+    local ports_nft="${PORTS//,/, }"
+    mkdir -p /etc/shieldnode
+    cat > "$NFT_FILE" <<EOF
+#!/usr/sbin/nft -f
+# shieldnode SYNPROXY — изолированная table, НЕ трогает inet ddos_protect.
+# mss/wscale подогнаны под бэкенд (verify на enable). При жалобах клиентов на
+# низком path-MTU (DSL/PPPoE/мобайл) — понизь SHIELD_SYNPROXY_MSS.
+table inet shield_synproxy {
+    set sp_ports {
+        type inet_service
+        flags interval
+        elements = { ${ports_nft} }
+    }
+    chain pre_raw {
+        type filter hook prerouting priority -300; policy accept;
+        tcp dport @sp_ports tcp flags syn / fin,syn,rst,ack notrack
+    }
+    chain in_synproxy {
+        type filter hook input priority -275; policy accept;
+        tcp dport @sp_ports ct state invalid,untracked synproxy mss ${MSS} wscale ${WSCALE} timestamp sack-perm
+        tcp dport @sp_ports ct state invalid drop
+    }
+}
+EOF
+}
+
+enable(){
+    cap_check
+    nft list table $TABLE >/dev/null 2>&1 && nft delete table $TABLE
+    verify_backend_mss_wscale
+    sysctl -qw net.netfilter.nf_conntrack_tcp_loose=0 2>/dev/null || true
+    sysctl -qw net.ipv4.tcp_syncookies=1 2>/dev/null || true
+    cat > "$SYSCTL_FILE" <<SCTL
+# shieldnode SYNPROXY requirements
+net.netfilter.nf_conntrack_tcp_loose=0
+net.ipv4.tcp_syncookies=1
+SCTL
+    write_conf
+    nft -c -f "$NFT_FILE" || die "сгенерированный ruleset не парсится"
+    nft -f "$NFT_FILE"
+    log "✔ SYNPROXY включён: порты={${PORTS}} mss=${MSS} wscale=${WSCALE}"
+    verify_untracked_reaches
+    log "  conntrack_tcp_loose=0, syncookies=1 (persisted ${SYSCTL_FILE})"
+}
+
+disable(){
+    nft list table $TABLE >/dev/null 2>&1 && nft delete table $TABLE && log "table $TABLE удалена"
+    rm -f "$NFT_FILE" "$SYSCTL_FILE"
+    log "✔ SYNPROXY выключен."
+}
+
+status(){
+    echo "ports = {${PORTS}}   mss = ${MSS}   wscale = ${WSCALE}"
+    echo "loose = $(sysctl -n net.netfilter.nf_conntrack_tcp_loose 2>/dev/null || echo '?')"
+    echo ""
+    if nft list table $TABLE >/dev/null 2>&1; then
+        echo "SYNPROXY: ACTIVE"
+        echo "--- conntrack count ---"
+        conntrack -C 2>/dev/null || cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || true
+        echo "--- synproxy cookie stats ---"
+        cat /proc/net/stat/synproxy 2>/dev/null || echo "(нет статы)"
+    else
+        echo "SYNPROXY: inactive"
+    fi
+}
+
+dryrun(){
+    cap_check && log "✔ ядро/nft поддерживают SYNPROXY"
+    write_conf
+    nft -c -f "$NFT_FILE" && log "✔ ruleset валиден (порты={${PORTS}} mss=${MSS} wscale=${WSCALE})"
+    log "(ничего не применено)"
+}
+
+case "${1:-status}" in
+    on|enable|start)  enable ;;
+    off|disable|stop) disable ;;
+    status)           status ;;
+    dryrun|check)     dryrun ;;
+    *) echo "usage: $0 {on|off|status|dryrun}"; exit 1 ;;
+esac
+SYNPROXY_MODULE_EOF
+chmod 0755 /usr/local/sbin/shieldnode-synproxy.sh
+
+if [ "$SHIELD_SYNPROXY" = "1" ]; then
+    print_status "SHIELD_SYNPROXY=1 → включаю SYNPROXY-слой"
+    # enable применяет слой + verify mss/wscale + проверка untracked (авто-откат)
+    if /usr/local/sbin/shieldnode-synproxy.sh on; then
+        # boot-persistence: грузим зафиксированный synproxy.nft при старте (без verify)
+        cat > /etc/systemd/system/shieldnode-synproxy.service <<'SPUNIT'
+[Unit]
+Description=Shieldnode SYNPROXY ruleset
+After=shieldnode-nftables.service
+Wants=shieldnode-nftables.service
+ConditionPathExists=/etc/shieldnode/synproxy.nft
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/shieldnode/synproxy.nft
+[Install]
+WantedBy=multi-user.target
+SPUNIT
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl enable shieldnode-synproxy.service >/dev/null 2>&1 || true
+        print_ok "SYNPROXY активен и переживёт ребут"
+    else
+        print_warn "SYNPROXY НЕ включён (см. вывод модуля выше) — ddos_protect работает штатно"
+    fi
+else
+    print_info "SYNPROXY выключен. Вкл по умолчанию; если отключил — восстанови: SHIELD_SYNPROXY=1 при установке, или sudo shieldnode-synproxy.sh on"
 fi
 
 # v3.1: НЕ встраиваемся в /etc/nftables.conf!
@@ -4004,6 +4142,8 @@ grep -oE '^[[:space:]]*[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]+)?' "$TMP/all.raw" | \
         o1 = $1 + 0
         o2 = $2 + 0
         o3 = $3 + 0
+        o4 = $4 + 0
+        if (o1 > 255 || o2 > 255 || o3 > 255 || o4 > 255) next   # v3.23.15 P2-1: невалидный октет (битый фид)
         if (o1 == 0)   next                                      # 0/8
         if (o1 == 10)  next                                      # RFC1918
         if (o1 == 127) next                                      # loopback
@@ -4598,6 +4738,23 @@ if [ ! -e "$WHITELIST_LOCAL" ]; then
 # Удалить: отредактировать файл (удалить строку), изменения применятся за 2 сек.
 WHITELIST_DEFAULT
     chmod 0644 "$WHITELIST_LOCAL"
+fi
+
+# v3.23.15 P2-2: anti-lockout — текущий админский IP в whitelist-local.txt.
+# Durable: whitelist-updater синхронит файл → manual_whitelist_v4 (обходит SSH ct=5
+# и все shieldnode-проверки). Защита от self-lockout при параллельных SSH/CI-CD.
+# NB: за shared CGNAT это whitelist'ит весь пул — удали строку из файла (применится
+# за ~2 сек) или через guard → Trusted IPs.
+if [ -n "${ADMIN_IP:-}" ]; then
+    case "$ADMIN_IP" in
+        *:*) : ;;  # IPv6 — manual_whitelist_v4 это ipv4; v6-whitelist отдельно (2-я волна)
+        *)
+            if validate_ipv4_or_cidr "$ADMIN_IP" 2>/dev/null && ! grep -qF "$ADMIN_IP" "$WHITELIST_LOCAL" 2>/dev/null; then
+                echo "$ADMIN_IP  # v3.23.15 anti-lockout (админ-IP при установке)" >> "$WHITELIST_LOCAL"
+                print_ok "Anti-lockout: $ADMIN_IP добавлен в whitelist-local.txt"
+            fi
+            ;;
+    esac
 fi
 
 # 2. Updater script
@@ -7047,16 +7204,6 @@ human_num() {
     printf "%'d" "${1:-0}" 2>/dev/null || echo "${1:-0}"
 }
 
-fmt_status() {
-    case "$1" in
-        active)        echo -e "${G}active${N}" ;;
-        inactive)      echo -e "${Y}inactive${N}" ;;
-        failed)        echo -e "${R}failed${N}" ;;
-        activating)    echo -e "${Y}activating${N}" ;;
-        *)             echo -e "${Y}${1:-—}${N}" ;;
-    esac
-}
-
 # v3.12.0: ASN/owner lookup для top attackers через ipinfo.io.
 # Кэш в events.db (asn_cache table), TTL 7 дней.
 # При no-internet или rate-limit возвращает "?" — guard продолжает работать.
@@ -8393,14 +8540,6 @@ fi
 
 print_header "ШАГ 12.6: CLEANUP LEGACY"
 
-# v3.23.13 LEGACY CLEANUP: subnet-aggregator block удалён.
-# Это был v3.23.3-rc — release candidate который никогда не релизился стабильно.
-# Прошло >1 года, любой узел который мог его иметь, давно обновился через v3.23.4+.
-# Если оператор всё ещё сидит на v3.23.3-rc — пусть обновится на v3.23.12 перед
-# переходом на v3.23.13.
-
-LEGACY_REMOVED=0
-
 # v3.23.13 SR-FIX-5: миграция perms 0644 → 0640 для shieldnode.conf
 # Предыдущие версии оставляли conf world-readable (TRUSTED_IPS видны любому
 # юзеру). При upgrade auto-migrate. shield_safe_source также делает это
@@ -8922,7 +9061,7 @@ NEW_IPS=$(sqlite3 "$DB" "
     SELECT DISTINCT ip FROM events
     WHERE last_seen > strftime('%s','now') - ($PROMOTE_WINDOW_HOURS * 3600)
       AND count >= $PROMOTE_THRESHOLD
-      AND type IN ('conn_flood','syn_escalate','newconn_flood')
+      AND type IN ('conn_flood','syn_escalate','udp_escalate')
     ORDER BY count DESC;
 " 2>/dev/null || true)
 
@@ -9075,7 +9214,7 @@ done
 COUNT=$(echo "$FILTER_IPS" | wc -l)
 {
     echo ""
-    echo "# Auto-promoted $(date -u +%FT%TZ) ($COUNT IPs, count>=2000/24h, conn_flood/syn_flood)"
+    echo "# Auto-promoted $(date -u +%FT%TZ) ($COUNT IPs, count>=$PROMOTE_THRESHOLD cumulative, conn_flood/syn-udp-escalate)"
     echo "$FILTER_IPS"
 } >> "$CUSTOM_LOCAL"
 
@@ -9150,7 +9289,7 @@ PROMOTE_TIMER_EOF
 systemctl daemon-reload
 systemctl enable shieldnode-auto-promote.timer >/dev/null 2>&1
 systemctl start shieldnode-auto-promote.timer >/dev/null 2>&1
-print_ok "Auto-promote enabled (каждые 6ч, count>=2000/24ч, conn_flood/syn_flood only)"
+print_ok "Auto-promote enabled (каждые 6ч, count>=800 cumulative, conn_flood/syn-udp-escalate)"
 
 # ==============================================================================
 # ШАГ 12.9: CROWDSEC SCENARIO (v3.23.3) — conn_flood публикация в community
