@@ -81,6 +81,18 @@ sudo guard sync       # синк custom.txt прямо сейчас
 
 ## Версии
 
+- **v3.23.16** — SYNPROXY (default-on, SHIELD_SYNPROXY=1):
+  - **FEAT**: SYNPROXY-модуль (`shieldnode-synproxy.sh`, таблица `inet shield_synproxy`). SYN-пакеты перехватываются до conntrack (syncookies) → защита от conntrack-exhaustion атак. Изолирован от `ddos_protect` (откат = удаление модуля, нода не ронит). Verify mss/wscale + auto-rollback при сбое. Boot-unit. Требует ядро >=5.14.
+  - **ВАЖНО**: `SHIELD_SYNPROXY=1` теперь дефолт. Opt-out: `SHIELD_SYNPROXY=0` в shieldnode.conf.
+- **v3.23.15** — SECURITY HARDENING (static audit P0-P2):
+  - **P0 FIX**: SQL-injection через journald. Aggregator gsub-очистка SRC= для ВСЕХ handlers (`[shield:ddos]`, `[UFW BLOCK]`), IPv4-валидация перед INSERT.
+  - **P0 FIX**: Bogon-фильтр threat-feeds: min prefix /16 (был /8 — мог забанить 1.0.0.0/8), CGNAT/TEST-NET/benchmark в bogon-list, `MAX_FEED_ENTRIES` cap (200k/100k/10k/50k).
+  - **P0 FIX**: auto-promote был мёртв (nft log prefix не генерился + typo в query `syn_flood`→`syn_escalate`). Исправлено.
+  - **P0 FIX**: Aggregator RAM blow-up при шторме: `MAX_UNIQUE_IPS_PER_TYPE=50000`, `MemoryMax=512M MemoryHigh=384M`.
+  - **P0**: SSH-блок выше infra-accept; IaaS убран из baseline (CDN/edge only).
+  - **P0**: Базовая IPv6-защита: new-conn DROP на VPN-портах + SSH/v6 rate-limit.
+  - **P1**: auto-promote порог 2000→800. pcap-archiver tar.zst реально работает в runtime. conntrack snapshot полный + gzip. state-file cap 30000 entries.
+  - **P2**: octet≤255 в blocklist-updater. ADMIN_IP → whitelist anti-lockout.
 - **v3.23.14** — FALSE-POSITIVE + PIPE-DEADLOCK FIX:
   - **FIX**: убраны шумные threat-фиды (blocklist.de/all, IPSum L3) — агрегаторы abuse-репортов с публичными CGNAT/PAT адресами операторов → дроп NEW-коннектов реальных юзеров. Остались Spamhaus DROP + FireHOL L1 + Feodo. `MIN_ENTRIES_THREAT` 5000→3000 под урезанный набор.
   - **FIX**: self-reexec при `curl | bash` — ~480KB скрипт не влезал в pipe-буфер (64KB), bash блокировался на ожидании apt → curl обрывался (`curl: 23`), скрипт обрезался. Теперь в pipe-режиме качается копия в /tmp и exec'ается (stdin не pipe → дедлок невозможен).
