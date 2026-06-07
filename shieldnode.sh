@@ -1,7 +1,16 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.23.18 (Commercial Edition) — SECURITY HARDENING
+#  VPN NODE DDoS PROTECTION v3.23.19 (Commercial Edition) — SECURITY HARDENING
+#
+#  v3.23.19: CRIT FIX агрегатора — shieldnode-aggregator.service под
+#    ProtectSystem=strict не объявлял /run/shieldnode как writable → lock
+#    /run/shieldnode/agg-state.lock падал "Read-only file system" → агрегатор
+#    скипал КАЖДЫЙ тик → events.db замораживалась → guard-статистика стояла,
+#    защита выглядела "не реагирующей" (а nft при этом дропал нормально).
+#    Добавлены RuntimeDirectory=shieldnode + ReadWritePaths=/run/shieldnode
+#    (как в ports-update unit). + агрегатор при невозможности открыть lock пишет
+#    CRITICAL и exit 1 (раньше молча "skip" — баг прятался незаметно).
 #
 #  v3.23.18: synproxy теперь показывает причину невключения (фикс молчаливого
 #    set -e + grep в verify_backend; явный die на nft -f при отсутствии nf_synproxy).
@@ -395,7 +404,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.23.18"
+SHIELDNODE_VERSION="3.23.19"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -6271,7 +6280,10 @@ LOG_STATE_TTL=259200       # 3 дня — старые записи cleanup
 mkdir -p /run/shieldnode 2>/dev/null
 
 # Lock на запись state — защита от race между тиками
-exec {STATE_LOCK_FD}> "$LOG_STATE_LOCK"
+if ! exec {STATE_LOCK_FD}> "$LOG_STATE_LOCK" 2>/dev/null; then
+    logger -t "$LOG_TAG" "CRITICAL: не могу открыть $LOG_STATE_LOCK (RO fs / sandbox ReadWritePaths?) — events.db НЕ обновляется"
+    exit 1
+fi
 flock -n "$STATE_LOCK_FD" || {
     logger -t "$LOG_TAG" "another aggregator run holds state lock — skip this tick"
     exit 0
@@ -6637,6 +6649,14 @@ ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=$DB_DIR
 ReadWritePaths=$LOG_DIR
+# v3.23.19 FIX: под ProtectSystem=strict вся ФС RO кроме ReadWritePaths.
+# Агрегатор пишет lock в /run/shieldnode/agg-state.lock — без этих строк путь RO,
+# lock падает, агрегатор скипает каждый тик и events.db не обновляется.
+# Зеркалит ports-update unit. Preserve=yes — /run/shieldnode делят несколько юнитов.
+RuntimeDirectory=shieldnode
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+ReadWritePaths=/run/shieldnode
 # v3.23.13 BUG-007: hard memory limit — защита от RAM blow-up при rotating-IP
 # атаках (>100k unique sources). MAX 512MB = достаточно для 50k IP × 13 типов
 # в bash hash. Если упёрлись — systemd убивает aggregator, защита nft drops
