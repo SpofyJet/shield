@@ -3,7 +3,7 @@
 # ==============================================================================
 #  VPN NODE DDoS PROTECTION v3.23.16 (Commercial Edition) — SECURITY HARDENING
 #
-#  v3.23.16: SYNPROXY (default-on, SHIELD_SYNPROXY=1 default (opt-out: SHIELD_SYNPROXY=0 в shieldnode.conf)) — conntrack-exhaustion
+#  v3.23.16: SYNPROXY (opt-in, SHIELD_SYNPROXY=0 default) — conntrack-exhaustion
 #    защита. SYN перехватывается до conntrack (syncookies). Отдельный модуль
 #    shieldnode-synproxy.sh / table inet shield_synproxy (ddos_protect не трогает).
 #    На enable: verify mss/wscale + проверка untracked с авто-откатом. Boot-unit.
@@ -385,7 +385,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.23.16"
+SHIELDNODE_VERSION="3.23.18"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -636,8 +636,8 @@ SHIELD_SSH_CT_LIMIT="${SHIELD_SSH_CT_LIMIT:-5}"
 SHIELD_SSH_NEWCONN_RATE="${SHIELD_SSH_NEWCONN_RATE:-8/minute}"
 SHIELD_SSH_NEWCONN_BURST="${SHIELD_SSH_NEWCONN_BURST:-20}"
 SHIELD_AUTOPROMOTE_THRESHOLD="${SHIELD_AUTOPROMOTE_THRESHOLD:-800}"
-# v3.23.16: SYNPROXY (conntrack-exhaustion защита). 1=вкл (дефолт), 0=выкл.
-SHIELD_SYNPROXY="${SHIELD_SYNPROXY:-1}"
+# v3.23.16: SYNPROXY (conntrack-exhaustion защита). 0=выкл (дефолт), 1=вкл.
+SHIELD_SYNPROXY="${SHIELD_SYNPROXY:-0}"
 SHIELD_AUTOPROMOTE_WINDOW_HOURS="${SHIELD_AUTOPROMOTE_WINDOW_HOURS:-24}"
 SHIELD_CUSTOM_LOCAL_TTL_DAYS="${SHIELD_CUSTOM_LOCAL_TTL_DAYS:-90}"
 SHIELD_EVENTS_DB_RETENTION_DAYS="${SHIELD_EVENTS_DB_RETENTION_DAYS:-90}"
@@ -675,7 +675,7 @@ shield_ensure_numeric SHIELD_RATE_UDP_BURST 20000
 shield_ensure_numeric SHIELD_SSH_CT_LIMIT 5
 shield_ensure_numeric SHIELD_SSH_NEWCONN_BURST 20
 shield_ensure_numeric SHIELD_AUTOPROMOTE_THRESHOLD 800
-shield_ensure_numeric SHIELD_SYNPROXY 1
+shield_ensure_numeric SHIELD_SYNPROXY 0
 shield_ensure_numeric SHIELD_AUTOPROMOTE_WINDOW_HOURS 24
 shield_ensure_numeric SHIELD_CUSTOM_LOCAL_TTL_DAYS 90
 shield_ensure_numeric SHIELD_EVENTS_DB_RETENTION_DAYS 90
@@ -1317,10 +1317,19 @@ check_disk_space() {
         # df -BM выдаёт колонку Available с суффиксом 'M'
         avail=$(df -BM "$mp" 2>/dev/null | awk 'NR==2 {gsub("M","",$4); print $4+0}')
         if [ -z "$avail" ] || [ "$avail" -lt "$need_mb" ]; then
+            # v3.23.17: частая причина переполнения /var — старый pcap-ring в /var/log/pcap
+            # (strftime-имена + -W не удалял файлы). Чистим legacy и пере-меряем.
+            if [ "$mp" = "/var" ]; then
+                find /var/log/pcap -maxdepth 1 -type f -name 'syn-*.pcap' -delete 2>/dev/null || true
+                avail=$(df -BM "$mp" 2>/dev/null | awk 'NR==2 {gsub("M","",$4); print $4+0}')
+            fi
+        fi
+        if [ -z "$avail" ] || [ "$avail" -lt "$need_mb" ]; then
             print_error "FATAL: $mp имеет ${avail:-0} MB свободно, нужно >= ${need_mb} MB"
-            print_info "Очисти: sudo journalctl --vacuum-size=100M"
+            print_info "Очисти: sudo find /var/log/pcap -name 'syn-*.pcap' -delete   # частая причина (старый pcap-ring)"
+            print_info "       sudo du -sh /var/log/pcap /var/lib/shieldnode/* 2>/dev/null | sort -h"
+            print_info "       sudo journalctl --vacuum-size=100M"
             print_info "       sudo apt-get clean && sudo apt-get autoremove -y"
-            print_info "       sudo find /var/log -type f -name '*.gz' -delete"
             return 1
         fi
     done
@@ -2452,9 +2461,9 @@ SHIELD_SSH_NEWCONN_BURST=20
 # Heavy-CGNAT нода? Подними обратно (conn_flood ложно срабатывает на CGNAT-пиках).
 SHIELD_AUTOPROMOTE_THRESHOLD=800
 SHIELD_AUTOPROMOTE_WINDOW_HOURS=24
-# v3.23.16: SYNPROXY (conntrack-exhaustion). 1=вкл (дефолт), 0=выкл.
+# v3.23.16: SYNPROXY (conntrack-exhaustion). 0=выкл (дефолт), 1=вкл.
 # Включать на ноду ТОЛЬКО после своей канарейка-проверки. Применяется на установке.
-SHIELD_SYNPROXY=1
+SHIELD_SYNPROXY=0
 SHIELD_CUSTOM_LOCAL_TTL_DAYS=90
 
 # ─── Retention ───
@@ -3182,15 +3191,15 @@ else
 fi
 
 # ============================================================================
-# v3.23.16: SYNPROXY модуль (default-on, conntrack-exhaustion защита)
+# v3.23.16: SYNPROXY модуль (opt-in, conntrack-exhaustion защита)
 # ============================================================================
 # Изолированный модуль (отдельная nft table inet shield_synproxy, отдельный
-# процесс). Управляется флагом SHIELD_SYNPROXY (default 1). ddos_protect не
+# процесс). Управляется флагом SHIELD_SYNPROXY (default 0). ddos_protect не
 # трогается. Запускаем ПОСЛЕ загрузки основной таблицы — модуль детектит
 # protected_ports_tcp из живого ruleset'а.
 cat > /usr/local/sbin/shieldnode-synproxy.sh <<'SYNPROXY_MODULE_EOF'
 #!/bin/bash
-# shieldnode-synproxy v0.2 — SYNPROXY default-on (защита от conntrack-exhaustion).
+# shieldnode-synproxy v0.2 — opt-in SYNPROXY (защита от conntrack-exhaustion).
 # SYN перехватывается ДО conntrack (syncookies); запись в conntrack только после
 # завершённого 3-way → SYN-флуд не течёт таблицу. Изолированная table
 # inet shield_synproxy (ddos_protect не трогает, откат = удаление). SSH не трогает.
@@ -3269,8 +3278,8 @@ verify_backend_mss_wscale(){
     log "Проверяю нативный SYN-ACK бэкенда на :$FIRST_PORT (${VERIFY_SECS}s, нужен живой трафик)…"
     cap=$(timeout "$VERIFY_SECS" tcpdump -ni "$dev" -c1 -v \
           "tcp src port $FIRST_PORT and tcp[tcpflags]=(tcp-syn|tcp-ack)" 2>/dev/null || true)
-    mss_seen=$(echo "$cap"    | grep -oE 'mss [0-9]+'    | head -1 | awk '{print $2}')
-    wscale_seen=$(echo "$cap" | grep -oE 'wscale [0-9]+' | head -1 | awk '{print $2}')
+    mss_seen=$(echo "$cap"    | grep -oE 'mss [0-9]+'    | head -1 | awk '{print $2}' || true)
+    wscale_seen=$(echo "$cap" | grep -oE 'wscale [0-9]+' | head -1 | awk '{print $2}' || true)
     if [ -z "${mss_seen:-}" ]; then
         log "  (живого SYN-ACK за окно нет — оставляю авто-детект mss=$MSS wscale=$WSCALE)"
         return 0
@@ -3350,7 +3359,7 @@ net.ipv4.tcp_syncookies=1
 SCTL
     write_conf
     nft -c -f "$NFT_FILE" || die "сгенерированный ruleset не парсится"
-    nft -f "$NFT_FILE"
+    nft -f "$NFT_FILE" || die "применение ruleset не удалось (nft -f) — нет модуля ядра nf_synproxy? см. dmesg"
     log "✔ SYNPROXY включён: порты={${PORTS}} mss=${MSS} wscale=${WSCALE}"
     verify_untracked_reaches
     log "  conntrack_tcp_loose=0, syncookies=1 (persisted ${SYSCTL_FILE})"
@@ -3419,7 +3428,7 @@ SPUNIT
         print_warn "SYNPROXY НЕ включён (см. вывод модуля выше) — ddos_protect работает штатно"
     fi
 else
-    print_info "SYNPROXY выключен. Вкл по умолчанию; если отключил — восстанови: SHIELD_SYNPROXY=1 при установке, или sudo shieldnode-synproxy.sh on"
+    print_info "SYNPROXY выключен (дефолт). Вкл: SHIELD_SYNPROXY=1 при установке, или sudo shieldnode-synproxy.sh on"
 fi
 
 # v3.1: НЕ встраиваемся в /etc/nftables.conf!
@@ -6697,11 +6706,10 @@ Usage:
   sudo guard self-test  health check (v3.23.5+): conntrack, disk, MY_IP, services
 
 Interactive menu:
-  [1] active attacks            [4] scanner blocklist samples
-  [2] crowdsec banned IPs       [6] recent history
-  [3] whitelist IPs             [7] top attackers (all-time)
-  [s] settings                  [9] view full /var/log/shieldnode/events.log
-  [r] refresh                   [0] exit
+  [2] crowdsec banned IPs       [3] whitelist IPs
+  [6] recent history            [7] top attackers (all-time)
+  [s] settings                  [r] refresh
+  [0] exit
 
 HELP
         exit 0
@@ -7087,7 +7095,7 @@ collect_stats() {
 
     LAST_UPDATE=$(systemctl show shieldnode-update@scanner.service \
         --property=ExecMainExitTimestamp --value 2>/dev/null | \
-        xargs -I{} date -d {} '+%Y-%m-%d %H:%M' 2>/dev/null)
+        xargs -I{} env LC_ALL=C date -d {} '+%Y-%m-%d %H:%M' 2>/dev/null)
     LAST_UPDATE="${LAST_UPDATE:-—}"
 
     # v2.7: nftables counters — статистика "всего заблокировано"
@@ -7150,7 +7158,7 @@ collect_stats() {
     # Последний masked в установщике (стр 1000) → ActiveEnterTimestamp пуст →
     # NFT_SINCE всегда был "—" после первого ребута.
     NFT_SINCE=$(systemctl show shieldnode-nftables.service --property=ActiveEnterTimestamp --value 2>/dev/null | \
-        xargs -I{} date -d {} '+%Y-%m-%d %H:%M' 2>/dev/null)
+        xargs -I{} env LC_ALL=C date -d {} '+%Y-%m-%d %H:%M' 2>/dev/null)
     NFT_SINCE="${NFT_SINCE:-—}"
 
     # v2.9: All-time stats из /var/lib/shieldnode/events.db
@@ -7174,7 +7182,7 @@ collect_stats() {
         # Самое раннее событие — "since"
         FIRST_TS=$(sqlite3 "$SHIELD_DB" "SELECT MIN(first_seen) FROM events" 2>/dev/null)
         if [ -n "$FIRST_TS" ] && [ "$FIRST_TS" != "" ]; then
-            DB_SINCE=$(date -d "@$FIRST_TS" '+%Y-%m-%d %H:%M' 2>/dev/null)
+            DB_SINCE=$(LC_ALL=C date -d "@$FIRST_TS" '+%Y-%m-%d %H:%M' 2>/dev/null || LC_ALL=C date -r "$FIRST_TS" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "—")
         fi
     fi
 
@@ -7341,7 +7349,7 @@ draw_snapshot() {
     local bl_summary="scanner=$(human_num "$BL_V4")"
     [ "$THREAT_SET_SIZE" -gt 0 ] && bl_summary+=", threat=$(human_num "$THREAT_SET_SIZE")"
     [ "$TOR_SET_SIZE"    -gt 0 ] && bl_summary+=", tor=$(human_num "$TOR_SET_SIZE")"
-    [ "$CUSTOM_SET_SIZE" -gt 0 ] && bl_summary+=", custom=$(human_num "$CUSTOM_SET_SIZE")"
+    bl_summary+=", custom=$(human_num "$CUSTOM_SET_SIZE")"   # v3.23.18: всегда видно (даже 0)
     printf  "  └─ ${DIM}blocklists${N}          %s\n" "$bl_summary"
     # v3.20.0+: mobile-RU и broadband-RU whitelist строки УБРАНЫ (whitelist'ы удалены)
     echo ""
@@ -7435,48 +7443,6 @@ svc_dot() {
 }
 
 # === Просмотр списков ===
-show_syn_flood_ips() {
-    echo ""
-    echo -e "${R}${B}Confirmed attack IPs${N} ${DIM}(banned, 1h)${N}"
-    echo -e "${DIM}─────────────────────────────────${N}"
-
-    local json_conf
-    json_conf=$(nft -j list set inet ddos_protect confirmed_attack_v4 2>/dev/null)
-    if command -v jq >/dev/null 2>&1 && [ -n "$json_conf" ]; then
-        echo "$json_conf" | jq -r '
-            .nftables[]?.set?.elem[]? |
-            (.elem.val // .val) as $ip |
-            (.elem.expires // .expires // 0) as $exp |
-            "  \($ip)  expires in \($exp)s"
-        ' 2>/dev/null | head -50
-    fi
-    [ -z "$json_conf" ] || [ "$(echo "$json_conf" | jq -r '.nftables[]?.set?.elem? | length // 0' 2>/dev/null)" = "0" ] && \
-        echo -e "  ${DIM}(empty — no confirmed attacks now)${N}"
-
-    echo ""
-    echo -e "${Y}${B}Suspect IPs${N} ${DIM}(under watch, 30min — first offence)${N}"
-    echo -e "${DIM}─────────────────────────────────${N}"
-
-    local json_susp
-    json_susp=$(nft -j list set inet ddos_protect suspect_v4 2>/dev/null)
-    if command -v jq >/dev/null 2>&1 && [ -n "$json_susp" ]; then
-        echo "$json_susp" | jq -r '
-            .nftables[]?.set?.elem[]? |
-            (.elem.val // .val) as $ip |
-            (.elem.expires // .expires // 0) as $exp |
-            "  \($ip)  expires in \($exp)s"
-        ' 2>/dev/null | head -50
-    fi
-    [ -z "$json_susp" ] || [ "$(echo "$json_susp" | jq -r '.nftables[]?.set?.elem? | length // 0' 2>/dev/null)" = "0" ] && \
-        echo -e "  ${DIM}(empty — all clean)${N}"
-
-    echo ""
-    echo -e "${DIM}Logic:${N}"
-    echo -e "  ${DIM}1st limit hit → suspect (30min watch, no drop)${N}"
-    echo -e "  ${DIM}2nd hit while suspect → confirmed_attack (1h drop)${N}"
-    echo ""
-}
-
 show_crowdsec_bans() {
     echo ""
     echo -e "${B}CrowdSec banned IPs${N}"
@@ -7641,19 +7607,6 @@ show_whitelist_ips() {
     done
 }
 
-show_scanner_samples() {
-    echo ""
-    echo -e "${B}Scanner blocklist (first 30 entries)${N}"
-    echo -e "${DIM}─────────────────────────────────${N}"
-    nft list set inet ddos_protect scanner_blocklist_v4 2>/dev/null | \
-        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(-[0-9.]+)?(/[0-9]+)?' | \
-        head -30 | sed 's/^/  /'
-    echo ""
-    printf "  Total: ${B}%d${N} IPv4 subnets\n" "$BL_V4"
-    echo ""
-}
-
-# v2.9: история блокировок из sqlite
 show_history() {
     echo ""
     local db="/var/lib/shieldnode/events.db"
@@ -7779,42 +7732,6 @@ unban_all() {
 
 
 # v3.5: показать /var/log/shieldnode/events.log через less
-show_full_log() {
-    echo ""
-    local log="/var/log/shieldnode/events.log"
-    if [ ! -r "$log" ]; then
-        echo -e "${Y}events.log not available${N} ${DIM}($log)${N}"
-        echo -e "${DIM}Aggregator пишет туда раз в минуту. Запусти вручную:${N}"
-        echo -e "${DIM}  sudo systemctl start shieldnode-aggregator.service${N}"
-        echo ""
-        return
-    fi
-    local lines
-    lines=$(wc -l < "$log" 2>/dev/null)
-    lines="${lines:-0}"
-    echo -e "${B}Full events log${N} ${DIM}($log, $lines lines)${N}"
-    echo -e "${DIM}─────────────────────────────────${N}"
-    if command -v less >/dev/null 2>&1; then
-        # v3.8.1: подсказка + надёжные флаги less.
-        # -F = exit если влезает на экран
-        # -X = не очищать экран при выходе (чтобы юзер видел что вернулся в guard)
-        # -R = raw control chars (для ANSI-цветов в логе)
-        # -K = exit по Ctrl-C
-        # -E = quit при достижении конца файла
-        echo -e "${DIM}Навигация: ↑↓ стрелки, PgUp/PgDn, ${B}q${N}${DIM} — выход${N}"
-        echo -e "${DIM}Если застрял в команде less (видишь \":\") — нажми ${B}ESC${N}${DIM} затем ${B}q${N}"
-        sleep 1
-        LESS="" less -FRXKE "$log"
-    else
-        echo -e "${DIM}less не установлен, показываю последние 200 строк${N}"
-        echo ""
-        tail -200 "$log"
-    fi
-    echo ""
-}
-
-# v3.23.1: helper для регенерации postoverflow whitelist для TRUSTED_IPS
-# из guard UI (add/delete/re-apply). Симметрично с installer'ом ШАГ 12.5.
 _trusted_regen_postoverflow() {
     local csv="$1"
     local PO_DIR=/etc/crowdsec/postoverflows/s01-whitelist
@@ -7939,8 +7856,6 @@ show_settings_menu() {
         echo -e "  ${DIM}v3.20.0: пункты [3] Mobile-RU и [5] Broadband-RU убраны.${N}"
         echo -e "  ${DIM}Защита упрощена — единый лимит ct=15000 для всех IP.${N}"
         echo ""
-        echo -e "  [${B}f${N}] Force github sync now"
-        echo -e "  [${B}v${N}] Force version check now"
         echo ""
         # v3.18.8: Trusted IPs counter
         local trusted_count=0
@@ -7996,25 +7911,6 @@ show_settings_menu() {
                     systemctl enable --now shieldnode-update@tor.timer >/dev/null 2>&1
                     systemctl start shieldnode-update@tor.service >/dev/null 2>&1 &
                     echo -e "  ${G}✓${N} Tor blocklist ${G}enabled${N} (загрузка запущена)"
-                fi
-                sleep 1
-                ;;
-            f|F)
-                echo ""
-                echo -e "  ${DIM}Запускаю github sync...${N}"
-                systemctl start shieldnode-github-sync.service
-                sleep 2
-                journalctl -t shieldnode-github-sync -n 3 --no-pager 2>/dev/null | sed 's/^/  /'
-                sleep 1
-                ;;
-            v|V)
-                echo ""
-                echo -e "  ${DIM}Запускаю version check...${N}"
-                systemctl start shieldnode-version-check.service
-                sleep 2
-                if [ -r /var/lib/shieldnode/.upstream_version ]; then
-                    echo ""
-                    sed 's/^/  /' /var/lib/shieldnode/.upstream_version
                 fi
                 sleep 1
                 ;;
@@ -8314,10 +8210,9 @@ while true; do
     echo -e "${C}┌─────────────────────────────────────────────────────────────────┐${N}"
     echo -e "${C}│${N}  ${B}Actions${N}                                                        ${C}│${N}"
     echo -e "${C}├─────────────────────────────────────────────────────────────────┤${N}"
-    echo -e "${C}│${N}  [${B}1${N}] Active attacks         [${B}2${N}] CrowdSec bans                   ${C}│${N}"
-    echo -e "${C}│${N}  [${B}3${N}] Whitelist manage       [${B}4${N}] Scanner blocklist               ${C}│${N}"
+    echo -e "${C}│${N}  [${B}2${N}] CrowdSec bans          [${B}3${N}] Whitelist manage                ${C}│${N}"
     echo -e "${C}│${N}  [${B}6${N}] Recent history         [${B}7${N}] Top attackers                   ${C}│${N}"
-    echo -e "${C}│${N}  [${B}8${N}] Unban all              [${B}9${N}] View full events.log            ${C}│${N}"
+    echo -e "${C}│${N}  [${B}8${N}] Unban all                                                  ${C}│${N}"
     echo -e "${C}│${N}  [${B}s${N}] Settings                                                   ${C}│${N}"
     echo -e "${C}├─────────────────────────────────────────────────────────────────┤${N}"
     echo -e "${C}│${N}  [${B}r${N}] Refresh                [${B}0${N}] Exit                            ${C}│${N}"
@@ -8326,14 +8221,11 @@ while true; do
 
     read -r CHOICE
     case "$CHOICE" in
-        1) show_syn_flood_ips    ;;
         2) show_crowdsec_bans    ;;
         3) show_whitelist_ips    ;;
-        4) show_scanner_samples  ;;
         6) show_history          ;;
         7) show_top_attackers    ;;
         8) unban_all             ;;
-        9) show_full_log         ;;
         s|S) show_settings_menu  ;;
         r|R|"") continue ;;
         0|q|quit|exit) clear 2>/dev/null; exit 0 ;;
@@ -8779,7 +8671,9 @@ print_header "ШАГ 12.7: PCAP-CAPTURE (rolling SYN dump)"
 
 # Хостер при DDoS требует pcap для блокировки upstream / abuse-report.
 # tcpdump на SYN-пакеты без ACK (начало TCP-соединения), 128 байт payload.
-# Ring buffer: 20 файлов × 50MB = max 1GB, ротация по часу.
+# Ring buffer: 20 нумерованных файлов × 50MB = max 1GB (-W 20 -C 50).
+# v3.23.17 FIX: убраны strftime-имя и -G — с ними -W НЕ удалял старые файлы,
+# каждый rotate создавал уникальное имя → /var/log/pcap рос до десятков GB.
 # На нормальной нагрузке: ~100-200MB/сутки.
 
 # v3.23.9: tcpdump install с retry + проверка что binary реально доступен
@@ -8807,6 +8701,8 @@ fi
 
 mkdir -p /var/log/pcap
 chmod 755 /var/log/pcap
+# v3.23.17: удаляем legacy strftime-pcap от старого сломанного ring (могло быть десятки GB)
+find /var/log/pcap -maxdepth 1 -type f -name 'syn-*.pcap' -delete 2>/dev/null || true
 
 if [ "$TCPDUMP_AVAILABLE" = "1" ]; then
 # Используем single-quote heredoc (literal) чтобы $VAR и % не expand'ились,
@@ -8820,8 +8716,8 @@ Wants=network.target
 [Service]
 Type=simple
 ExecStart=__TCPDUMP_BIN__ -i any -nn -s 128 \
-    -w /var/log/pcap/syn-%%Y%%m%%d-%%H%%M%%S.pcap \
-    -W 20 -C 50 -G 3600 -Z root \
+    -w /var/log/pcap/syn.pcap \
+    -W 20 -C 50 -Z root \
     '(tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack == 0)'
 Restart=always
 RestartSec=10
@@ -8856,7 +8752,7 @@ fi
 sleep 2
 
 if systemctl is-active --quiet shieldnode-pcap.service; then
-    print_ok "PCAP capture запущен (ring 1GB, /var/log/pcap/syn-*.pcap)"
+    print_ok "PCAP capture запущен (ring 1GB, /var/log/pcap/syn.pcap*)"
 else
     print_warn "PCAP capture не стартовал — проверь: systemctl status shieldnode-pcap"
 fi
@@ -8931,8 +8827,8 @@ if [ "$DELTA" -ge "$TRIGGER_THRESHOLD" ]; then
     mkdir -p "$ARCH_SUBDIR"
 
     # Копируем все pcap-файлы (cp -p сохранит mtime)
-    if compgen -G "$PCAP_DIR/*.pcap" > /dev/null; then
-        cp -p "$PCAP_DIR"/*.pcap "$ARCH_SUBDIR/" 2>/dev/null || true
+    if compgen -G "$PCAP_DIR/syn.pcap*" > /dev/null; then
+        cp -p "$PCAP_DIR"/syn.pcap* "$ARCH_SUBDIR/" 2>/dev/null || true
         # Метаданные: drop-counters, conntrack snapshot, suspect_v4
         nft list table inet ddos_protect > "$ARCH_SUBDIR/nft-state.txt" 2>/dev/null || true
         # v3.23.13 BUG-012 FIX: conntrack snapshot полный + gzip (раньше head -10000
@@ -8975,6 +8871,13 @@ if command -v zstd >/dev/null 2>&1; then
 fi
 # Удаляем всё (uncompressed dirs + tar.zst) старше retention
 find "$ARCHIVE_DIR" -mindepth 1 -maxdepth 1 -mtime +"$PCAP_RETENTION_DAYS" \( -type d -o -name '*.tar.zst' \) -exec rm -rf {} \; 2>/dev/null || true
+# v3.23.17: чистим legacy strftime-pcap (старый сломанный ring) + жёсткий size-cap на ring-каталог.
+find /var/log/pcap -maxdepth 1 -type f -name 'syn-*.pcap' -delete 2>/dev/null || true
+RING_MB=$(du -sm /var/log/pcap 2>/dev/null | awk '{print $1+0}')
+if [ "${RING_MB:-0}" -gt 1536 ]; then
+    ls -1t /var/log/pcap/syn.pcap* 2>/dev/null | tail -n +21 | while read -r f; do rm -f "$f" 2>/dev/null || true; done
+    logger -t "$LOG_TAG" "WARN: /var/log/pcap=${RING_MB}MB > 1536MB cap — trimmed stale files"
+fi
 
 exit 0
 PCAP_ARCH_EOF
