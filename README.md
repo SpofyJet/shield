@@ -39,7 +39,7 @@ Kernel-tuning (BBR, qdisc, сетевые буферы, sizing conntrack) — **
 Когда флуд незавершённых SYN забивает conntrack-таблицу — нода превращается в чёрную дыру (`nf_conntrack: table full`). SYNPROXY это закрывает.
 
 - Модуль `shieldnode-synproxy.sh`, таблица `inet shield_synproxy` — **не трогает** `ddos_protect`. Откат = удаление таблицы, нода не падает.
-- Дефолт **включён** (`SHIELD_SYNPROXY=1`). Opt-out: `SHIELD_SYNPROXY=0` в `shieldnode.conf`.
+- По умолчанию **выключен** (`SHIELD_SYNPROXY=0`, opt-in): synproxy меняет TCP data-path, на нодах с нестандартным MTU/фаерволом включать после своей проверки. Включить: `SHIELD_SYNPROXY=1` в `shieldnode.conf` или `sudo shieldnode-synproxy.sh on`.
 - Авто-детект портов / mss / wscale, verify по живому SYN-ACK, авто-откат при конфликте слоёв.
 - Требует ядро **≥5.14** + модуль `nf_synproxy`. Если их нет — выводит чёткую причину, `ddos_protect` продолжает работать штатно.
 - Переживает ребут (`shieldnode-synproxy.service`).
@@ -112,7 +112,7 @@ curl -fL https://raw.githubusercontent.com/SpofyJet/shield/main/shieldnode.sh | 
 
 - **v3.23.18** — synproxy: теперь показывает причину невключения (фикс молчаливого `set -e` + grep, явный `die` на `nft -f` при отсутствии `nf_synproxy`); custom-счётчик виден в панели всегда; чистка меню (убраны active-attacks / scanner-samples / full-log + settings force-sync/version-check).
 - **v3.23.17** — FIX переполнения диска: rolling pcap рос до десятков GB (strftime-имя ломало `-W` ring). Нумерованный ring 1GB + size-cap + авто-очистка legacy. Portable-даты в guard (`LC_ALL=C`).
-- **v3.23.16** — SYNPROXY (default-on): изолированный модуль, защита от conntrack-exhaustion.
+- **v3.23.16** — SYNPROXY (opt-in, `SHIELD_SYNPROXY=0` по умолчанию): изолированный модуль, защита от conntrack-exhaustion.
 - **v3.23.15** — security hardening: SQL-inj через journald, bogon-фильтр фидов, оживление auto-promote, RAM-cap агрегатора, SSH/IPv6.
 - **v3.23.14** — убраны шумные threat-фиды (ложные баны CGNAT); фикс pipe-deadlock при `curl | bash`.
 - **v3.23.3** — post-incident (2026-05-24): conn-flood 50k→15k, pcap-capture, auto-promote, CrowdSec scenario.
