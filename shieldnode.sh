@@ -1,7 +1,17 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.23.16 (Commercial Edition) — SECURITY HARDENING
+#  VPN NODE DDoS PROTECTION v3.23.18 (Commercial Edition) — SECURITY HARDENING
+#
+#  v3.23.18: synproxy теперь показывает причину невключения (фикс молчаливого
+#    set -e + grep в verify_backend; явный die на nft -f при отсутствии nf_synproxy).
+#    custom-счётчик виден в guard всегда. Чистка меню: [1] active-attacks,
+#    [4] scanner-samples, [9] full-log и settings [f]/[v] удалены из кода + функции.
+#
+#  v3.23.17: FIX переполнения диска — rolling pcap (/var/log/pcap) рос до десятков
+#    GB: strftime-имя ломало -W ring (ring удаляет только нумерованные файлы).
+#    Теперь нумерованный ring 1GB (без -G/strftime) + size-cap + авто-очистка
+#    legacy в archiver/install/FATAL. all-time history даты: LC_ALL=C + fallback.
 #
 #  v3.23.16: SYNPROXY (opt-in, SHIELD_SYNPROXY=0 default) — conntrack-exhaustion
 #    защита. SYN перехватывается до conntrack (syncookies). Отдельный модуль
