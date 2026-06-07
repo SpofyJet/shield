@@ -110,6 +110,7 @@ curl -fL https://raw.githubusercontent.com/SpofyJet/shield/main/shieldnode.sh | 
 
 ## Изменения (последние)
 
+- **v3.23.19** — CRIT FIX агрегатора: под `ProtectSystem=strict` юнит не объявлял `/run/shieldnode` writable → lock падал (RO fs) → агрегатор скипал каждый тик → events.db/статистика замораживались (защита выглядела «не реагирующей», хотя nft дропал). + агрегатор теперь пишет CRITICAL вместо молчаливого skip.
 - **v3.23.18** — synproxy: теперь показывает причину невключения (фикс молчаливого `set -e` + grep, явный `die` на `nft -f` при отсутствии `nf_synproxy`); custom-счётчик виден в панели всегда; чистка меню (убраны active-attacks / scanner-samples / full-log + settings force-sync/version-check).
 - **v3.23.17** — FIX переполнения диска: rolling pcap рос до десятков GB (strftime-имя ломало `-W` ring). Нумерованный ring 1GB + size-cap + авто-очистка legacy. Portable-даты в guard (`LC_ALL=C`).
 - **v3.23.16** — SYNPROXY (opt-in, `SHIELD_SYNPROXY=0` по умолчанию): изолированный модуль, защита от conntrack-exhaustion.
