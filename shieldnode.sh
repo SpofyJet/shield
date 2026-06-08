@@ -1,7 +1,16 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.23.19 (Commercial Edition) — SECURITY HARDENING
+#  VPN NODE DDoS PROTECTION v3.24.0 (Commercial Edition) — SECURITY HARDENING
+#
+#  v3.24.0: SYNPROXY включён по умолчанию (SHIELD_SYNPROXY=1) — безопасно (авто-
+#    fallback на ddos_protect если ядро не тянет; verify mss/wscale + авто-откат;
+#    авто-доустановка linux-modules-extra на стоковых ядрах). + НОВЫЙ модуль
+#    anti-conntrack-exhaustion (shieldnode-ctguard): изолированная таблица
+#    inet shield_ctguard (priority -160), мониторит nf_conntrack_count и при
+#    >=90% заполнения эвиктит ТОЛЬКО IP с аномальной долей соединений
+#    (>=SHIELD_CT_EVICT_MIN, дефолт 10000 — много выше легита), nft-блок + conntrack -D,
+#    авто-recovery при <=70%. conntrack% выведен в дашборд guard. Renumber меню 1..5.
 #
 #  v3.23.19: CRIT FIX агрегатора — shieldnode-aggregator.service под
 #    ProtectSystem=strict не объявлял /run/shieldnode как writable → lock
@@ -22,7 +31,7 @@
 #    Теперь нумерованный ring 1GB (без -G/strftime) + size-cap + авто-очистка
 #    legacy в archiver/install/FATAL. all-time history даты: LC_ALL=C + fallback.
 #
-#  v3.23.16: SYNPROXY (opt-in, SHIELD_SYNPROXY=0 default) — conntrack-exhaustion
+#  v3.23.16: SYNPROXY (default-on с v3.24.0, SHIELD_SYNPROXY=1) — conntrack-exhaustion
 #    защита. SYN перехватывается до conntrack (syncookies). Отдельный модуль
 #    shieldnode-synproxy.sh / table inet shield_synproxy (ddos_protect не трогает).
 #    На enable: verify mss/wscale + проверка untracked с авто-откатом. Boot-unit.
@@ -404,7 +413,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.23.19"
+SHIELDNODE_VERSION="3.24.0"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -655,8 +664,14 @@ SHIELD_SSH_CT_LIMIT="${SHIELD_SSH_CT_LIMIT:-5}"
 SHIELD_SSH_NEWCONN_RATE="${SHIELD_SSH_NEWCONN_RATE:-8/minute}"
 SHIELD_SSH_NEWCONN_BURST="${SHIELD_SSH_NEWCONN_BURST:-20}"
 SHIELD_AUTOPROMOTE_THRESHOLD="${SHIELD_AUTOPROMOTE_THRESHOLD:-800}"
-# v3.23.16: SYNPROXY (conntrack-exhaustion защита). 0=выкл (дефолт), 1=вкл.
-SHIELD_SYNPROXY="${SHIELD_SYNPROXY:-0}"
+# v3.24.0: SYNPROXY (conntrack-exhaustion защита). 1=вкл (дефолт), 0=выкл.
+SHIELD_SYNPROXY="${SHIELD_SYNPROXY:-1}"
+# v3.24.0: conntrack-pressure guard (anti-exhaustion backstop)
+SHIELD_CTGUARD="${SHIELD_CTGUARD:-1}"
+SHIELD_CT_WARN_PCT="${SHIELD_CT_WARN_PCT:-80}"
+SHIELD_CT_HIGH_PCT="${SHIELD_CT_HIGH_PCT:-90}"
+SHIELD_CT_RECOVER_PCT="${SHIELD_CT_RECOVER_PCT:-70}"
+SHIELD_CT_EVICT_MIN="${SHIELD_CT_EVICT_MIN:-10000}"
 SHIELD_AUTOPROMOTE_WINDOW_HOURS="${SHIELD_AUTOPROMOTE_WINDOW_HOURS:-24}"
 SHIELD_CUSTOM_LOCAL_TTL_DAYS="${SHIELD_CUSTOM_LOCAL_TTL_DAYS:-90}"
 SHIELD_EVENTS_DB_RETENTION_DAYS="${SHIELD_EVENTS_DB_RETENTION_DAYS:-90}"
@@ -763,6 +778,7 @@ if [ "${1:-}" = "--uninstall" ]; then
                 protected-ports-update.timer protected-ports-update.service \
                 protected-ports-update.path \
                 shieldnode-aggregator.timer shieldnode-aggregator.service \
+                shieldnode-ctguard.timer shieldnode-ctguard.service \
                 shieldnode-nftables.service \
                 shieldnode-update@scanner.timer shieldnode-update@scanner.service \
                 shieldnode-update@threat.timer  shieldnode-update@threat.service \
@@ -801,6 +817,9 @@ if [ "${1:-}" = "--uninstall" ]; then
     rm -f /usr/local/sbin/shieldnode-version-check.sh
     rm -f /usr/local/sbin/shieldnode-whitelist-updater.sh
     rm -f /usr/local/sbin/shieldnode-synproxy.sh /etc/shieldnode/synproxy.nft /etc/sysctl.d/99-shieldnode-synproxy.conf  # v3.23.16
+    rm -f /usr/local/sbin/shieldnode-ctguard.sh  # v3.24.0
+    rm -f /etc/systemd/system/shieldnode-ctguard.service /etc/systemd/system/shieldnode-ctguard.timer  # v3.24.0
+    nft delete table inet shield_ctguard 2>/dev/null || true  # v3.24.0
     rm -f /usr/local/sbin/shieldnode-defaults.sh
     rm -f /usr/local/sbin/shieldnode-cleanup.sh  # v3.20.3
     rm -f /usr/local/bin/guard
@@ -2480,9 +2499,18 @@ SHIELD_SSH_NEWCONN_BURST=20
 # Heavy-CGNAT нода? Подними обратно (conn_flood ложно срабатывает на CGNAT-пиках).
 SHIELD_AUTOPROMOTE_THRESHOLD=800
 SHIELD_AUTOPROMOTE_WINDOW_HOURS=24
-# v3.23.16: SYNPROXY (conntrack-exhaustion). 0=выкл (дефолт), 1=вкл.
-# Включать на ноду ТОЛЬКО после своей канарейка-проверки. Применяется на установке.
-SHIELD_SYNPROXY=0
+# v3.24.0: SYNPROXY (conntrack-exhaustion). 1=вкл (дефолт), 0=выкл.
+# Безопасно: ядро не тянет → авто-fallback на ddos_protect; verify mss/wscale + авто-откат.
+SHIELD_SYNPROXY=1
+
+# v3.24.0: conntrack-guard — backstop против conntrack-exhaustion (изолированная таблица
+# shield_ctguard). Эвиктит ТОЛЬКО IP с аномальной долей conntrack (>= EVICT_MIN соединений,
+# много выше легитимного максимума) и ТОЛЬКО при высоком заполнении таблицы. 1=вкл, 0=выкл.
+SHIELD_CTGUARD=1
+SHIELD_CT_WARN_PCT=80       # %% заполнения conntrack → WARN-алерт
+SHIELD_CT_HIGH_PCT=90       # %% → начинаем эвиктить тяжёлые источники
+SHIELD_CT_RECOVER_PCT=70    # %% → снимаем блокировки (auto-recovery)
+SHIELD_CT_EVICT_MIN=10000   # сколько conns с ОДНОГО IP = повод эвикта (легит-максимум ~2000)
 SHIELD_CUSTOM_LOCAL_TTL_DAYS=90
 
 # ─── Retention ───
@@ -3279,6 +3307,12 @@ synproxy_syn_total(){
 cap_check(){
     modprobe nf_synproxy 2>/dev/null || true
     modprobe nf_conntrack 2>/dev/null || true
+    # v3.24.0: на стоковых ядрах nf_synproxy может быть в linux-modules-extra — доустановим
+    if ! lsmod 2>/dev/null | grep -qw nf_synproxy && command -v apt-get >/dev/null 2>&1; then
+        log "nf_synproxy не загружен — пробую linux-modules-extra-$(uname -r) (на XanMod встроен, пропустится)…"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "linux-modules-extra-$(uname -r)" >/dev/null 2>&1 || true
+        modprobe nf_synproxy 2>/dev/null || true
+    fi
     nft -c -f - >/dev/null 2>&1 <<'PROBE' || die "ядро/nft без SYNPROXY (нужен CONFIG_NFT_SYNPROXY / kernel >=5.14). Обнови ядро или используй обычную SYN-rate защиту."
 table inet __sp_probe {
     chain c {
@@ -3447,7 +3481,160 @@ SPUNIT
         print_warn "SYNPROXY НЕ включён (см. вывод модуля выше) — ddos_protect работает штатно"
     fi
 else
-    print_info "SYNPROXY выключен (дефолт). Вкл: SHIELD_SYNPROXY=1 при установке, или sudo shieldnode-synproxy.sh on"
+    print_info "SYNPROXY выключен (SHIELD_SYNPROXY=0). Дефолт — вкл. Включить: sudo shieldnode-synproxy.sh on"
+fi
+
+# ════════════════════════════════════════════════════════════════════
+# v3.24.0: anti-conntrack-exhaustion guard (shieldnode-ctguard)
+# Изолированная таблица inet shield_ctguard (priority -160 → раньше ddos_protect).
+# ddos_protect НЕ трогает; откат = удаление таблицы. Эвиктит только аномальные источники.
+# ════════════════════════════════════════════════════════════════════
+cat > /usr/local/sbin/shieldnode-ctguard.sh <<'CTGUARD_EOF'
+#!/bin/bash
+# shieldnode conntrack-pressure guard. Запускается таймером раз в ~15с.
+# При нормальной нагрузке только читает /proc (дёшево) и выходит. Тяжёлый
+# conntrack -L делается ТОЛЬКО при заполнении >= HIGH%.
+set -uo pipefail
+CONF=/etc/shieldnode/shieldnode.conf
+[ -r "$CONF" ] && . "$CONF" 2>/dev/null || true
+SHIELD_CTGUARD="${SHIELD_CTGUARD:-1}"
+WARN="${SHIELD_CT_WARN_PCT:-80}"; HIGH="${SHIELD_CT_HIGH_PCT:-90}"
+RECOVER="${SHIELD_CT_RECOVER_PCT:-70}"; EVICT_MIN="${SHIELD_CT_EVICT_MIN:-10000}"
+EVICT_TTL="${SHIELD_CT_EVICT_TTL:-30m}"
+TAG=shieldnode-ctguard
+RUN=/run/shieldnode; mkdir -p "$RUN" 2>/dev/null || true
+TIER_F="$RUN/ctguard.tier"; EVICT_F="$RUN/ctguard.evicted"
+
+# выключено → снести таблицу и выйти
+if [ "$SHIELD_CTGUARD" != "1" ]; then
+    nft delete table inet shield_ctguard 2>/dev/null || true
+    rm -f "$TIER_F" "$EVICT_F" 2>/dev/null || true
+    exit 0
+fi
+
+ensure_table(){
+    nft list table inet shield_ctguard >/dev/null 2>&1 && return 0
+    nft -f - 2>/dev/null <<'NFT'
+table inet shield_ctguard {
+    set evict4 { type ipv4_addr; flags timeout; }
+    set evict6 { type ipv6_addr; flags timeout; }
+    counter ctguard_drops { }
+    chain pre {
+        type filter hook prerouting priority -160; policy accept;
+        ip  saddr @evict4 counter name ctguard_drops drop
+        ip6 saddr @evict6 counter name ctguard_drops drop
+    }
+}
+NFT
+}
+
+CNT=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo 0)
+MAX=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo 0)
+[ "${MAX:-0}" -gt 0 ] 2>/dev/null || exit 0
+PCT=$(( CNT * 100 / MAX ))
+PREV=$(cat "$TIER_F" 2>/dev/null || echo 0)
+echo "$PCT" > "$RUN/ctguard.pct" 2>/dev/null || true
+
+# держим таблицу всегда (пустой evict-сет = no-op), чтобы правило было готово
+ensure_table || logger -t "$TAG" "WARN: не смог создать таблицу shield_ctguard (kernel/nft?)"
+
+is_protected(){  # $1=ip — не эвиктить whitelist/infra/loopback/private/себя
+    local ip="$1"
+    case "$ip" in
+        127.*|10.*|192.168.*|169.254.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
+        ::1|fe80:*|fc*|fd*) return 0 ;;
+    esac
+    hostname -I 2>/dev/null | tr ' ' '\n' | grep -qxF "$ip" && return 0
+    nft get element inet ddos_protect manual_whitelist_v4 "{ $ip }" >/dev/null 2>&1 && return 0
+    nft get element inet ddos_protect infrastructure_v4   "{ $ip }" >/dev/null 2>&1 && return 0
+    return 1
+}
+
+# ── RECOVERY: заполнение упало → снять все блокировки ──
+if [ "$PCT" -le "$RECOVER" ]; then
+    if [ "$PREV" != "0" ]; then
+        nft flush set inet shield_ctguard evict4 2>/dev/null || true
+        nft flush set inet shield_ctguard evict6 2>/dev/null || true
+        : > "$EVICT_F" 2>/dev/null || true
+        logger -t "$TAG" "RECOVERY: conntrack ${PCT}% (${CNT}/${MAX}) — evict-сет очищен, блокировки сняты"
+        echo 0 > "$TIER_F" 2>/dev/null || true
+    fi
+    exit 0
+fi
+
+# ── WARN: только алерт, без действий ──
+if [ "$PCT" -lt "$HIGH" ]; then
+    if [ "${PREV:-0}" -lt "$WARN" ] 2>/dev/null; then
+        logger -t "$TAG" "WARN: conntrack ${PCT}% (${CNT}/${MAX}) — приближается к лимиту, наблюдаю"
+    fi
+    echo "$PCT" > "$TIER_F" 2>/dev/null || true
+    exit 0
+fi
+
+# ── HIGH+: эвикт источников с аномальной долей conntrack ──
+logger -t "$TAG" "HIGH: conntrack ${PCT}% (${CNT}/${MAX}) — ищу источники >= ${EVICT_MIN} соединений"
+if ! command -v conntrack >/dev/null 2>&1; then
+    logger -t "$TAG" "CRITICAL: conntrack-tool не найден — не могу определить тяжёлые источники (apt install conntrack)"
+    echo "$PCT" > "$TIER_F" 2>/dev/null || true
+    exit 0
+fi
+evicted=0
+while read -r c ip; do
+    [ -n "${ip:-}" ] || continue
+    [ "$c" -ge "$EVICT_MIN" ] 2>/dev/null || continue
+    if is_protected "$ip"; then
+        logger -t "$TAG" "skip whitelisted/infra $ip (${c} conns)"
+        continue
+    fi
+    if printf '%s' "$ip" | grep -q ':'; then
+        nft add element inet shield_ctguard evict6 "{ $ip timeout $EVICT_TTL }" 2>/dev/null || true
+    else
+        nft add element inet shield_ctguard evict4 "{ $ip timeout $EVICT_TTL }" 2>/dev/null || true
+    fi
+    conntrack -D -s "$ip" >/dev/null 2>&1 || true
+    echo "$ip $c $(date '+%F %T')" >> "$EVICT_F" 2>/dev/null || true
+    logger -t "$TAG" "EVICT: $ip держал ${c} соединений — заблокирован на ${EVICT_TTL} + conntrack очищен"
+    evicted=$((evicted+1))
+done < <(conntrack -L 2>/dev/null | grep -oE 'src=[0-9a-fA-F.:]+' | cut -d= -f2 | sort | uniq -c | sort -rn | head -50)
+
+if [ "$evicted" -eq 0 ]; then
+    logger -t "$TAG" "CRITICAL: conntrack ${PCT}%, но НЕТ источника >= ${EVICT_MIN} conns — вероятно РАСПРЕДЕЛЁННАЯ атака. Подними net.netfilter.nf_conntrack_max или блокируй вручную."
+fi
+echo "$PCT" > "$TIER_F" 2>/dev/null || true
+CTGUARD_EOF
+chmod 0755 /usr/local/sbin/shieldnode-ctguard.sh
+
+cat > /etc/systemd/system/shieldnode-ctguard.service <<'SPCTU'
+[Unit]
+Description=Shieldnode conntrack-pressure guard (anti-exhaustion)
+After=shieldnode-nftables.service
+Wants=shieldnode-nftables.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/shieldnode-ctguard.sh
+Nice=-5
+SPCTU
+
+cat > /etc/systemd/system/shieldnode-ctguard.timer <<'SPCTT'
+[Unit]
+Description=Run shieldnode conntrack-guard every 15s
+Requires=shieldnode-ctguard.service
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=15s
+AccuracySec=2s
+[Install]
+WantedBy=timers.target
+SPCTT
+
+systemctl daemon-reload 2>/dev/null || true
+if [ "$SHIELD_CTGUARD" = "1" ]; then
+    systemctl enable --now shieldnode-ctguard.timer >/dev/null 2>&1 || true
+    /usr/local/sbin/shieldnode-ctguard.sh >/dev/null 2>&1 || true
+    print_ok "conntrack-guard включён (эвикт при >= ${SHIELD_CT_HIGH_PCT}% заполнения, порог ${SHIELD_CT_EVICT_MIN} conns/IP, recovery <= ${SHIELD_CT_RECOVER_PCT}%)"
+else
+    systemctl disable --now shieldnode-ctguard.timer >/dev/null 2>&1 || true
+    print_info "conntrack-guard выключен (SHIELD_CTGUARD=0)"
 fi
 
 # v3.1: НЕ встраиваемся в /etc/nftables.conf!
@@ -7392,6 +7579,22 @@ draw_snapshot() {
     echo -e "  ${B}Services${N}    $svc_line"
     echo ""
 
+    # ===== CONNTRACK PRESSURE (v3.24.0) =====
+    local ct_cnt ct_max ct_pct ct_color="${G}"
+    ct_cnt=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo 0)
+    ct_max=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo 0)
+    if [ "${ct_max:-0}" -gt 0 ] 2>/dev/null; then
+        ct_pct=$(( ct_cnt * 100 / ct_max ))
+        [ "$ct_pct" -ge 80 ] && ct_color="${Y}"
+        [ "$ct_pct" -ge 90 ] && ct_color="${R}"
+        printf "  ${B}Conntrack${N}   ${ct_color}%s%%${N} ${DIM}(%s / %s)${N}" "$ct_pct" "$(human_num "$ct_cnt")" "$(human_num "$ct_max")"
+        if [ -s /run/shieldnode/ctguard.evicted ]; then
+            printf "   ${R}ctguard: %s IP evicted${N}" "$(wc -l < /run/shieldnode/ctguard.evicted 2>/dev/null || echo 0)"
+        fi
+        echo ""
+        echo ""
+    fi
+
     # ===== PROTECTED PORTS =====
     echo -e "  ${B}Protected${N}"
     printf  "  ├─ ${DIM}TCP:${N}  ${C}%s${N}\n" "$PROTECTED_TCP_LIST"
@@ -7881,10 +8084,9 @@ show_settings_menu() {
         echo ""
         echo -e "  [${B}1${N}] Auto-sync github custom.txt    $s1  ${DIM}(every 6h)${N}"
         echo -e "  [${B}2${N}] Check for shieldnode updates  $s2  ${DIM}(every 1d)${N}"
-        echo -e "  [${B}4${N}] Tor exit blocklist            $s4"
+        echo -e "  [${B}3${N}] Tor exit blocklist            $s4"
         echo ""
-        echo -e "  ${DIM}v3.20.0: пункты [3] Mobile-RU и [5] Broadband-RU убраны.${N}"
-        echo -e "  ${DIM}Защита упрощена — единый лимит ct=15000 для всех IP.${N}"
+        echo -e "  ${DIM}Единый лимит ct=15000 для всех IP.${N}"
         echo ""
         echo ""
         # v3.18.8: Trusted IPs counter
@@ -7928,7 +8130,7 @@ show_settings_menu() {
                 fi
                 sleep 1
                 ;;
-            4)
+            3)
                 if [ "$tor_state" = "1" ]; then
                     _write_setting "BLOCK_TOR" "0"
                     rm -f /etc/shieldnode/block_tor
@@ -8240,9 +8442,9 @@ while true; do
     echo -e "${C}┌─────────────────────────────────────────────────────────────────┐${N}"
     echo -e "${C}│${N}  ${B}Actions${N}                                                        ${C}│${N}"
     echo -e "${C}├─────────────────────────────────────────────────────────────────┤${N}"
-    echo -e "${C}│${N}  [${B}2${N}] CrowdSec bans          [${B}3${N}] Whitelist manage                ${C}│${N}"
-    echo -e "${C}│${N}  [${B}6${N}] Recent history         [${B}7${N}] Top attackers                   ${C}│${N}"
-    echo -e "${C}│${N}  [${B}8${N}] Unban all                                                  ${C}│${N}"
+    echo -e "${C}│${N}  [${B}1${N}] CrowdSec bans          [${B}2${N}] Whitelist manage                ${C}│${N}"
+    echo -e "${C}│${N}  [${B}3${N}] Recent history         [${B}4${N}] Top attackers                   ${C}│${N}"
+    echo -e "${C}│${N}  [${B}5${N}] Unban all                                                  ${C}│${N}"
     echo -e "${C}│${N}  [${B}s${N}] Settings                                                   ${C}│${N}"
     echo -e "${C}├─────────────────────────────────────────────────────────────────┤${N}"
     echo -e "${C}│${N}  [${B}r${N}] Refresh                [${B}0${N}] Exit                            ${C}│${N}"
@@ -8251,11 +8453,11 @@ while true; do
 
     read -r CHOICE
     case "$CHOICE" in
-        2) show_crowdsec_bans    ;;
-        3) show_whitelist_ips    ;;
-        6) show_history          ;;
-        7) show_top_attackers    ;;
-        8) unban_all             ;;
+        1) show_crowdsec_bans    ;;
+        2) show_whitelist_ips    ;;
+        3) show_history          ;;
+        4) show_top_attackers    ;;
+        5) unban_all             ;;
         s|S) show_settings_menu  ;;
         r|R|"") continue ;;
         0|q|quit|exit) clear 2>/dev/null; exit 0 ;;
