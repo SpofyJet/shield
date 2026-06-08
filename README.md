@@ -39,7 +39,7 @@ Kernel-tuning (BBR, qdisc, сетевые буферы, sizing conntrack) — **
 Когда флуд незавершённых SYN забивает conntrack-таблицу — нода превращается в чёрную дыру (`nf_conntrack: table full`). SYNPROXY это закрывает.
 
 - Модуль `shieldnode-synproxy.sh`, таблица `inet shield_synproxy` — **не трогает** `ddos_protect`. Откат = удаление таблицы, нода не падает.
-- По умолчанию **выключен** (`SHIELD_SYNPROXY=0`, opt-in): synproxy меняет TCP data-path, на нодах с нестандартным MTU/фаерволом включать после своей проверки. Включить: `SHIELD_SYNPROXY=1` в `shieldnode.conf` или `sudo shieldnode-synproxy.sh on`.
+- По умолчанию **включён** (`SHIELD_SYNPROXY=1` с v3.24.0). Безопасно: если ядро не поддерживает SYNPROXY — авто-fallback на `ddos_protect`; на стоковых ядрах авто-доустановка `linux-modules-extra-$(uname -r)` (на XanMod встроен). verify mss/wscale живого бэкенда + авто-откат при несовпадении. Выключить: `SHIELD_SYNPROXY=0` или `sudo shieldnode-synproxy.sh off`.
 - Авто-детект портов / mss / wscale, verify по живому SYN-ACK, авто-откат при конфликте слоёв.
 - Требует ядро **≥5.14** + модуль `nf_synproxy`. Если их нет — выводит чёткую причину, `ddos_protect` продолжает работать штатно.
 - Переживает ребут (`shieldnode-synproxy.service`).
@@ -110,6 +110,7 @@ curl -fL https://raw.githubusercontent.com/SpofyJet/shield/main/shieldnode.sh | 
 
 ## Изменения (последние)
 
+- **v3.24.0** — SYNPROXY включён по умолчанию (`SHIELD_SYNPROXY=1`; безопасно: авто-fallback на `ddos_protect`, авто-доустановка `linux-modules-extra`). + НОВЫЙ модуль **conntrack-guard** (`shieldnode-ctguard`): изолированная таблица `inet shield_ctguard` (priority -160), мониторит `nf_conntrack_count` и при заполнении ≥90% эвиктит ТОЛЬКО IP с аномальной долей соединений (≥`SHIELD_CT_EVICT_MIN`, дефолт 10000 — много выше легитимного максимума ~2000) — nft-блок 30мин + `conntrack -D`, авто-recovery при ≤70%. conntrack% выведен в дашборд guard. Меню guard перенумеровано 1–5.
 - **v3.23.19** — CRIT FIX агрегатора: под `ProtectSystem=strict` юнит не объявлял `/run/shieldnode` writable → lock падал (RO fs) → агрегатор скипал каждый тик → events.db/статистика замораживались (защита выглядела «не реагирующей», хотя nft дропал). + агрегатор теперь пишет CRITICAL вместо молчаливого skip.
 - **v3.23.18** — synproxy: теперь показывает причину невключения (фикс молчаливого `set -e` + grep, явный `die` на `nft -f` при отсутствии `nf_synproxy`); custom-счётчик виден в панели всегда; чистка меню (убраны active-attacks / scanner-samples / full-log + settings force-sync/version-check).
 - **v3.23.17** — FIX переполнения диска: rolling pcap рос до десятков GB (strftime-имя ломало `-W` ring). Нумерованный ring 1GB + size-cap + авто-очистка legacy. Portable-даты в guard (`LC_ALL=C`).
