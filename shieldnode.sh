@@ -1,7 +1,14 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.26.4 (Commercial Edition) — SECURITY HARDENING
+#  VPN NODE DDoS PROTECTION v3.26.5 (Commercial Edition) — SECURITY HARDENING
+#
+#  v3.26.5 (dependency auto-upgrade):
+#    - install/upgrade держит управляемые apt-зависимости на последней версии репо
+#      (nftables, conntrack, iproute2, tcpdump, sqlite3, jq, curl, zstd, xz-utils,
+#      crowdsec + firewall-bouncer). Апгрейд только если репо-версия строго новее
+#      (downgrade исключён --only-upgrade). Foreign-CrowdSec не трогаем (подсказка).
+#      Knob SHIELD_UPGRADE_DEPS=0 замораживает версии.
 #
 #  v3.26.4 (CGNAT/mobile false-positive fix):
 #    - phantom attack-mode входит ТОЛЬКО при реальном per-source холдере (≥PH_MIN);
@@ -485,7 +492,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.26.4"
+SHIELDNODE_VERSION="3.26.5"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -1526,6 +1533,34 @@ wait_for_apt_lock() {
     return 0
 }
 
+# v3.26.5: держим УЖЕ УСТАНОВЛЕННЫЕ управляемые apt-зависимости на последней версии репо.
+# Не доустанавливает лишнее, апгрейдит только если candidate строго новее (--only-upgrade
+# никогда не делает downgrade). Заморозить версии: SHIELD_UPGRADE_DEPS=0.
+SHIELD_UPGRADE_DEPS="${SHIELD_UPGRADE_DEPS:-1}"
+_SHIELD_APT_REFRESHED=0
+shield_apt_refresh_once(){ [ "$_SHIELD_APT_REFRESHED" = "1" ] && return 0; wait_for_apt_lock; apt-get update -qq >/dev/null 2>&1 || true; _SHIELD_APT_REFRESHED=1; }
+ensure_latest_apt(){   # $1=пакет, $2=опц. сервис для рестарта после апгрейда
+    [ "$SHIELD_UPGRADE_DEPS" = "1" ] || return 0
+    local pkg="$1" svc="${2:-}" inst cand
+    dpkg -l "$pkg" 2>/dev/null | grep -qE '^ii' || return 0          # не установлен → не трогаем
+    shield_apt_refresh_once
+    inst=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null)
+    cand=$(apt-cache policy "$pkg" 2>/dev/null | awk '/Candidate:/{print $2}')
+    [ -n "$cand" ] && [ "$cand" != "(none)" ] || return 0
+    dpkg --compare-versions "$cand" gt "$inst" 2>/dev/null || return 0   # candidate новее?
+    wait_for_apt_lock
+    print_status "Обновляю $pkg: $inst → $cand..."
+    if timeout --kill-after=30s 300s env DEBIAN_FRONTEND=noninteractive \
+         CSCLI_UNATTENDED_SKIP=1 CROWDSEC_SKIP_HUB_UPDATE=1 \
+         apt-get install --only-upgrade -y "$pkg" </dev/null >/dev/null 2>&1; then
+        print_ok "$pkg → $(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null)"
+        [ -n "$svc" ] && systemctl restart "$svc" >/dev/null 2>&1 || true
+    else
+        DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/dev/null 2>&1 || true
+        print_warn "$pkg: апгрейд не завершился — остаётся $inst (вручную: sudo apt install --only-upgrade $pkg)"
+    fi
+}
+
 # Проверяем apt lock перед любыми установками
 wait_for_apt_lock || exit 1
 
@@ -1576,6 +1611,12 @@ if ! command -v conntrack >/dev/null 2>&1; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y conntrack >/dev/null 2>&1 || \
         print_warn "conntrack не установлен — unban_all не сможет полностью разбанить IP с активными соединениями"
 fi
+
+# v3.26.5: подтягиваем уже установленные управляемые зависимости до последней версии репо
+# (security-патчи дистрибутива). Только установленные пакеты; gated SHIELD_UPGRADE_DEPS.
+for _dep in nftables conntrack iproute2 tcpdump sqlite3 jq curl zstd xz-utils psmisc; do
+    ensure_latest_apt "$_dep"
+done
 
 if ! nft list ruleset >/dev/null 2>&1; then
     print_error "nft list ruleset не работает — нет ядерных модулей nftables"
@@ -2560,6 +2601,13 @@ if [ ! -f "$SHIELD_LIMITS_FILE" ]; then
 #
 # Безопасность: файл должен быть owned root:root, perms 0640.
 # shield_safe_source проверяет это при загрузке.
+
+# ─── Авто-апгрейд зависимостей (v3.26.5) ───
+# 1 = при install/upgrade держать УЖЕ установленные управляемые пакеты (nftables,
+# conntrack, iproute2, tcpdump, sqlite3, jq, curl, zstd, xz-utils, crowdsec + баунсер)
+# на последней версии из репо (security-патчи). Апгрейд только если репо-версия новее
+# (downgrade исключён). 0 = заморозить версии. Можно и разово: SHIELD_UPGRADE_DEPS=0 bash shieldnode.sh
+SHIELD_UPGRADE_DEPS=1
 
 # ─── Per-IP conntrack лимит (защита от conn-flood/slowloris) ───
 # 15000 = baseline 20× от пика реальных юзеров. Срезает все известные ботнеты.
@@ -5508,7 +5556,15 @@ else
         print_warn "  • table ip crowdsec в nftables"
         print_info "Чтобы разрешить shieldnode'у управлять CrowdSec:"
         print_info "  sudo touch $CROWDSEC_MARKER && sudo guard upgrade"
+        print_info "  security-апдейты CrowdSec ставь сам: sudo apt install --only-upgrade crowdsec"
     fi
+fi
+# v3.26.5: если CrowdSec под нашим управлением — держим движок и баунсер на последней
+# версии (security-релизы CrowdSec, напр. 1.7.8 = фикс обхода WAF + DoS на LAPI).
+# Foreign-инсталл НЕ трогаем (только подсказка). Свежая установка уже на candidate → no-op.
+if [ "$SHIELDNODE_CROWDSEC_MANAGED" = "1" ]; then
+    ensure_latest_apt crowdsec crowdsec
+    ensure_latest_apt crowdsec-firewall-bouncer-nftables crowdsec-firewall-bouncer
 fi
 print_ok "CrowdSec: $(cscli version 2>&1 | head -1 || echo установлен)"
 if [ "$SHIELDNODE_CROWDSEC_MANAGED" = "1" ]; then
