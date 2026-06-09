@@ -1,7 +1,18 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.26.3 (Commercial Edition) — SECURITY HARDENING
+#  VPN NODE DDoS PROTECTION v3.26.4 (Commercial Edition) — SECURITY HARDENING
+#
+#  v3.26.4 (CGNAT/mobile false-positive fix):
+#    - phantom attack-mode входит ТОЛЬКО при реальном per-source холдере (≥PH_MIN);
+#      мобильный CGNAT-churn (conntrack≫live и у ЛЕГИТА из-за est_to) больше НЕ = атака.
+#    - PH_MIN дефолт 500→4000 (выше легит-CGNAT-churn ~2200, ниже атаки 7000+) →
+#      ENFORCE=1 снова безопасен на мобильных нодах.
+#    - агрегатный кап теперь opt-in: SHIELD_CTG_AGG_CAP (0=прямые ноды, 1=CDN/мост).
+#      Настоящий rate/fill-флуд капается всегда; чистый churn — нет (не вредит легиту).
+#    - ensure_table пересоздаёт устаревшую таблицу без chain capnew (фикс WARN-спама
+#      "не наложил агрегатный кап" при апгрейде поверх <v3.26).
+#    - убран per-tick лог "фантом-холдеров не найдено".
 #
 #  v3.26.3: (perf) дешёвый коарс-гейт в ctguard — дорогой conntrack-L дамп только
 #    если conntrack >> ss_total (фантом-тяжело) или attack-mode; здоровая busy-нода
@@ -474,7 +485,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.26.3"
+SHIELDNODE_VERSION="3.26.4"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -2585,12 +2596,18 @@ SHIELD_SYNPROXY=1
 # v3.26: conntrack-guard — основная защита от connect-and-hold (фантом) флуда + backstop
 # против conntrack-exhaustion. Изолированная таблица shield_ctguard. Эвиктит источники,
 # у которых conntrack ≫ ЖИВЫХ сокетов (ss) — handshake-and-abandon; легит с live>0 щадит.
-# Срабатывает ТОЛЬКО в attack-mode (ss-phantom-ratio / EWMA-отклонение / fill). 1=вкл, 0=выкл.
+# v3.26.4: attack-mode по фантому входит ТОЛЬКО при наличии реального per-source холдера
+# (≥SHIELD_CTG_PHANTOM_MIN) — мобильный CGNAT-churn (conntrack≫live и у легита) больше НЕ
+# триггерит ложную атаку/кап/эвикт. 1=вкл, 0=выкл.
 SHIELD_CTGUARD=1
 SHIELD_CTG_ENFORCE=1         # 1=выселять; 0=ТОЛЬКО лог (наблюдение) — для осторожного раската
 SHIELD_CTG_LIVE_FRAC=10      # выселять источник, если живых сокетов < этого %% от его conntrack
-SHIELD_CTG_PHANTOM_RATIO=60  # %% ss-phantom-ratio для входа в attack-mode (норма <=3, атака >=96)
-SHIELD_CTG_PHANTOM_MIN=500   # мин. conntrack-флоу с источника, чтобы рассматривать к эвикту
+SHIELD_CTG_PHANTOM_RATIO=60  # %% ss-phantom-ratio (сигнал; attack-mode лишь при реальном холдере)
+SHIELD_CTG_PHANTOM_MIN=4000  # мин. conntrack с источника, чтобы считать его холдером. Выше потолка
+                             # легит-CGNAT-churn (~2200), ниже connect-and-hold атаки (7000+).
+                             # Не-CGNAT нода со стабильными конн-ами: можно понизить для чувствительности.
+SHIELD_CTG_AGG_CAP=0         # агрегатный кап new-conn по фантому. 0=off (прямые ноды: эвикт сам справляется,
+                             # кап на CGNAT-пиках вреден). 1=on для CDN/мост-нод, где per-IP эвикт невозможен.
 SHIELD_CTG_ACTIVE_FLOOR=20   # > стольких ЖИВЫХ сокетов у источника => shared-front/CGNAT => НЕ трогаем
 SHIELD_CTG_CT_MAX_CEIL=1048576  # авто-поднимать nf_conntrack_max до этого потолка при заполнении
 SHIELD_CTG_COARSE_MULT=3     # perf: полный conntrack-дамп только если conntrack > ss_total×это
@@ -3615,10 +3632,15 @@ MULT_IN="${SHIELD_CTG_MULT_IN:-4}"; MULT_OUT="${SHIELD_CTG_MULT_OUT:-2}"
 FLOOR_RATE="${SHIELD_CTG_FLOOR_RATE:-200}"
 FLOOR_CT="${SHIELD_CTG_FLOOR_CT:-20000}"
 # v3.26.0 phantom-eviction ПО ЖИВЫМ СОКЕТАМ (ss), acct-free.
-PH_MIN="${SHIELD_CTG_PHANTOM_MIN:-500}"          # мин. conntrack-флоу с источника, чтобы рассматривать
+# v3.26.4 PH_MIN дефолт 500→4000: на мобильных/CGNAT-нодах легит-клиенты бросают
+# соединения быстрее, чем est_to их реапит → conntrack≫live и у ЛЕГИТА тоже (churn).
+# Порог 4000 выше потолка легит-CGNAT-churn (~2200) и ниже connect-and-hold атаки (7000+),
+# что делает ENFORCE=1 безопасным на CGNAT. Не-CGNAT ноды могут понизить для чувствительности.
+PH_MIN="${SHIELD_CTG_PHANTOM_MIN:-4000}"         # мин. conntrack-флоу с источника, чтобы считать его холдером
 LIVE_FRAC="${SHIELD_CTG_LIVE_FRAC:-10}"          # выселять если live/conntrack < этого % (фантом-холдер)
 ACTIVE_FLOOR="${SHIELD_CTG_ACTIVE_FLOOR:-20}"    # > стольких ЖИВЫХ сокетов у источника → shared-front/CGNAT → НЕ трогаем
-PHR_TRIG="${SHIELD_CTG_PHANTOM_RATIO:-60}"       # % ss-phantom-ratio для attack-mode (норма ≤3, атака ≥96)
+PHR_TRIG="${SHIELD_CTG_PHANTOM_RATIO:-60}"       # % ss-phantom-ratio (сигнал; attack-mode только если есть РЕАЛЬНЫЙ холдер)
+AGG_CAP="${SHIELD_CTG_AGG_CAP:-0}"               # v3.26.4: агрегатный кап new-conn по фантому. 0=off (прямые ноды), 1=on (CDN/мост, где per-IP эвикт невозможен)
 ENFORCE="${SHIELD_CTG_ENFORCE:-1}"               # 1=выселять; 0=только лог (наблюдение)
 CT_MAX_CEIL="${SHIELD_CTG_CT_MAX_CEIL:-1048576}" # до какого потолка авто-поднимать nf_conntrack_max
 COARSE_MULT="${SHIELD_CTG_COARSE_MULT:-3}"       # perf: полный conntrack-дамп только если conntrack > ss_total×это (или attack-mode)
@@ -3639,7 +3661,14 @@ fi
 SELF_IPS="$(hostname -I 2>/dev/null) $(ip -o addr 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | tr '\n' ' ')"
 
 ensure_table(){
-    nft list table inet shield_ctguard >/dev/null 2>&1 && return 0
+    # v3.26.4: пересоздаём УСТАРЕВШУЮ таблицу. До v3.26 в shield_ctguard не было chain capnew —
+    # при апгрейде поверх старой таблицы apply_cap падал каждый тик. Если таблица есть, но
+    # без capnew — удаляем и создаём заново корректную схему.
+    if nft list table inet shield_ctguard >/dev/null 2>&1; then
+        nft list chain inet shield_ctguard capnew >/dev/null 2>&1 && return 0
+        logger -t "$TAG" "ensure_table: устаревшая shield_ctguard (нет capnew) — пересоздаю"
+        nft delete table inet shield_ctguard 2>/dev/null || true
+    fi
     nft -f - 2>/dev/null <<'NFT'
 table inet shield_ctguard {
     set evict4 { type ipv4_addr; flags timeout; }
@@ -3770,16 +3799,19 @@ echo "$SS_LIVE $CT_INB" > "$RUN/ctguard.live" 2>/dev/null || true
 
 PREV_MODE=normal; [ -r "$MODE_F" ] && PREV_MODE=$(cat "$MODE_F" 2>/dev/null || echo normal)
 
-ATTACK=0
-if [ "$RATE" -gt "$trig_rate" ] 2>/dev/null || [ "$CNT" -gt "$trig_ct" ] 2>/dev/null || [ "$PCT" -ge "$HIGH" ] 2>/dev/null \
-   || { [ "$PHR" -ge "$PHR_TRIG" ] 2>/dev/null && [ "$CT_INB" -ge "$SNAP_FLOOR" ] 2>/dev/null; }; then
-    ATTACK=1
-elif [ "$PREV_MODE" = "attack" ]; then
-    if [ "$RATE" -gt "$exit_rate" ] 2>/dev/null || [ "$CNT" -gt "$exit_ct" ] 2>/dev/null || [ "$PCT" -gt "$RECOVER" ] 2>/dev/null \
-       || { [ "$PHR" -ge "$PHR_TRIG" ] 2>/dev/null && [ "$CT_INB" -ge "$SNAP_FLOOR" ] 2>/dev/null; }; then
-        ATTACK=1
-    fi
+# v3.26.4: РАЗДЕЛЯЕМ настоящий флуд от мобильного churn.
+# (1) Настоящий L4-флуд new-conn/conntrack (rate/fill) — агрегатный кап здесь правильный инструмент.
+FLOOD=0
+if [ "$RATE" -gt "$trig_rate" ] 2>/dev/null || [ "$CNT" -gt "$trig_ct" ] 2>/dev/null || [ "$PCT" -ge "$HIGH" ] 2>/dev/null; then
+    FLOOD=1
+elif [ "$PREV_MODE" = "attack" ] && { [ "$RATE" -gt "$exit_rate" ] 2>/dev/null || [ "$CNT" -gt "$exit_ct" ] 2>/dev/null || [ "$PCT" -gt "$RECOVER" ] 2>/dev/null; }; then
+    FLOOD=1
 fi
+# (2) ss-phantom-сигнал. Высокий ratio даёт И connect-and-hold атака, И легит мобильный
+# churn (est_to реапит медленнее, чем клиенты бросают конны → conntrack≫live у легита тоже).
+# Различаем их НИЖЕ по наличию реального per-source холдера (≥PH_MIN), а не по самому ratio.
+PHANTOM_SIG=0
+[ "$PHR" -ge "$PHR_TRIG" ] 2>/dev/null && [ "$CT_INB" -ge "$SNAP_FLOOR" ] 2>/dev/null && PHANTOM_SIG=1
 
 apply_cap(){  # глобальный кап new-conn на protected-порты (НЕ per-IP → safe для CDN/моста)
     local cap="$1" ports; ports=$(protected_ports)
@@ -3793,9 +3825,10 @@ apply_cap(){  # глобальный кап new-conn на protected-порты (
 clear_cap(){ nft flush chain inet shield_ctguard capnew 2>/dev/null || true; }
 
 phantom_evict(){  # v3.26.0: эвикт источников с conntrack ≫ живых сокетов (ss). acct-free, CGNAT-safe.
+    FOUND_HOLDER=0
     command -v conntrack >/dev/null 2>&1 || { logger -t "$TAG" "CRITICAL: conntrack-tool нет — эвикт недоступен (apt install conntrack)"; return; }
     take_snap || { logger -t "$TAG" "WARN: snapshot не снят (conntrack/ss/protected_ports) — эвикт пропущен"; return; }
-    local evicted=0 ip ct live
+    local ip ct live
     while read -r ct ip; do
         [ -n "${ip:-}" ] || continue
         [ "${ct:-0}" -ge "$PH_MIN" ] 2>/dev/null || continue
@@ -3803,10 +3836,11 @@ phantom_evict(){  # v3.26.0: эвикт источников с conntrack ≫ ж
         [ "$live" -gt "$ACTIVE_FLOOR" ] 2>/dev/null && continue           # много живых → shared-front/CGNAT → НЕ трогаем
         awk -v l="$live" -v c="$ct" -v f="$LIVE_FRAC" 'BEGIN{exit !(c>0 && l*100/c < f)}' || continue  # live-доля < порога
         is_protected "$ip" && continue
+        FOUND_HOLDER=$((FOUND_HOLDER+1))
         if [ "$ENFORCE" != "1" ]; then
             logger -t "$TAG" "DRY: выселил бы $ip (conntrack=$ct live=$live)"
             echo "$ip conntrack=$ct live=$live DRY $(date '+%F %T')" >> "$EVICT_F" 2>/dev/null || true
-            evicted=$((evicted+1)); continue
+            continue
         fi
         if printf '%s' "$ip" | grep -q ':'; then
             nft add element inet shield_ctguard evict6 "{ $ip timeout $EVICT_TTL }" 2>/dev/null || true
@@ -3817,19 +3851,35 @@ phantom_evict(){  # v3.26.0: эвикт источников с conntrack ≫ ж
         [ "$CSCLI" = "1" ] && command -v cscli >/dev/null 2>&1 && cscli decisions add -i "$ip" -d "$CSCLI_TTL" -r "shieldnode phantom conn-flood" >/dev/null 2>&1 || true
         echo "$ip conntrack=$ct live=$live $(date '+%F %T')" >> "$EVICT_F" 2>/dev/null || true
         logger -t "$TAG" "EVICT $ip: conntrack=$ct live=$live (phantom-holder) — block ${EVICT_TTL} + conntrack -D"
-        evicted=$((evicted+1))
     done < "$RUN/ctg.ctsrc"
-    if [ "$evicted" -eq 0 ]; then
-        logger -t "$TAG" "ATTACK-mode, но фантом-холдеров не найдено (за CDN/мостом / все live>0) — держим кап + reap по conntrack-таймауту"
-    fi
 }
+
+# v3.26.4 решение:
+#  • эвикт пробуем при phantom-сигнале — реальные холдеры (≥PH_MIN, low-live) ловятся,
+#    мобильный churn даёт 0 холдеров МОЛЧА (нет спама, нет attack-mode).
+#  • attack-mode входим ТОЛЬКО если есть что делать: настоящий флуд, найден холдер,
+#    или включён агрегатный кап для CDN/мост-ноды (SHIELD_CTG_AGG_CAP=1).
+FOUND_HOLDER=0
+if [ "$PHANTOM_SIG" = "1" ] || { [ "$PREV_MODE" = "attack" ] && [ "$CT_INB" -ge "$SNAP_FLOOR" ] 2>/dev/null; }; then
+    phantom_evict
+fi
+DO_CAP=0
+[ "$FLOOD" = "1" ] && DO_CAP=1                                   # настоящий new-conn/conntrack флуд → кап
+[ "$AGG_CAP" = "1" ] && [ "$PHANTOM_SIG" = "1" ] && DO_CAP=1     # CDN/мост (opt-in): per-IP эвикт невозможен → кап
+ATTACK=0
+[ "$FLOOD" = "1" ] && ATTACK=1
+[ "${FOUND_HOLDER:-0}" -gt 0 ] 2>/dev/null && ATTACK=1
+[ "$DO_CAP" = "1" ] && ATTACK=1
 
 if [ "$ATTACK" = "1" ]; then
     echo attack > "$MODE_F" 2>/dev/null || true
-    cap=$(( BASE_RATE * MULT_OUT )); [ "$cap" -lt "$FLOOR_RATE" ] && cap="$FLOOR_RATE"
-    apply_cap "$cap"
-    phantom_evict
-    [ "$PREV_MODE" != "attack" ] && logger -t "$TAG" "ATTACK ON: rate=${RATE}/s (base≈${BASE_RATE}, trig>${trig_rate}) conntrack=${CNT}(${PCT}%) phantom-ratio=${PHR}% (live=${SS_LIVE}/${CT_INB}) enforce=${ENFORCE} — кап new-conn=${cap}/s + phantom-эвикт"
+    if [ "$DO_CAP" = "1" ]; then
+        cap=$(( BASE_RATE * MULT_OUT )); [ "$cap" -lt "$FLOOR_RATE" ] && cap="$FLOOR_RATE"
+        apply_cap "$cap"
+    else
+        clear_cap; cap="off(direct/no-flood)"
+    fi
+    [ "$PREV_MODE" != "attack" ] && logger -t "$TAG" "ATTACK ON: rate=${RATE}/s (base≈${BASE_RATE}, trig>${trig_rate}) conntrack=${CNT}(${PCT}%) phantom-ratio=${PHR}% (live=${SS_LIVE}/${CT_INB}) holders=${FOUND_HOLDER} flood=${FLOOD} enforce=${ENFORCE} agg_cap=${AGG_CAP} — кап=${cap} + phantom-эвикт"
     echo "$PCT" > "$TIER_F" 2>/dev/null || true
     exit 0
 fi
@@ -3881,7 +3931,7 @@ systemctl daemon-reload 2>/dev/null || true
 if [ "$SHIELD_CTGUARD" = "1" ]; then
     systemctl enable --now shieldnode-ctguard.timer >/dev/null 2>&1 || true
     /usr/local/sbin/shieldnode-ctguard.sh >/dev/null 2>&1 || true
-    print_ok "conn-flood guard включён (v3.26: триггеры = ss-phantom-ratio ≥${SHIELD_CTG_PHANTOM_RATIO:-60}% / отклонение ×${SHIELD_CTG_MULT_IN:-4} по new-conn|conntrack / fill ≥${SHIELD_CT_HIGH_PCT:-90}%; ответ = агрегатный кап + phantom-эвикт по ЖИВЫМ сокетам; SHIELD_CTG_ENFORCE=${SHIELD_CTG_ENFORCE:-1})"
+    print_ok "conn-flood guard включён (v3.26.4: phantom-эвикт по ЖИВЫМ сокетам, холдер≥${SHIELD_CTG_PHANTOM_MIN:-4000} conn; attack-mode только при реальном холдере / rate-fill флуде — CGNAT-churn не триггерит; агрегатный кап opt-in SHIELD_CTG_AGG_CAP=${SHIELD_CTG_AGG_CAP:-0}; SHIELD_CTG_ENFORCE=${SHIELD_CTG_ENFORCE:-1})"
 else
     systemctl disable --now shieldnode-ctguard.timer >/dev/null 2>&1 || true
     print_info "conntrack-guard выключен (SHIELD_CTGUARD=0)"

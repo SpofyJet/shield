@@ -56,9 +56,9 @@ Kernel-tuning (BBR, qdisc, сетевые буферы, sizing conntrack) — **
 **Решение — детект по ЖИВЫМ сокетам (`shieldnode-ctguard`):**
 
 - **Признак фантома:** у источника `conntrack ≫ живых сокетов (ss)`. Атакер бросил соединение → живых сокетов 0; легит держит трафик → `live ≈ conntrack`. Это `acct`-free (не зависит от `nf_conntrack_acct`).
-- **Триггер attack-mode:** `ss-phantom-ratio` (доля conntrack без живого сокета). Норма ≤3%, атака 96–98%. Плюс EWMA-отклонение new-conn/conntrack от нормы ноды и fill-триггер как backstop.
-- **Ответ:** агрегатный кап new-conn на защищаемые порты (глобальный, **не** per-IP → безопасно для CDN/CGNAT) + эвикт источников-фантомов (nft-блок + `conntrack -D`, опц. CrowdSec-бан).
-- **CGNAT-safe by design:** эвикт срабатывает **только в attack-mode**, и источник щадится при любом из условий — живых сокетов > порога (shared-front/CGNAT), live-доля выше порога, или IP в whitelist. Здоровая нода в attack-mode не входит → не выселяет вообще.
+- **Триггер attack-mode (v3.26.4):** `ss-phantom-ratio` (доля conntrack без живого сокета) — это *сигнал*, но attack-mode по фантому входит **только при наличии реального per-source холдера** (источник с conntrack ≥ `SHIELD_CTG_PHANTOM_MIN` и почти нулём живых). Отдельно — EWMA-отклонение new-conn/conntrack и fill-триггер (настоящий L4-флуд). **Важно:** на мобильных/CGNAT-нодах высокий phantom-ratio бывает и у ЛЕГИТА — клиенты бросают конны быстрее, чем `est_to=1800` их реапит, и conntrack≫live у легита тоже. Поэтому ratio сам по себе НЕ объявляет атаку — нужен концентрированный холдер.
+- **Ответ:** эвикт источников-фантомов (nft-блок + `conntrack -D`, опц. CrowdSec-бан). Агрегатный кап new-conn на защищаемые порты — **opt-in** через `SHIELD_CTG_AGG_CAP` (0=прямые ноды: эвикт сам справляется, кап на CGNAT-пиках вреден; 1=CDN/мост-ноды, где per-IP-эвикт невозможен). Настоящий rate/fill-флуд капается всегда.
+- **CGNAT-safe by design:** эвикт щадит источник при любом из условий — живых сокетов > порога (shared-front/CGNAT), live-доля выше порога, conntrack < `PHANTOM_MIN` (=4000 по умолчанию, выше легит-CGNAT-churn ~2200), или IP в whitelist. Чистый мобильный churn (нет холдера) в attack-mode **не входит вообще** — ни эвикта, ни капа, ни спама.
 - **sysctl:** `nf_conntrack_tcp_timeout_established=1800` (брошенные фантомы дохнут за 30 мин вместо 5 суток; живые сессии с keepalive переживают).
 - **Производительность:** дешёвый коарс-гейт — дорогой полный дамп `conntrack -L` запускается только если `conntrack ≫ ss_total` (фантом-тяжело) или мы уже в attack-mode. Здоровая busy-нода не платит за дамп каждый тик.
 
@@ -147,7 +147,7 @@ sudo guard self-test  # быстрые проверки ноды
 
 ## Конфигурация
 
-- `/etc/shieldnode/limits.conf` — все лимиты + ручки ctguard (`SHIELD_CTG_ENFORCE`, `SHIELD_CTG_LIVE_FRAC`, `SHIELD_CTG_PHANTOM_RATIO`, `SHIELD_CTG_PHANTOM_MIN`, `SHIELD_CTG_ACTIVE_FLOOR`, `SHIELD_CTG_CT_MAX_CEIL`, `SHIELD_CTG_COARSE_MULT`). Файл sourced'ится с проверкой прав (root:root, 0640).
+- `/etc/shieldnode/limits.conf` — все лимиты + ручки ctguard (`SHIELD_CTG_ENFORCE`, `SHIELD_CTG_LIVE_FRAC`, `SHIELD_CTG_PHANTOM_RATIO`, `SHIELD_CTG_PHANTOM_MIN`, `SHIELD_CTG_AGG_CAP`, `SHIELD_CTG_ACTIVE_FLOOR`, `SHIELD_CTG_CT_MAX_CEIL`, `SHIELD_CTG_COARSE_MULT`). Файл sourced'ится с проверкой прав (root:root, 0640).
 - `/etc/shieldnode/shieldnode.conf` — фичи: `SHIELD_SYNPROXY`, `SHIELD_CTGUARD`, `BLOCK_TOR`, `TRUSTED_IPS` (single IP и CIDR), и др.
 
 После изменения лимитов: `sudo systemctl restart shieldnode-nftables.service` (для nft) и `sudo systemctl restart shieldnode-ctguard` (для ctguard), либо `sudo guard upgrade`.
@@ -175,6 +175,7 @@ curl -fL https://raw.githubusercontent.com/SpofyJet/shield/main/shieldnode.sh | 
 
 ## Изменения (последние)
 
+- **v3.26.4** — фикс ложных срабатываний на мобильных/CGNAT-нодах. phantom attack-mode входит **только при реальном per-source холдере** (≥`PHANTOM_MIN`); мобильный churn (conntrack≫live и у легита из-за `est_to`) больше НЕ объявляет атаку. `PHANTOM_MIN` дефолт 500→4000 (выше легит-CGNAT-churn ~2200, ниже атаки 7000+) → `ENFORCE=1` снова безопасен на мобильных нодах. Агрегатный кап теперь **opt-in** (`SHIELD_CTG_AGG_CAP`: 0=прямые, 1=CDN/мост); настоящий rate/fill-флуд капается всегда. `ensure_table` пересоздаёт устаревшую таблицу без `capnew` (фикс WARN-спама «не наложил агрегатный кап» при апгрейде поверх <v3.26). Убран per-tick лог «фантом-холдеров не найдено».
 - **v3.26.3** — perf: дешёвый коарс-гейт в ctguard (полный `conntrack -L` дамп только при `conntrack ≫ ss` или attack-mode). Наблюдаемость: guard «Total blocked» + разбивка включают дропы ctguard-слоя; `self-test` проверяет heartbeat ctguard. Конфиг: ручки `SHIELD_CTG_*` выведены в `limits.conf`.
 - **v3.26.x** — phantom-детект по **живым сокетам** (`ss` vs conntrack, acct-free) + `ss-phantom-ratio` триггер + conntrack-exhaustion guard. Заменил байтовый детектор (тот при `acct=0` мог масс-эвиктить CGNAT — критфикс). `is_protected` v4/v6, synproxy `sp_ports` auto-merge + синк портов. per-IP conn-flood = высокий backstop 15000.
 - **v3.24.0** — SYNPROXY включён по умолчанию; первый модуль conntrack-guard (тогда — только fill-триггер + per-IP-порог; в v3.26 переписан на liveness).
