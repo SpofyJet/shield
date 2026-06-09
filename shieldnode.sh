@@ -1,7 +1,68 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.24.0 (Commercial Edition) — SECURITY HARDENING
+#  VPN NODE DDoS PROTECTION v3.26.3 (Commercial Edition) — SECURITY HARDENING
+#
+#  v3.26.3: (perf) дешёвый коарс-гейт в ctguard — дорогой conntrack-L дамп только
+#    если conntrack >> ss_total (фантом-тяжело) или attack-mode; здоровая busy-нода
+#    не платит за полный дамп каждый тик. (наблюдаемость) guard «Total blocked» +
+#    разбивка включают дропы ctguard-слоя (своя таблица); self-test проверяет heartbeat
+#    ctguard (детект залипшего таймера). (конфиг) ручки SHIELD_CTG_* выведены в limits.conf.
+#
+#  v3.26.2: guard-дашборд теперь показывает РЕАЛЬНЫЕ дропы нового ctguard-слоя
+#    (счётчики shield_ctguard: ctguard_drops/ctguard_capdrop) + режим и phantom-ratio;
+#    раньше guard читал счётчики только из ddos_protect → дропы фантом-эвикта были
+#    не видны (на connect-and-hold атаке conn_flood_v4≈0). + индикатор synproxy active.
+#
+#  v3.26.1: per-IP conn_flood возвращён на высокий backstop 15000 (в v3.26.0 был
+#    ошибочно понижен до 4000 — близко к замеренному легит-CGNAT-потолку ~2216/IP,
+#    риск ложных дропов в reconnect-шторме). Точность распределёнки — у ctguard
+#    phantom-evict (liveness-aware, CGNAT-safe), per-IP лишь грубый backstop.
+#    Ports-watcher теперь синхронит и synproxy sp_ports при смене портов фаервола.
+#    Уточнён sysctl-коммент про acct (ctguard меряет живые сокеты, не байты).
+#
+#  v3.26.0: phantom-детект по ЖИВЫМ СОКЕТАМ (ss vs conntrack, acct-free) + ss-phantom-
+#    ratio триггер + conntrack-exhaustion guard. Заменяет байтовый phantom_evict (тот при
+#    nf_conntrack_acct=0 видел ВСЕ флоу как «фантом» → масс-эвикт CGNAT — критфикс).
+#    is_protected теперь v4/v6. synproxy sp_ports: auto-merge (фикс пересечения портов с
+#    protected_ports_tcp). SHIELD_CTG_ENFORCE (1=эвикт, 0=наблюдение). Новые conf:
+#    SHIELD_CTG_LIVE_FRAC/_PHANTOM_RATIO/_CT_MAX_CEIL.
+#
+#  v3.25.0: защита от РАСПРЕДЕЛЁННОГО connection-exhaustion (connect-and-hold)
+#    флуда — универсально для прямых / CDN / мост-нод (без per-node порогов).
+#    Корень проблемы: статический per-IP порог нерешаем (легит-пик от ~127 на
+#    прямой ноде до десятков тысяч за CDN). Новый сигнал = ОТКЛОНЕНИЕ от
+#    собственной нормы ноды + КАЧЕСТВО флоу (фантом vs живой), не счётчик.
+#    (1) ctguard переписан: EWMA-базлайн new-conn/с (TcpPassiveOpens) и
+#        concurrent (conntrack) per-node; attack-mode при ×4 от нормы (выход
+#        ×2), плюс fill-триггер сохранён. Отвязан от гейта 90% (app падал при
+#        7% заполнения).
+#    (2) Ответ в attack-mode: агрегатный кап new-conn на protected-порты
+#        (глобальный limit rate, НЕ per-IP → safe для CDN/моста/CGNAT;
+#        существующие сессии не трогаются) + phantom-эвикт: выселяет ТОЛЬКО
+#        источники с многими handshake-only флоу (acct-байты < порога) И почти
+#        без живых флоу — shared-фронты/CGNAT (с живым трафиком) не трогаются.
+#    (3) sysctl: nf_conntrack_tcp_timeout_established 5д→1800с (брошенные
+#        фантомы дохнут, живые с keepalive живут), acct=1 (для phantom-детекта),
+#        tcp_loose=0, срезаны close_wait/fin_wait/time_wait/last_ack.
+#    (4) Опц. crowdsec-бан выселенных фантом-источников (SHIELD_CTG_CSCLI=1).
+#    Legacy per-IP conn_flood оставлен как высокий backstop (per-node в conf),
+#    больше не основная защита.
+#
+#  v3.24.2: (1) conn_flood log-правило стало per-IP (отдельный set connwatch_v4
+#    с 'ip saddr ct count over X-1') вместо глобального 'ct count over X-1' —
+#    раньше на здоровой ноде суммарный conntrack по всем клиентам штатно >порог,
+#    и лог [shield:conn_flood] сыпался почти непрерывно (дропа не было, только
+#    шум в journald). Теперь логируется только реальный per-IP near-threshold.
+#    (2) SYNPROXY: анонсируемый клиентам MSS теперь кэпится SHIELD_SYNPROXY_MSS_CAP
+#    (default 1400) — фикс PMTU-blackhole для RU-мобайла/PPPoE/DSL с низким
+#    path-MTU при default-on SYNPROXY. Кэп только понижает MSS (всегда безопасно).
+#
+#  v3.24.1: bouncer flap guard — релоады crowdsec при установке рвут decision-
+#    стрим firewall-bouncer'а ("stream halted" → systemd рестарт по кругу).
+#    Финальная проверка ловила bouncer в момент флапа (restart; sleep 3) и
+#    печатала ложное "НЕ active". Теперь: ждём готовности LAPI → reset-failed →
+#    рестарт → проверка active С РЕТРАЯМИ (8×2с) вместо одного снимка.
 #
 #  v3.24.0: SYNPROXY включён по умолчанию (SHIELD_SYNPROXY=1) — безопасно (авто-
 #    fallback на ddos_protect если ядро не тянет; verify mss/wscale + авто-откат;
@@ -413,7 +474,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.24.0"
+SHIELDNODE_VERSION="3.26.3"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -1709,6 +1770,24 @@ net.ipv4.conf.default.log_martians = 0
 # vpn-node-setup.sh.
 net.netfilter.nf_conntrack_udp_timeout = 180
 net.netfilter.nf_conntrack_udp_timeout_stream = 600
+
+# === v3.25.0: anti-connection-exhaustion (conntrack table) ===
+# Распределённый connect-and-hold флуд оставляет "фантомные" ESTABLISHED-
+# записи (handshake прошёл → клиент бросил → запись висит по дефолту 5 суток,
+# nf_conntrack_tcp_timeout_established=432000). На атаке копятся десятки тысяч
+# мёртвых записей (наблюдалось 72000 при 2270 живых сокетах) → давление на
+# conntrack и память. Срезаем idle-таймауты: брошенные дохнут за ~30 мин,
+# живые сессии с трафиком/keepalive сбрасывают таймер и переживают. acct=1
+# оставлен для диагностики (per-flow байты в conntrack); ctguard v3.26 отделяет
+# фантом-холдеров по ЖИВЫМ сокетам (ss vs conntrack), не по байтам. Это
+# nf_conntrack-зона, НЕ tcp_*-сокеты (их по-прежнему ведёт setup).
+net.netfilter.nf_conntrack_acct = 1
+net.netfilter.nf_conntrack_tcp_loose = 0
+net.netfilter.nf_conntrack_tcp_timeout_established = 1800
+net.netfilter.nf_conntrack_tcp_timeout_close_wait = 30
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 30
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
+net.netfilter.nf_conntrack_tcp_timeout_last_ack = 30
 SYSCTL_EOF
 
 # Применяем
@@ -2503,14 +2582,22 @@ SHIELD_AUTOPROMOTE_WINDOW_HOURS=24
 # Безопасно: ядро не тянет → авто-fallback на ddos_protect; verify mss/wscale + авто-откат.
 SHIELD_SYNPROXY=1
 
-# v3.24.0: conntrack-guard — backstop против conntrack-exhaustion (изолированная таблица
-# shield_ctguard). Эвиктит ТОЛЬКО IP с аномальной долей conntrack (>= EVICT_MIN соединений,
-# много выше легитимного максимума) и ТОЛЬКО при высоком заполнении таблицы. 1=вкл, 0=выкл.
+# v3.26: conntrack-guard — основная защита от connect-and-hold (фантом) флуда + backstop
+# против conntrack-exhaustion. Изолированная таблица shield_ctguard. Эвиктит источники,
+# у которых conntrack ≫ ЖИВЫХ сокетов (ss) — handshake-and-abandon; легит с live>0 щадит.
+# Срабатывает ТОЛЬКО в attack-mode (ss-phantom-ratio / EWMA-отклонение / fill). 1=вкл, 0=выкл.
 SHIELD_CTGUARD=1
-SHIELD_CT_WARN_PCT=80       # %% заполнения conntrack → WARN-алерт
-SHIELD_CT_HIGH_PCT=90       # %% → начинаем эвиктить тяжёлые источники
-SHIELD_CT_RECOVER_PCT=70    # %% → снимаем блокировки (auto-recovery)
-SHIELD_CT_EVICT_MIN=10000   # сколько conns с ОДНОГО IP = повод эвикта (легит-максимум ~2000)
+SHIELD_CTG_ENFORCE=1         # 1=выселять; 0=ТОЛЬКО лог (наблюдение) — для осторожного раската
+SHIELD_CTG_LIVE_FRAC=10      # выселять источник, если живых сокетов < этого %% от его conntrack
+SHIELD_CTG_PHANTOM_RATIO=60  # %% ss-phantom-ratio для входа в attack-mode (норма <=3, атака >=96)
+SHIELD_CTG_PHANTOM_MIN=500   # мин. conntrack-флоу с источника, чтобы рассматривать к эвикту
+SHIELD_CTG_ACTIVE_FLOOR=20   # > стольких ЖИВЫХ сокетов у источника => shared-front/CGNAT => НЕ трогаем
+SHIELD_CTG_CT_MAX_CEIL=1048576  # авто-поднимать nf_conntrack_max до этого потолка при заполнении
+SHIELD_CTG_COARSE_MULT=3     # perf: полный conntrack-дамп только если conntrack > ss_total×это
+SHIELD_CT_WARN_PCT=80        # %% заполнения conntrack → WARN-алерт
+SHIELD_CT_HIGH_PCT=90        # %% → fill-триггер attack-mode + авто-подъём nf_conntrack_max
+SHIELD_CT_RECOVER_PCT=70     # %% → выход из attack-mode (auto-recovery)
+SHIELD_CT_EVICT_MIN=10000    # DEPRECATED (v3.26): старый байтовый детектор удалён, не используется
 SHIELD_CUSTOM_LOCAL_TTL_DAYS=90
 
 # ─── Retention ───
@@ -2759,6 +2846,15 @@ $XRAY_PORTS_UDP_INIT
     # define timeout, you will hit Operation is not supported error").
     # Conntrack table timers сами cleanup элементы при истечении соединений.
     set connlimit_v4 {
+        type ipv4_addr
+        flags dynamic
+        size 65536
+    }
+
+    # v3.24.2: connwatch_v4 — отдельный per-source-IP ct-count для LOG-правила
+    # near-threshold (X-1), чтобы лог НЕ матчился глобально. Без timeout (как
+    # connlimit_v4 — conntrack timers cleanup'ят сами). Не дропает, не банит.
+    set connwatch_v4 {
         type ipv4_addr
         flags dynamic
         size 65536
@@ -3104,13 +3200,15 @@ $SHIELD_V6_RULES
         # massive ботнете (каждый атакующий хоть раз логируется в минуту).
         #
         # Архитектура:
-        #   (1) Log-rule: 'ct count over <X-1>' БЕЗ 'add @set' — match только.
+        #   (1) Log-rule: per-IP 'add @connwatch_v4 { ip saddr ct count over X-1 }'
+        #       — match ТОЛЬКО когда у конкретного src >X-1 conns (v3.24.2;
+        #       раньше был глобальный 'ct count over X-1' → лог-шум на busy-ноде).
         #       meter per-IP rate-limit (1/min). Counter+drop НЕТ — пакет идёт
         #       дальше в правило (2).
         #   (2) Drop rule (как в v3.23.12): atomic match-add-counter-drop.
         #       Counter показывает реальные дропы.
         tcp dport @protected_ports_tcp ct state new \\
-            ct count over $SHIELD_CT_CONN_FLOOD_MINUS_1 \\
+            add @connwatch_v4 { ip saddr ct count over $SHIELD_CT_CONN_FLOOD_MINUS_1 } \\
             meter shield_conn_flood_log { ip saddr limit rate 1/minute burst 5 packets } \\
             log prefix "[shield:conn_flood] " level info flags ip options
         tcp dport @protected_ports_tcp ct state new \\
@@ -3241,7 +3339,7 @@ fi
 # v3.23.16: SYNPROXY модуль (opt-in, conntrack-exhaustion защита)
 # ============================================================================
 # Изолированный модуль (отдельная nft table inet shield_synproxy, отдельный
-# процесс). Управляется флагом SHIELD_SYNPROXY (default 0). ddos_protect не
+# процесс). Управляется флагом SHIELD_SYNPROXY (default 1, v3.24.0). ddos_protect не
 # трогается. Запускаем ПОСЛЕ загрузки основной таблицы — модуль детектит
 # protected_ports_tcp из живого ruleset'а.
 cat > /usr/local/sbin/shieldnode-synproxy.sh <<'SYNPROXY_MODULE_EOF'
@@ -3374,16 +3472,26 @@ verify_untracked_reaches(){
 
 write_conf(){
     local ports_nft="${PORTS//,/, }"
+    # v3.24.2: кэпим анонсируемый клиентам MSS (после verify_backend, который мог
+    # выставить большой backend-MSS). Слишком большой MSS = PMTU-blackhole для
+    # RU-мобайла/PPPoE/DSL. Кэп ТОЛЬКО понижает → всегда безопасно (клиент шлёт
+    # сегменты <= min(свой, анонс)). Поднять: SHIELD_SYNPROXY_MSS_CAP=0 (off).
+    local mss_cap="${SHIELD_SYNPROXY_MSS_CAP:-1400}"
+    if [ "${mss_cap:-0}" -gt 0 ] 2>/dev/null && [ "${MSS:-0}" -gt "$mss_cap" ] 2>/dev/null; then
+        log "  MSS=$MSS > cap $mss_cap → анонсирую $mss_cap (low-path-MTU клиенты; SHIELD_SYNPROXY_MSS_CAP)"
+        MSS="$mss_cap"
+    fi
     mkdir -p /etc/shieldnode
     cat > "$NFT_FILE" <<EOF
 #!/usr/sbin/nft -f
 # shieldnode SYNPROXY — изолированная table, НЕ трогает inet ddos_protect.
-# mss/wscale подогнаны под бэкенд (verify на enable). При жалобах клиентов на
-# низком path-MTU (DSL/PPPoE/мобайл) — понизь SHIELD_SYNPROXY_MSS.
+# mss/wscale подогнаны под бэкенд (verify на enable), MSS кэпится под low-path-MTU
+# (SHIELD_SYNPROXY_MSS_CAP, default 1400). При жалобах — понизь SHIELD_SYNPROXY_MSS.
 table inet shield_synproxy {
     set sp_ports {
         type inet_service
         flags interval
+        auto-merge
         elements = { ${ports_nft} }
     }
     chain pre_raw {
@@ -3491,26 +3599,44 @@ fi
 # ════════════════════════════════════════════════════════════════════
 cat > /usr/local/sbin/shieldnode-ctguard.sh <<'CTGUARD_EOF'
 #!/bin/bash
-# shieldnode conntrack-pressure guard. Запускается таймером раз в ~15с.
-# При нормальной нагрузке только читает /proc (дёшево) и выходит. Тяжёлый
-# conntrack -L делается ТОЛЬКО при заполнении >= HIGH%.
+# shieldnode conntrack/connection-flood guard v3.26.0. Таймер раз в ~15с.
+# v3.26.0: фантом-детект ПО ЖИВЫМ СОКЕТАМ (ss vs conntrack), acct-free; ss-phantom-ratio
+# триггер; conntrack-exhaustion guard. Заменяет байтовый детектор (тот при acct=0 видел
+# все флоу как «фантом» → масс-эвикт CGNAT). ENFORCE=0 → наблюдение (только лог).
+# Изолированная таблица inet shield_ctguard (priority -160). ddos_protect не трогает.
 set -uo pipefail
+export LC_ALL=C
 CONF=/etc/shieldnode/shieldnode.conf
 [ -r "$CONF" ] && . "$CONF" 2>/dev/null || true
 SHIELD_CTGUARD="${SHIELD_CTGUARD:-1}"
-WARN="${SHIELD_CT_WARN_PCT:-80}"; HIGH="${SHIELD_CT_HIGH_PCT:-90}"
-RECOVER="${SHIELD_CT_RECOVER_PCT:-70}"; EVICT_MIN="${SHIELD_CT_EVICT_MIN:-10000}"
+WARN="${SHIELD_CT_WARN_PCT:-80}"; HIGH="${SHIELD_CT_HIGH_PCT:-90}"; RECOVER="${SHIELD_CT_RECOVER_PCT:-70}"
 EVICT_TTL="${SHIELD_CT_EVICT_TTL:-30m}"
+MULT_IN="${SHIELD_CTG_MULT_IN:-4}"; MULT_OUT="${SHIELD_CTG_MULT_OUT:-2}"
+FLOOR_RATE="${SHIELD_CTG_FLOOR_RATE:-200}"
+FLOOR_CT="${SHIELD_CTG_FLOOR_CT:-20000}"
+# v3.26.0 phantom-eviction ПО ЖИВЫМ СОКЕТАМ (ss), acct-free.
+PH_MIN="${SHIELD_CTG_PHANTOM_MIN:-500}"          # мин. conntrack-флоу с источника, чтобы рассматривать
+LIVE_FRAC="${SHIELD_CTG_LIVE_FRAC:-10}"          # выселять если live/conntrack < этого % (фантом-холдер)
+ACTIVE_FLOOR="${SHIELD_CTG_ACTIVE_FLOOR:-20}"    # > стольких ЖИВЫХ сокетов у источника → shared-front/CGNAT → НЕ трогаем
+PHR_TRIG="${SHIELD_CTG_PHANTOM_RATIO:-60}"       # % ss-phantom-ratio для attack-mode (норма ≤3, атака ≥96)
+ENFORCE="${SHIELD_CTG_ENFORCE:-1}"               # 1=выселять; 0=только лог (наблюдение)
+CT_MAX_CEIL="${SHIELD_CTG_CT_MAX_CEIL:-1048576}" # до какого потолка авто-поднимать nf_conntrack_max
+COARSE_MULT="${SHIELD_CTG_COARSE_MULT:-3}"       # perf: полный conntrack-дамп только если conntrack > ss_total×это (или attack-mode)
+CSCLI="${SHIELD_CTG_CSCLI:-1}"; CSCLI_TTL="${SHIELD_CTG_CSCLI_TTL:-6h}"
+ALPHA_NUM="${SHIELD_CTG_ALPHA_NUM:-5}"           # EWMA alpha = ALPHA_NUM/100
 TAG=shieldnode-ctguard
-RUN=/run/shieldnode; mkdir -p "$RUN" 2>/dev/null || true
-TIER_F="$RUN/ctguard.tier"; EVICT_F="$RUN/ctguard.evicted"
+RUN=/run/shieldnode; ST=/var/lib/shieldnode
+mkdir -p "$RUN" "$ST" 2>/dev/null || true
+TIER_F="$RUN/ctguard.tier"; EVICT_F="$RUN/ctguard.evicted"; MODE_F="$RUN/ctguard.mode"
+PREV_F="$RUN/ctguard.prev"; BASE_F="$ST/ctguard-base"
 
-# выключено → снести таблицу и выйти
 if [ "$SHIELD_CTGUARD" != "1" ]; then
     nft delete table inet shield_ctguard 2>/dev/null || true
-    rm -f "$TIER_F" "$EVICT_F" 2>/dev/null || true
+    rm -f "$TIER_F" "$EVICT_F" "$MODE_F" "$PREV_F" "$BASE_F" 2>/dev/null || true
     exit 0
 fi
+
+SELF_IPS="$(hostname -I 2>/dev/null) $(ip -o addr 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | tr '\n' ' ')"
 
 ensure_table(){
     nft list table inet shield_ctguard >/dev/null 2>&1 && return 0
@@ -3519,86 +3645,210 @@ table inet shield_ctguard {
     set evict4 { type ipv4_addr; flags timeout; }
     set evict6 { type ipv6_addr; flags timeout; }
     counter ctguard_drops { }
+    counter ctguard_capdrop { }
     chain pre {
         type filter hook prerouting priority -160; policy accept;
         ip  saddr @evict4 counter name ctguard_drops drop
         ip6 saddr @evict6 counter name ctguard_drops drop
     }
+    chain capnew {
+        type filter hook prerouting priority -159; policy accept;
+    }
 }
 NFT
+}
+
+is_protected(){  # whitelist/infra/loopback/private/self (v4 и v6)
+    local ip="$1"
+    case "$ip" in
+        127.*|10.*|192.168.*|169.254.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
+        ::1|fe80:*|fc*|fd*) return 0 ;;
+    esac
+    printf '%s\n' $SELF_IPS | grep -qxF "$ip" && return 0
+    if printf '%s' "$ip" | grep -q ':'; then
+        nft get element inet ddos_protect infrastructure_v6  "{ $ip }" >/dev/null 2>&1 && return 0
+        nft get element inet ddos_protect manual_whitelist_v6 "{ $ip }" >/dev/null 2>&1 && return 0
+    else
+        nft get element inet ddos_protect manual_whitelist_v4 "{ $ip }" >/dev/null 2>&1 && return 0
+        nft get element inet ddos_protect infrastructure_v4   "{ $ip }" >/dev/null 2>&1 && return 0
+    fi
+    return 1
+}
+
+protected_ports(){ nft list set inet ddos_protect protected_ports_tcp 2>/dev/null | tr -d '\n' | grep -oE 'elements = \{[^}]*\}' | sed -E 's/.*\{ *//; s/ *\}.*//'; }
+
+SNAP_DONE=0
+take_snap(){   # раз за тик: conntrack inbound per-src + ss live per-src на protected tcp портах
+    [ "$SNAP_DONE" = "1" ] && return 0
+    command -v conntrack >/dev/null 2>&1 || return 1
+    local ports; ports="$(protected_ports | tr -d ' ')"
+    [ -n "$ports" ] || return 1
+    conntrack -L -p tcp 2>/dev/null | awk -v P="$ports" -v S="$SELF_IPS" '
+        function inset(p,  i,t){for(i=1;i<=nr;i++)if(rr[i]==p)return 1;for(i=1;i<=ng;i++){split(gr[i],t,"-");if(p>=t[1]&&p<=t[2])return 1}return 0}
+        BEGIN{n=split(P,a,",");for(i=1;i<=n;i++){if(a[i]~/-/){ng++;gr[ng]=a[i]}else{nr++;rr[nr]=a[i]}} m=split(S,s," ");for(i=1;i<=m;i++)slf[s[i]]=1}
+        /ESTABLISHED/{cip="";did="";dpt="";for(i=1;i<=NF;i++){if(cip==""&&$i~/^src=/){split($i,x,"=");cip=x[2]} if(did==""&&$i~/^dst=/){split($i,x,"=");did=x[2]} if(dpt==""&&$i~/^dport=/){split($i,x,"=");dpt=x[2]}} if(cip!=""&&(did in slf)&&inset(dpt))print cip}' \
+        | sort | uniq -c > "$RUN/ctg.ctsrc" 2>/dev/null || : > "$RUN/ctg.ctsrc"
+    if command -v ss >/dev/null 2>&1; then
+        ss -tnH state established 2>/dev/null | awk -v P="$ports" '
+            function inset(p,  i,t){for(i=1;i<=nr;i++)if(rr[i]==p)return 1;for(i=1;i<=ng;i++){split(gr[i],t,"-");if(p>=t[1]&&p<=t[2])return 1}return 0}
+            BEGIN{n=split(P,a,",");for(i=1;i<=n;i++){if(a[i]~/-/){ng++;gr[ng]=a[i]}else{nr++;rr[nr]=a[i]}}}
+            {m=split($3,L,":");if(inset(L[m])){k=split($4,b,":");print b[1]}}' \
+            | sort | uniq -c > "$RUN/ctg.sslive" 2>/dev/null || : > "$RUN/ctg.sslive"
+    else
+        : > "$RUN/ctg.sslive"
+    fi
+    SNAP_DONE=1
 }
 
 CNT=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo 0)
 MAX=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo 0)
 [ "${MAX:-0}" -gt 0 ] 2>/dev/null || exit 0
 PCT=$(( CNT * 100 / MAX ))
-PREV=$(cat "$TIER_F" 2>/dev/null || echo 0)
 echo "$PCT" > "$RUN/ctguard.pct" 2>/dev/null || true
+ensure_table || logger -t "$TAG" "WARN: не смог создать shield_ctguard (kernel/nft?)"
+date +%s > "$RUN/ctguard.heartbeat" 2>/dev/null || true   # v3.26.3: для детекта залипшего таймера
 
-# держим таблицу всегда (пустой evict-сет = no-op), чтобы правило было готово
-ensure_table || logger -t "$TAG" "WARN: не смог создать таблицу shield_ctguard (kernel/nft?)"
+# v3.26.0 conntrack-exhaustion guard: поднять max при заполнении (легит начинает дропаться)
+if [ "$PCT" -ge "$HIGH" ] 2>/dev/null && [ "$MAX" -lt "$CT_MAX_CEIL" ] 2>/dev/null; then
+    NEWMAX=$(( MAX * 2 )); [ "$NEWMAX" -gt "$CT_MAX_CEIL" ] && NEWMAX="$CT_MAX_CEIL"
+    if [ "$ENFORCE" = "1" ]; then
+        sysctl -wq net.netfilter.nf_conntrack_max="$NEWMAX" 2>/dev/null && logger -t "$TAG" "conntrack fill ${PCT}% → nf_conntrack_max ${MAX}→${NEWMAX}" && MAX="$NEWMAX" && PCT=$(( CNT * 100 / MAX ))
+    else
+        logger -t "$TAG" "DRY: conntrack fill ${PCT}% → поднял бы nf_conntrack_max ${MAX}→${NEWMAX}"
+    fi
+fi
 
-is_protected(){  # $1=ip — не эвиктить whitelist/infra/loopback/private/себя
-    local ip="$1"
-    case "$ip" in
-        127.*|10.*|192.168.*|169.254.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
-        ::1|fe80:*|fc*|fd*) return 0 ;;
-    esac
-    hostname -I 2>/dev/null | tr ' ' '\n' | grep -qxF "$ip" && return 0
-    nft get element inet ddos_protect manual_whitelist_v4 "{ $ip }" >/dev/null 2>&1 && return 0
-    nft get element inet ddos_protect infrastructure_v4   "{ $ip }" >/dev/null 2>&1 && return 0
-    return 1
+# new-conn rate via TcpPassiveOpens (дёшево, kernel-wide, топология-агностик)
+NOW=$(date +%s)
+PASS=$(awk '/^Tcp:/{ if(!seen){for(i=1;i<=NF;i++)col[$i]=i; seen=1; next} print $(col["PassiveOpens"]); exit }' /proc/net/snmp 2>/dev/null); PASS="${PASS:-0}"
+PTS=0; PPASS=0
+[ -r "$PREV_F" ] && read -r PTS PPASS < "$PREV_F" 2>/dev/null || true
+echo "$NOW $PASS" > "$PREV_F" 2>/dev/null || true
+DT=$(( NOW - PTS )); [ "$DT" -le 0 ] 2>/dev/null && DT=15
+RATE=0
+if [ "${PPASS:-0}" -gt 0 ] 2>/dev/null && [ "$PASS" -ge "$PPASS" ] 2>/dev/null; then
+    RATE=$(( (PASS - PPASS) / DT ))
+fi
+
+# baseline (EWMA), переживает ребут
+BASE_RATE=0; BASE_CT=0
+[ -r "$BASE_F" ] && read -r BASE_RATE BASE_CT < "$BASE_F" 2>/dev/null || true
+if [ "${BASE_RATE:-0}" -le 0 ] 2>/dev/null; then BASE_RATE="$RATE"; fi
+if [ "${BASE_CT:-0}" -le 0 ] 2>/dev/null; then BASE_CT="$CNT"; fi
+
+trig_rate=$(( BASE_RATE * MULT_IN )); [ "$trig_rate" -lt "$FLOOR_RATE" ] && trig_rate="$FLOOR_RATE"
+trig_ct=$(( BASE_CT * MULT_IN ));     [ "$trig_ct" -lt "$FLOOR_CT" ]     && trig_ct="$FLOOR_CT"
+exit_rate=$(( BASE_RATE * MULT_OUT )); [ "$exit_rate" -lt $(( FLOOR_RATE / 2 )) ] && exit_rate=$(( FLOOR_RATE / 2 ))
+exit_ct=$(( BASE_CT * MULT_OUT ));     [ "$exit_ct" -lt $(( FLOOR_CT / 2 )) ]     && exit_ct=$(( FLOOR_CT / 2 ))
+
+# v3.26.0 ss-phantom-ratio (acct-free, основной триггер).
+# v3.26.3 perf: дешёвый коарс-гейт. Фантомы раздувают conntrack, но НЕ число
+# established-сокетов (у connect-and-hold атакеров live=0). Полный (дорогой)
+# conntrack -L дамп в take_snap делаем ТОЛЬКО если суммарный conntrack заметно
+# больше числа живых сокетов (фантом-тяжело) ИЛИ мы уже в attack-mode. Иначе —
+# здоровая busy-нода: дорогой дамп пропускаем (строго меньше работы, детект не теряем).
+SNAP_FLOOR=$(( FLOOR_CT / 4 )); [ "$SNAP_FLOOR" -lt 2000 ] && SNAP_FLOOR=2000
+CT_INB=0; SS_LIVE=0; PHR=0
+PREV_MODE_PEEK=normal; [ -r "$MODE_F" ] && PREV_MODE_PEEK=$(cat "$MODE_F" 2>/dev/null || echo normal)
+if [ "$CNT" -ge "$SNAP_FLOOR" ] 2>/dev/null; then
+    # дешёвый сигнал: всего established-сокетов (одна лёгкая ss-выборка)
+    SS_TOTAL=$(ss -tnH state established 2>/dev/null | wc -l 2>/dev/null); SS_TOTAL="${SS_TOTAL:-0}"
+    if [ "$PREV_MODE_PEEK" = "attack" ] 2>/dev/null || [ "$CNT" -gt $(( (SS_TOTAL + 1) * COARSE_MULT )) ] 2>/dev/null; then
+        take_snap || true                                 # дорогой per-source conntrack -L + ss
+        CT_INB=$(awk '{s+=$1}END{print s+0}' "$RUN/ctg.ctsrc" 2>/dev/null); CT_INB="${CT_INB:-0}"
+        SS_LIVE=$(awk '{s+=$1}END{print s+0}' "$RUN/ctg.sslive" 2>/dev/null); SS_LIVE="${SS_LIVE:-0}"
+        PHR=$(awk -v t="$CT_INB" -v l="$SS_LIVE" 'BEGIN{printf "%d",(t>0?(t-l)*100/t:0)}')
+    else
+        # коарс-гейт решил: НЕ фантом-тяжело → дорогой дамп пропущен.
+        # PHR=0 для ТРИГГЕРА (мы уже judged not-heavy этим гейтом, грубый ratio
+        # на busy-прокси завышен из-за outbound-conntrack и НЕ должен тригерить attack).
+        SS_LIVE="$SS_TOTAL"; CT_INB=0; PHR=0
+    fi
+fi
+echo "$PHR" > "$RUN/ctguard.phr" 2>/dev/null || true            # v3.26.1: для дашборда guard
+echo "$SS_LIVE $CT_INB" > "$RUN/ctguard.live" 2>/dev/null || true
+
+PREV_MODE=normal; [ -r "$MODE_F" ] && PREV_MODE=$(cat "$MODE_F" 2>/dev/null || echo normal)
+
+ATTACK=0
+if [ "$RATE" -gt "$trig_rate" ] 2>/dev/null || [ "$CNT" -gt "$trig_ct" ] 2>/dev/null || [ "$PCT" -ge "$HIGH" ] 2>/dev/null \
+   || { [ "$PHR" -ge "$PHR_TRIG" ] 2>/dev/null && [ "$CT_INB" -ge "$SNAP_FLOOR" ] 2>/dev/null; }; then
+    ATTACK=1
+elif [ "$PREV_MODE" = "attack" ]; then
+    if [ "$RATE" -gt "$exit_rate" ] 2>/dev/null || [ "$CNT" -gt "$exit_ct" ] 2>/dev/null || [ "$PCT" -gt "$RECOVER" ] 2>/dev/null \
+       || { [ "$PHR" -ge "$PHR_TRIG" ] 2>/dev/null && [ "$CT_INB" -ge "$SNAP_FLOOR" ] 2>/dev/null; }; then
+        ATTACK=1
+    fi
+fi
+
+apply_cap(){  # глобальный кап new-conn на protected-порты (НЕ per-IP → safe для CDN/моста)
+    local cap="$1" ports; ports=$(protected_ports)
+    nft flush chain inet shield_ctguard capnew 2>/dev/null || true
+    [ -n "$ports" ] || { logger -t "$TAG" "WARN: protected_ports пуст — агрегатный кап не наложен"; return; }
+    local burst=$(( cap * 2 )); [ "$burst" -lt 100 ] && burst=100
+    nft add rule inet shield_ctguard capnew tcp dport "{ $ports }" ct state new \
+        limit rate over "${cap}/second" burst "${burst} packets" counter name ctguard_capdrop drop 2>/dev/null \
+        || logger -t "$TAG" "WARN: не наложил агрегатный кап (${cap}/s)"
+}
+clear_cap(){ nft flush chain inet shield_ctguard capnew 2>/dev/null || true; }
+
+phantom_evict(){  # v3.26.0: эвикт источников с conntrack ≫ живых сокетов (ss). acct-free, CGNAT-safe.
+    command -v conntrack >/dev/null 2>&1 || { logger -t "$TAG" "CRITICAL: conntrack-tool нет — эвикт недоступен (apt install conntrack)"; return; }
+    take_snap || { logger -t "$TAG" "WARN: snapshot не снят (conntrack/ss/protected_ports) — эвикт пропущен"; return; }
+    local evicted=0 ip ct live
+    while read -r ct ip; do
+        [ -n "${ip:-}" ] || continue
+        [ "${ct:-0}" -ge "$PH_MIN" ] 2>/dev/null || continue
+        live=$(awk -v ip="$ip" '$2==ip{print $1;exit}' "$RUN/ctg.sslive" 2>/dev/null); live="${live:-0}"
+        [ "$live" -gt "$ACTIVE_FLOOR" ] 2>/dev/null && continue           # много живых → shared-front/CGNAT → НЕ трогаем
+        awk -v l="$live" -v c="$ct" -v f="$LIVE_FRAC" 'BEGIN{exit !(c>0 && l*100/c < f)}' || continue  # live-доля < порога
+        is_protected "$ip" && continue
+        if [ "$ENFORCE" != "1" ]; then
+            logger -t "$TAG" "DRY: выселил бы $ip (conntrack=$ct live=$live)"
+            echo "$ip conntrack=$ct live=$live DRY $(date '+%F %T')" >> "$EVICT_F" 2>/dev/null || true
+            evicted=$((evicted+1)); continue
+        fi
+        if printf '%s' "$ip" | grep -q ':'; then
+            nft add element inet shield_ctguard evict6 "{ $ip timeout $EVICT_TTL }" 2>/dev/null || true
+        else
+            nft add element inet shield_ctguard evict4 "{ $ip timeout $EVICT_TTL }" 2>/dev/null || true
+        fi
+        conntrack -D -s "$ip" >/dev/null 2>&1 || true
+        [ "$CSCLI" = "1" ] && command -v cscli >/dev/null 2>&1 && cscli decisions add -i "$ip" -d "$CSCLI_TTL" -r "shieldnode phantom conn-flood" >/dev/null 2>&1 || true
+        echo "$ip conntrack=$ct live=$live $(date '+%F %T')" >> "$EVICT_F" 2>/dev/null || true
+        logger -t "$TAG" "EVICT $ip: conntrack=$ct live=$live (phantom-holder) — block ${EVICT_TTL} + conntrack -D"
+        evicted=$((evicted+1))
+    done < "$RUN/ctg.ctsrc"
+    if [ "$evicted" -eq 0 ]; then
+        logger -t "$TAG" "ATTACK-mode, но фантом-холдеров не найдено (за CDN/мостом / все live>0) — держим кап + reap по conntrack-таймауту"
+    fi
 }
 
-# ── RECOVERY: заполнение упало → снять все блокировки ──
-if [ "$PCT" -le "$RECOVER" ]; then
-    if [ "$PREV" != "0" ]; then
-        nft flush set inet shield_ctguard evict4 2>/dev/null || true
-        nft flush set inet shield_ctguard evict6 2>/dev/null || true
-        : > "$EVICT_F" 2>/dev/null || true
-        logger -t "$TAG" "RECOVERY: conntrack ${PCT}% (${CNT}/${MAX}) — evict-сет очищен, блокировки сняты"
-        echo 0 > "$TIER_F" 2>/dev/null || true
-    fi
-    exit 0
-fi
-
-# ── WARN: только алерт, без действий ──
-if [ "$PCT" -lt "$HIGH" ]; then
-    if [ "${PREV:-0}" -lt "$WARN" ] 2>/dev/null; then
-        logger -t "$TAG" "WARN: conntrack ${PCT}% (${CNT}/${MAX}) — приближается к лимиту, наблюдаю"
-    fi
+if [ "$ATTACK" = "1" ]; then
+    echo attack > "$MODE_F" 2>/dev/null || true
+    cap=$(( BASE_RATE * MULT_OUT )); [ "$cap" -lt "$FLOOR_RATE" ] && cap="$FLOOR_RATE"
+    apply_cap "$cap"
+    phantom_evict
+    [ "$PREV_MODE" != "attack" ] && logger -t "$TAG" "ATTACK ON: rate=${RATE}/s (base≈${BASE_RATE}, trig>${trig_rate}) conntrack=${CNT}(${PCT}%) phantom-ratio=${PHR}% (live=${SS_LIVE}/${CT_INB}) enforce=${ENFORCE} — кап new-conn=${cap}/s + phantom-эвикт"
     echo "$PCT" > "$TIER_F" 2>/dev/null || true
     exit 0
 fi
 
-# ── HIGH+: эвикт источников с аномальной долей conntrack ──
-logger -t "$TAG" "HIGH: conntrack ${PCT}% (${CNT}/${MAX}) — ищу источники >= ${EVICT_MIN} соединений"
-if ! command -v conntrack >/dev/null 2>&1; then
-    logger -t "$TAG" "CRITICAL: conntrack-tool не найден — не могу определить тяжёлые источники (apt install conntrack)"
-    echo "$PCT" > "$TIER_F" 2>/dev/null || true
-    exit 0
+# normal: восстановление + обучение базлайна
+if [ "$PREV_MODE" = "attack" ]; then
+    clear_cap
+    nft flush set inet shield_ctguard evict4 2>/dev/null || true
+    nft flush set inet shield_ctguard evict6 2>/dev/null || true
+    : > "$EVICT_F" 2>/dev/null || true
+    logger -t "$TAG" "RECOVERY: rate=${RATE}/s conntrack=${CNT}(${PCT}%) phantom-ratio=${PHR}% ниже порогов — кап снят, evict очищен"
 fi
-evicted=0
-while read -r c ip; do
-    [ -n "${ip:-}" ] || continue
-    [ "$c" -ge "$EVICT_MIN" ] 2>/dev/null || continue
-    if is_protected "$ip"; then
-        logger -t "$TAG" "skip whitelisted/infra $ip (${c} conns)"
-        continue
-    fi
-    if printf '%s' "$ip" | grep -q ':'; then
-        nft add element inet shield_ctguard evict6 "{ $ip timeout $EVICT_TTL }" 2>/dev/null || true
-    else
-        nft add element inet shield_ctguard evict4 "{ $ip timeout $EVICT_TTL }" 2>/dev/null || true
-    fi
-    conntrack -D -s "$ip" >/dev/null 2>&1 || true
-    echo "$ip $c $(date '+%F %T')" >> "$EVICT_F" 2>/dev/null || true
-    logger -t "$TAG" "EVICT: $ip держал ${c} соединений — заблокирован на ${EVICT_TTL} + conntrack очищен"
-    evicted=$((evicted+1))
-done < <(conntrack -L 2>/dev/null | grep -oE 'src=[0-9a-fA-F.:]+' | cut -d= -f2 | sort | uniq -c | sort -rn | head -50)
-
-if [ "$evicted" -eq 0 ]; then
-    logger -t "$TAG" "CRITICAL: conntrack ${PCT}%, но НЕТ источника >= ${EVICT_MIN} conns — вероятно РАСПРЕДЕЛЁННАЯ атака. Подними net.netfilter.nf_conntrack_max или блокируй вручную."
+echo normal > "$MODE_F" 2>/dev/null || true
+# EWMA только в normal (чтобы атака не отравляла норму)
+NB_RATE=$(awk -v o="$BASE_RATE" -v s="$RATE" -v a="$ALPHA_NUM" 'BEGIN{printf "%.0f", o*(100-a)/100 + s*a/100}')
+NB_CT=$(awk -v o="$BASE_CT" -v s="$CNT" -v a="$ALPHA_NUM" 'BEGIN{printf "%.0f", o*(100-a)/100 + s*a/100}')
+echo "$NB_RATE $NB_CT" > "$BASE_F" 2>/dev/null || true
+if [ "$PCT" -ge "$WARN" ] 2>/dev/null && [ "$PCT" -lt "$HIGH" ] 2>/dev/null; then
+    logger -t "$TAG" "WARN: conntrack ${PCT}% (${CNT}/${MAX}) — наблюдаю"
 fi
 echo "$PCT" > "$TIER_F" 2>/dev/null || true
 CTGUARD_EOF
@@ -3631,7 +3881,7 @@ systemctl daemon-reload 2>/dev/null || true
 if [ "$SHIELD_CTGUARD" = "1" ]; then
     systemctl enable --now shieldnode-ctguard.timer >/dev/null 2>&1 || true
     /usr/local/sbin/shieldnode-ctguard.sh >/dev/null 2>&1 || true
-    print_ok "conntrack-guard включён (эвикт при >= ${SHIELD_CT_HIGH_PCT}% заполнения, порог ${SHIELD_CT_EVICT_MIN} conns/IP, recovery <= ${SHIELD_CT_RECOVER_PCT}%)"
+    print_ok "conn-flood guard включён (v3.26: триггеры = ss-phantom-ratio ≥${SHIELD_CTG_PHANTOM_RATIO:-60}% / отклонение ×${SHIELD_CTG_MULT_IN:-4} по new-conn|conntrack / fill ≥${SHIELD_CT_HIGH_PCT:-90}%; ответ = агрегатный кап + phantom-эвикт по ЖИВЫМ сокетам; SHIELD_CTG_ENFORCE=${SHIELD_CTG_ENFORCE:-1})"
 else
     systemctl disable --now shieldnode-ctguard.timer >/dev/null 2>&1 || true
     print_info "conntrack-guard выключен (SHIELD_CTGUARD=0)"
@@ -4013,6 +4263,15 @@ fi
 NFT_ERR=$(nft -f "$TMP" 2>&1)
 if [ $? -eq 0 ]; then
     logger -t "$LOG_TAG" "Updated: TCP={$NEW_TCP} UDP={$NEW_UDP} MGMT={$NEW_MGMT_V4}"
+    # v3.26.1: синхронизируем synproxy sp_ports с новыми TCP-портами (если слой активен).
+    # sp_ports заполнялся один раз при install — без этого synproxy защищал бы старые
+    # порты после смены портов фаервола. Сет не пересоздаём → flags interval+auto-merge
+    # сохраняются (add element в существующий set авто-мёрджит пересечения).
+    if [ -n "$NEW_TCP" ] && nft list table inet shield_synproxy >/dev/null 2>&1; then
+        SYN_ERR=$(printf 'flush set inet shield_synproxy sp_ports\nadd element inet shield_synproxy sp_ports { %s }\n' "$(echo "$NEW_TCP" | sed 's/,/, /g')" | nft -f - 2>&1) \
+            && logger -t "$LOG_TAG" "synproxy sp_ports синхронизирован: {$NEW_TCP}" \
+            || logger -t "$LOG_TAG" "WARN: synproxy sp_ports sync failed: $SYN_ERR"
+    fi
 else
     logger -t "$LOG_TAG" "ERROR: nft failed: $NFT_ERR"
     exit 1
@@ -5632,12 +5891,32 @@ elif [ -f "$BOUNCER_CFG" ]; then
 fi
 
 systemctl enable --now crowdsec >/dev/null 2>&1 || true
+
+# v3.24.1: bouncer flap guard.
+# Релоады crowdsec выше рвут decision-стрим bouncer'а ("stream halted" → fatal →
+# systemd рестарт по кругу). Чтобы не поймать bouncer в момент флапа и не
+# напечатать ложное "НЕ active":
+#   1) дожидаемся готовности LAPI (агент должен отвечать),
+#   2) reset-failed (сбрасываем счётчик авто-рестартов) + чистый рестарт,
+#   3) проверяем is-active С РЕТРАЯМИ, а не одним снимком через 3с.
+for _i in $(seq 1 10); do
+    cscli lapi status >/dev/null 2>&1 && break
+    sleep 2
+done
+systemctl reset-failed crowdsec-firewall-bouncer 2>/dev/null || true
 systemctl restart crowdsec-firewall-bouncer >/dev/null 2>&1 || \
     systemctl enable --now crowdsec-firewall-bouncer >/dev/null 2>&1 || true
 
-sleep 3
+BOUNCER_OK=0
+for _i in $(seq 1 8); do
+    sleep 2
+    if systemctl is-active --quiet crowdsec-firewall-bouncer; then BOUNCER_OK=1; break; fi
+    # ещё не active — мог флапнуть на последнем reload; мягкий повторный старт
+    systemctl reset-failed crowdsec-firewall-bouncer 2>/dev/null || true
+    systemctl start crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+done
 
-if systemctl is-active --quiet crowdsec && systemctl is-active --quiet crowdsec-firewall-bouncer; then
+if systemctl is-active --quiet crowdsec && [ "$BOUNCER_OK" = "1" ]; then
     print_ok "crowdsec + bouncer активны"
 else
     print_warn "Один из сервисов не active:"
@@ -6955,6 +7234,22 @@ HELP
             ISSUES=$((ISSUES + 1))
         fi
 
+        # 2.5 ctguard (v3.26.3): таймер жив? heartbeat свежий (тик каждые 15с)?
+        if systemctl is-active --quiet shieldnode-ctguard.timer; then
+            hb=$(cat /run/shieldnode/ctguard.heartbeat 2>/dev/null || echo 0)
+            age=$(( $(date +%s) - ${hb:-0} ))
+            if [ "${hb:-0}" -le 0 ]; then
+                echo "  [i] ctguard: timer активен, heartbeat ещё нет (свежий старт?)"
+            elif [ "$age" -le 60 ]; then
+                echo "  [✓] ctguard: active (last tick ${age}s ago)"
+            else
+                echo "  [⚠] ctguard: heartbeat ${age}s назад (>60s) — тик залип? journalctl -t shieldnode-ctguard"
+                ISSUES=$((ISSUES + 1))
+            fi
+        else
+            echo "  [i] ctguard: timer не активен (SHIELD_CTGUARD=0?)"
+        fi
+
         # 3. CrowdSec
         if systemctl is-active --quiet crowdsec; then
             echo "  [✓] crowdsec: active"
@@ -7343,6 +7638,9 @@ collect_stats() {
     # v3.5: HTTP/conn-flood counters
     read CONN_FLOOD_PKTS_V4 CONN_FLOOD_BYTES_V4 <<< "$(read_counter conn_flood_v4)"
     read NEWCONN_FLOOD_PKTS_V4 NEWCONN_FLOOD_BYTES_V4 <<< "$(read_counter newconn_flood_v4)"
+    # v3.26.3: ctguard-слой дропает в СВОЕЙ таблице shield_ctguard — включаем в тоталы.
+    CTG_EVICT_PKTS=$(nft list counter inet shield_ctguard ctguard_drops 2>/dev/null | grep -oE 'packets [0-9]+' | grep -oE '[0-9]+' | head -1); CTG_EVICT_PKTS="${CTG_EVICT_PKTS:-0}"
+    CTG_CAP_PKTS=$(nft list counter inet shield_ctguard ctguard_capdrop 2>/dev/null | grep -oE 'packets [0-9]+' | grep -oE '[0-9]+' | head -1); CTG_CAP_PKTS="${CTG_CAP_PKTS:-0}"
     read TCP_INVALID_PKTS TCP_INVALID_BYTES <<< "$(read_counter tcp_invalid)"
     # v3.21.0: SSH pre-auth flood counters
     read SSH_CONN_FLOOD_PKTS_V4 SSH_CONN_FLOOD_BYTES_V4 <<< "$(read_counter ssh_conn_flood_v4)"
@@ -7595,6 +7893,24 @@ draw_snapshot() {
         echo ""
     fi
 
+    # ===== CTGUARD REAL DROPS (v3.26.1) =====
+    # Новый ctguard-слой дропает в СВОЕЙ таблице shield_ctguard — guard раньше
+    # читал счётчики только из ddos_protect, поэтому фантом-эвикт/кап не были видны.
+    if nft list table inet shield_ctguard >/dev/null 2>&1; then
+        local ctg_mode ctg_phr ctg_evd ctg_capd ctg_col="${G}"
+        ctg_mode=$(cat /run/shieldnode/ctguard.mode 2>/dev/null || echo normal)
+        ctg_phr=$(cat /run/shieldnode/ctguard.phr 2>/dev/null || echo 0)
+        ctg_evd=$(nft list counter inet shield_ctguard ctguard_drops 2>/dev/null | grep -oE 'packets [0-9]+' | grep -oE '[0-9]+' | head -1); ctg_evd="${ctg_evd:-0}"
+        ctg_capd=$(nft list counter inet shield_ctguard ctguard_capdrop 2>/dev/null | grep -oE 'packets [0-9]+' | grep -oE '[0-9]+' | head -1); ctg_capd="${ctg_capd:-0}"
+        [ "$ctg_mode" = "attack" ] && ctg_col="${R}"
+        printf "  ${B}ctguard${N}     ${ctg_col}%s${N} ${DIM}phantom-ratio${N} %s%%   ${DIM}phantom-evict${N} %s ${DIM}pkts${N}   ${DIM}cap${N} %s ${DIM}pkts${N}\n" \
+            "$ctg_mode" "$ctg_phr" "$(human_num "$ctg_evd")" "$(human_num "$ctg_capd")"
+    fi
+    # ===== SYNPROXY (v3.26.1) =====
+    if nft list table inet shield_synproxy >/dev/null 2>&1; then
+        printf "  ${B}synproxy${N}    ${G}active${N} ${DIM}(SYN перехват до conntrack)${N}\n"
+    fi
+
     # ===== PROTECTED PORTS =====
     echo -e "  ${B}Protected${N}"
     printf  "  ├─ ${DIM}TCP:${N}  ${C}%s${N}\n" "$PROTECTED_TCP_LIST"
@@ -7625,7 +7941,7 @@ draw_snapshot() {
     fi
 
     # ===== TODAY (drops / bytes) =====
-    local total_pkts=$((SCANNER_PKTS_V4 + TOR_PKTS_V4 + THREAT_PKTS_V4 + CUSTOM_PKTS_V4 + CONFIRMED_PKTS_V4 + SYN_CONF_PKTS_V4 + UDP_CONF_PKTS_V4 + CONN_FLOOD_PKTS_V4 + NEWCONN_FLOOD_PKTS_V4 + TCP_INVALID_PKTS + SSH_CONN_FLOOD_PKTS_V4 + SSH_NEWCONN_FLOOD_PKTS_V4))
+    local total_pkts=$((SCANNER_PKTS_V4 + TOR_PKTS_V4 + THREAT_PKTS_V4 + CUSTOM_PKTS_V4 + CONFIRMED_PKTS_V4 + SYN_CONF_PKTS_V4 + UDP_CONF_PKTS_V4 + CONN_FLOOD_PKTS_V4 + NEWCONN_FLOOD_PKTS_V4 + TCP_INVALID_PKTS + SSH_CONN_FLOOD_PKTS_V4 + SSH_NEWCONN_FLOOD_PKTS_V4 + ${CTG_EVICT_PKTS:-0} + ${CTG_CAP_PKTS:-0}))
     local total_bytes=$((SCANNER_BYTES_V4 + TOR_BYTES_V4 + THREAT_BYTES_V4 + CUSTOM_BYTES_V4 + CONFIRMED_BYTES_V4 + SYN_CONF_BYTES_V4 + UDP_CONF_BYTES_V4 + CONN_FLOOD_BYTES_V4 + NEWCONN_FLOOD_BYTES_V4 + TCP_INVALID_BYTES + SSH_CONN_FLOOD_BYTES_V4 + SSH_NEWCONN_FLOOD_BYTES_V4))
 
     echo -e "  ${B}Drops since reboot${N} ${DIM}($NFT_SINCE)${N}"
@@ -7647,6 +7963,10 @@ draw_snapshot() {
     printf  "  ├─ ${DIM}ssh conn-flood${N}      %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$SSH_CONN_FLOOD_PKTS_V4")" "$(human_bytes "$SSH_CONN_FLOOD_BYTES_V4")"
     printf  "  ├─ ${DIM}ssh new-conn flood${N}  %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$SSH_NEWCONN_FLOOD_PKTS_V4")" "$(human_bytes "$SSH_NEWCONN_FLOOD_BYTES_V4")"
     printf  "  ├─ ${DIM}TCP flag invalid${N}    %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$TCP_INVALID_PKTS")" "$(human_bytes "$TCP_INVALID_BYTES")"
+    if nft list table inet shield_ctguard >/dev/null 2>&1; then
+        printf  "  ├─ ${DIM}ctguard phantom-evict${N} %10s pkts\n" "$(human_num "${CTG_EVICT_PKTS:-0}")"
+        printf  "  ├─ ${DIM}ctguard cap${N}         %12s pkts\n"   "$(human_num "${CTG_CAP_PKTS:-0}")"
+    fi
     printf  "  └─ ${B}total${N}               ${B}%12s${N} pkts  ${DIM}/${N} ${B}%s${N}\n" "$(human_num "$total_pkts")" "$(human_bytes "$total_bytes")"
     echo ""
 
