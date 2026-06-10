@@ -1,6 +1,36 @@
 #!/bin/bash
 
 # ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.28.2 — FIX отображения v6 в guard
+#
+#  В строке "blocklists" дашборда вокруг счётчика v6 печатался сырой
+#  "\033[0;36m...\033[0m" вместо цвета. Причина: цветовые коды (${C}/${N})
+#  встраивались в переменную bl_summary, а она выводилась через printf "%s" —
+#  в %s-аргументе printf escape-последовательности НЕ интерпретируются (в отличие
+#  от формат-строки). Фикс: вывод через %b (как echo -e). Косметика, на защиту
+#  не влияет. Баг существовал с v3.27.0 (когда добавили суммарный v6-счётчик).
+#
+# ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.28.1 — ИНТЕРАКТИВНЫЙ ВЫБОР WHITELIST'А НОД
+#
+#  При установке (ДО долгих apt-операций) скрипт теперь СПРАШИВАЕТ, как
+#  whitelist'ить ноды флота:
+#    1) Remnawave токен — авто-дискавери всех нод (рекомендуется);
+#    2) Вручную IP нод/бриджей (TRUSTED_IPS);
+#    3) Пропустить (настроить позже).
+#  Раньше токен/IP надо было знать заранее и передавать через env/conf — теперь
+#  достаточно запустить установку и ответить на вопрос.
+#
+#  Детали:
+#    - Спрашиваем ТОЛЬКО на свежей ноде: если уже сконфигурено (REMNAWAVE_URL+TOKEN
+#      в env/conf, или есть /etc/shieldnode/remnawave.env, или задан TRUSTED_IPS) —
+#      промпт пропускается (апгрейды не переспрашивают).
+#    - В pipe-режиме (curl|bash) stdin=pipe, поэтому читаем с /dev/tty; токен —
+#      скрытым вводом (read -rs). URL валидируется (http(s)://…).
+#    - Headless/CI (нет управляющего терминала) → тихо пропускаем, работает env
+#      (поведение прежнее). Отключить промпт: SHIELD_WL_PROMPT=0.
+#
+# ==============================================================================
 #  VPN NODE DDoS PROTECTION v3.28.0 — REMNAWAVE FLEET AUTO-SYNC
 #
 #  Боль: при ручном whitelist'е (TRUSTED_IPS/BRIDGE_IPS) добавление новой ноды
@@ -633,7 +663,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.28.0"
+SHIELDNODE_VERSION="3.28.2"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -1287,6 +1317,69 @@ mkdir -p /etc/shieldnode 2>/dev/null
 # v3.18.11 SH-NEW-1: используем shield_safe_source (определена выше).
 if [ -r "$PREINSTALL_CONF" ]; then
     shield_safe_source "$PREINSTALL_CONF"
+fi
+
+# ============================================================================
+# v3.28.1: интерактивный выбор метода whitelist'а нод флота (ПЕРЕД установкой).
+#   Спрашиваем РАНО (до apt/долгих операций), чтобы оператор ответил и ушёл.
+#   1) Remnawave токен → авто-дискавери всех нод (новую ноду добавил в панель →
+#      все ноды подхватят сами). 2) Вручную IP нод/бриджей (TRUSTED_IPS). 3) Skip.
+#   Показываем ТОЛЬКО если ещё не сконфигурено (env/conf/remnawave.env/TRUSTED_IPS),
+#   синк не выключен жёстко и есть управляющий терминал. В headless/CI (нет /dev/tty)
+#   — тихо пропускаем (работает env). В pipe-режиме (curl|bash) stdin=pipe → /dev/tty.
+# ============================================================================
+shield_have_tty(){ { true >/dev/tty; } 2>/dev/null && [ -r /dev/tty ]; }
+_wl_have_token=0
+{ [ -n "${REMNAWAVE_URL:-}" ] && [ -n "${REMNAWAVE_TOKEN:-}" ]; } && _wl_have_token=1
+[ -r /etc/shieldnode/remnawave.env ] && _wl_have_token=1
+_wl_have_trusted=0; [ -n "${TRUSTED_IPS:-}" ] && _wl_have_trusted=1
+
+if [ "$_wl_have_token" = "0" ] && [ "$_wl_have_trusted" = "0" ] && \
+   [ "${SHIELD_REMNAWAVE_SYNC:-auto}" != "0" ] && [ "${SHIELD_WL_PROMPT:-1}" = "1" ] && \
+   shield_have_tty; then
+    {
+        printf '\n─── Whitelist нод флота (бриджей) ───\n'
+        printf 'Чтобы ноды/бриджи не резались лимитами, их IP должны быть в whitelist.\n'
+        printf '  1) Remnawave токен  — авто: тянем IP всех нод из панели и держим\n'
+        printf '                        актуальными. Новую ноду добавил в панель →\n'
+        printf '                        все ноды подхватят сами. (рекомендуется)\n'
+        printf '  2) Вручную IP       — перечислить IP нод/бриджей (TRUSTED_IPS).\n'
+        printf '  3) Пропустить       — настрою позже (sudo guard → settings).\n'
+        printf 'Выбор [1/2/3] (Enter=3): '
+    } > /dev/tty
+    read -r _wl_choice < /dev/tty || _wl_choice=""
+    case "${_wl_choice:-3}" in
+        1)
+            printf 'URL панели Remnawave (https://panel.example.com): ' > /dev/tty
+            read -r _rw_url < /dev/tty || _rw_url=""
+            printf 'API-токен (Remnawave Settings → API Tokens; ввод скрыт): ' > /dev/tty
+            read -rs _rw_tok < /dev/tty || _rw_tok=""
+            printf '\n' > /dev/tty
+            _rw_url="$(printf '%s' "$_rw_url" | tr -d '[:space:]')"
+            if printf '%s' "$_rw_url" | grep -qiE '^https?://[^/]' && [ -n "$_rw_tok" ]; then
+                REMNAWAVE_URL="$_rw_url"; REMNAWAVE_TOKEN="$_rw_tok"
+                export REMNAWAVE_URL REMNAWAVE_TOKEN
+                print_ok "Remnawave fleet-sync будет включён — IP нод панели подтянутся в whitelist автоматически"
+            else
+                print_warn "URL должен быть http(s)://… и токен не пустым — пропускаю. Включить позже: env REMNAWAVE_URL/REMNAWAVE_TOKEN при reinstall, либо sudo guard."
+            fi
+            ;;
+        2)
+            printf 'IP нод/бриджей через запятую (1.2.3.4,5.6.7.8): ' > /dev/tty
+            read -r _tr_ips < /dev/tty || _tr_ips=""
+            _tr_ips="$(printf '%s' "$_tr_ips" | tr -d '[:space:]')"
+            if [ -n "$_tr_ips" ]; then
+                TRUSTED_IPS="$_tr_ips"; export TRUSTED_IPS
+                print_ok "TRUSTED_IPS принят: $TRUSTED_IPS (применю к whitelist/UFW/CrowdSec)"
+                print_info "Подсказка: вариант (1) с токеном избавил бы от ручного обновления IP на каждой ноде"
+            else
+                print_info "IP не введены — whitelist нод пропущен"
+            fi
+            ;;
+        *)
+            print_info "Whitelist нод пропущен — настроишь позже (sudo guard → settings, либо env REMNAWAVE_TOKEN при reinstall)"
+            ;;
+    esac
 fi
 
 # v3.20.5: panel auto-detect через docker ps удалён.
@@ -8642,7 +8735,9 @@ draw_snapshot() {
         BL_V6_TOTAL=$(( BL_V6_TOTAL + ${_n:-0} ))
     done
     [ "$BL_V6_TOTAL" -gt 0 ] 2>/dev/null && bl_summary+=", ${C}v6=$(human_num "$BL_V6_TOTAL")${N}"
-    printf  "  └─ ${DIM}blocklists${N}          %s\n" "$bl_summary"
+    # v3.28.2 FIX: %b (не %s) — bl_summary содержит ${C}/${N} (=\033[..]); в %s-аргументе
+    # printf escape НЕ интерпретирует → раньше печатался сырой "\033[0;36m" вокруг v6.
+    printf  "  └─ ${DIM}blocklists${N}          %b\n" "$bl_summary"
     # v3.20.0+: mobile-RU и broadband-RU whitelist строки УБРАНЫ (whitelist'ы удалены)
     echo ""
 
