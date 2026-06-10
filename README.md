@@ -38,7 +38,7 @@ Kernel-tuning (BBR, qdisc, сетевые буферы, sizing conntrack) — **
 4. **TCP flag sanity** — drop XMAS / NULL / SYN+FIN / SYN+RST.
 5. **blocklists** — scanner / threat / tor / custom → drop.
 6. **SSH pre-auth** — ct=5 + 8/min, ещё до того как пакет дойдёт до sshd.
-7. **rate-limits** — conn-flood / newconn / syn / udp с архитектурой **ban-once**.
+7. **rate-limits** — conn-flood / newconn / syn / udp с архитектурой **ban-once**. v3.27: при `SHIELD_CGNAT_SAFE=1` (дефолт) превышение per-IP лимита режет только избыточные пакеты (rate-shape) + лог, но **не** эскалирует общий CGNAT-IP в 15-мин blackhole. Опц. глобальный backstop new-conn/с (`SHIELD_GLOBAL_NEWCONN_CEIL`, дефолт off — для не-CGNAT нод против распределённого handshake-флуда).
 
 Изолированно, в **отдельных** nft-таблицах (не трогают `ddos_protect`, откат = удаление таблицы):
 
@@ -49,7 +49,7 @@ Kernel-tuning (BBR, qdisc, сетевые буферы, sizing conntrack) — **
 
 ---
 
-## conntrack-guard / phantom-защита (v3.26)
+## conntrack-guard / phantom-защита (v3.26, уточнено в v3.27)
 
 **Проблема — распределённый connect-and-hold флуд.** Сотни IP открывают тысячи TCP-соединений, проходят handshake и **бросают** их. Записи висят в conntrack, приложение (xray) захлёбывается — при этом conntrack-таблица может быть заполнена лишь на 7–20%, так что классический «fill ≥90%» триггер молчит. Per-IP-порог тоже бесполезен: пик атаки (~1800–2300 conn/IP) **пересекается** с легит-CGNAT-потолком (~2200 conn/IP) — счётчиком не разделить.
 
@@ -61,6 +61,7 @@ Kernel-tuning (BBR, qdisc, сетевые буферы, sizing conntrack) — **
 - **CGNAT-safe by design:** эвикт щадит источник при любом из условий — живых сокетов > порога (shared-front/CGNAT), live-доля выше порога, conntrack < `PHANTOM_MIN` (=4000 по умолчанию, выше легит-CGNAT-churn ~2200), или IP в whitelist. Чистый мобильный churn (нет холдера) в attack-mode **не входит вообще** — ни эвикта, ни капа, ни спама.
 - **sysctl:** `nf_conntrack_tcp_timeout_established=1800` (брошенные фантомы дохнут за 30 мин вместо 5 суток; живые сессии с keepalive переживают).
 - **Производительность:** дешёвый коарс-гейт — дорогой полный дамп `conntrack -L` запускается только если `conntrack ≫ ss_total` (фантом-тяжело) или мы уже в attack-mode. Здоровая busy-нода не платит за дамп каждый тик.
+- **Уточнения v3.27:** глобальный кап входит по **скользящему окну** аномалий (`SHIELD_CTG_ANOM_WINDOW`) — атака «вкл/выкл» (pulsing) от капа не уходит, а одиночный легит-всплеск кап НЕ включает. Против **распределённого** connect-and-hold (много IP по чуть-чуть) добавлен 2-й проход эвикта с порогом ниже, но строго при `live==0` (CGNAT с активными юзерами щадится), только в sustained-attack. EWMA не обучается во время аномалии (анти-poison базлайна).
 
 **Раскат — observe → enforce.** По умолчанию `SHIELD_CTG_ENFORCE=1`, но для осторожного ввода на новой ноде поставь `0` (только лог), убедись по `journalctl -t shieldnode-ctguard`, что в кандидатах только атакеры (live=0), затем включи:
 
@@ -78,9 +79,10 @@ sudo systemctl restart shieldnode-ctguard
 Когда флуд незавершённых SYN забивает conntrack — нода превращается в чёрную дыру (`nf_conntrack: table full`). SYNPROXY это закрывает: SYN перехватывается **до** conntrack, проходит syncookie-хендшейк, запись создаётся только после полного 3-way.
 
 - Модуль `shieldnode-synproxy.sh`, таблица `inet shield_synproxy`. Включён по умолчанию (`SHIELD_SYNPROXY=1`).
-- Безопасно: ядро не поддерживает → авто-fallback на `ddos_protect`; на стоковых ядрах авто-доустановка `linux-modules-extra-$(uname -r)` (на XanMod встроен); verify mss/wscale живого бэкенда + авто-откат при несовпадении.
+- Безопасно: ядро не поддерживает → авто-fallback на `ddos_protect`; на стоковых ядрах авто-доустановка `linux-modules-extra-$(uname -r)` (на XanMod встроен); verify mss/wscale живого бэкенда + авто-откат при несовпадении. При неудаче включения — **fail-loud** (v3.27.0): маркер `/var/lib/shieldnode/.synproxy-degraded` + ALERT в install/journald + индикатор `DEGRADED` в `guard` (молча на слабую защиту не падаем).
+- **Покрывает и SSH-порт** (v3.27.1, `SHIELD_SYNPROXY_SSH=1`): спуф-SYN на SSH иначе тёк бы conntrack (SSH не в protected-портах → не под synproxy/ctguard-капом). Прозрачно для легит-хендшейков, established SSH не рвётся. Выключить: `SHIELD_SYNPROXY_SSH=0`.
 - Требует ядро **≥5.14** + модуль `nf_synproxy`. Переживает ребут. Выключить: `SHIELD_SYNPROXY=0` или `sudo shieldnode-synproxy.sh off`.
-- Порты синхронятся с фаерволом (ports-watcher держит `sp_ports` в актуальном состоянии).
+- Порты синхронятся с фаерволом (ports-watcher держит `sp_ports` в актуальном состоянии, SSH-порт сохраняется при смене портов).
 
 ---
 
@@ -105,13 +107,29 @@ sudo systemctl restart shieldnode-ctguard
 ## Блоклисты
 
 - **scanner** — Shodan / Censys / госсканеры РФ.
-- **threat** — Spamhaus DROP + FireHOL Level 1 + Feodotracker (high-confidence, ~7–8k IP, bogon-фильтр min /16).
+- **threat** — Spamhaus DROP (JSON `drop_v4.json` + `drop_v6.json`) + FireHOL Level 1 (high-confidence, bogon-фильтр: v4 min /16, v6 min /29). *Feodotracker убран в v3.27.2* — датасет abuse.ch сейчас пуст + введён обязательный `Auth-Key` (с 30.06.2025) + миграция под Spamhaus → отдавал ~0 IP и ломался бы на 401.
 - **tor** — Tor exit nodes (опционально, `BLOCK_TOR=1`).
 - **custom** — личный список оператора.
+
+**IPv6-блоклисты (v3.27.0+):** у каждого набора есть v6-параллель (`scanner_blocklist_v6`, `threat_blocklist_v6`, `custom_blocklist_v6`, `tor_exit_blocklist_v6`). Апдейтер парсит v6-CIDR из тех же фидов (префикс-флор + bogon/ULA/link-local/multicast/doc-фильтр + структурная валидация), применяет **отдельной nft-транзакцией** (битый v6 не ломает v4) и только если v6-сет существует (backward-compat). Spamhaus `drop_v6.json` реально наполняет `threat_blocklist_v6`. v6 drop-правила активны, только если на ноде есть публичный IPv6 (см. «IPv6» ниже).
 
 **custom** собирается из трёх источников: `lists/custom.txt` (синк с GitHub каждые 6 ч) + `custom-local.txt` (локальные дополнения, не перезаписываются) + auto-promote.
 
 **Auto-promote:** IP с count ≥ 800 за 24 ч (conn/syn/udp-escalate) попадает в `custom-local.txt` навсегда. TTL 90 дней — запись удаляется, если IP не атакует > 30 дней. Перед каждым промоутом — cross-check с CrowdSec whitelist.
+
+---
+
+## IPv6
+
+v6-защита **включается автоматически**, если при установке найден публичный IPv6 (`ip -6 addr show scope global`). Когда включена:
+
+- established v6 пропускается; **v6-блоклисты** (threat/scanner/tor/custom `_v6`) → drop — раньше остального (бьют и SSH-over-v6);
+- новые v6-конны на VPN-порты → **DROP** (клиенты идут по v4/CGNAT). Опц. `SHIELD_V6_REJECT=1` → **RST** вместо тихого drop → мгновенный happy-eyeballs fallback на v4 без SYN-timeout;
+- SSH-over-v6 под тем же pre-auth rate-limit, что и v4.
+
+Это **базовая защита (P0-1)**: покрывает VPN-порты, SSH и блоклисты, но **не** произвольные порты / ICMPv6 / общий conntrack — полноценный v6 rate-limit в планах.
+
+> **Важно для «v4-only» нод.** conntrack-таблица **общая для v4 и v6**. Многие провайдеры авто-выдают публичный IPv6, даже если ты «пользуешься только v4» — тогда хост достижим по v6, и v6-флуд грузит **общие** conntrack/CPU/канал (деградация v4 через общий лимит). Базовая v6-защита это не закрывает полностью. Хочешь честно v4-only — **выключи v6 в ядре** (`net.ipv6.conf.all.disable_ipv6=1` + `default.disable_ipv6=1`) или дропай весь v6 на edge. Сначала проверь: `ip -6 addr show scope global`. Детект v6 — в момент install (v6, добавленный позже, не увидится до reinstall).
 
 ---
 
@@ -139,7 +157,9 @@ sudo guard sync       # синк custom.txt прямо сейчас
 sudo guard self-test  # быстрые проверки ноды
 ```
 
-Дашборд показывает **реальные дропы всех слоёв**, включая `ctguard phantom-evict` и `cap` (отдельная таблица), режим ctguard (normal/**attack**) и `phantom-ratio`, статус SYNPROXY, conntrack %, блоклисты, top-attackers. `self-test` проверяет в т.ч. heartbeat ctguard (детект залипшего таймера).
+Дашборд показывает **реальные дропы всех слоёв**, включая `ctguard phantom-evict` и `cap` (отдельная таблица), режим ctguard (normal/**attack**) и `phantom-ratio`, статус SYNPROXY (вкл. `DEGRADED`), conntrack %, блоклисты (вкл. суммарный v6-счётчик), top-attackers с ASN/владельцем. `self-test` проверяет в т.ч. heartbeat ctguard (детект залипшего таймера).
+
+> ASN/владелец для top-attackers резолвится через **Team Cymru whois** (v3.27.2, заменил legacy ipinfo.io: без ключа/квоты, без утечки IP коммерческому geoIP). Нужен пакет `whois` (ставится best-effort; нет → колонка владельца «?», без лагов). Кэш в `events.db`, TTL 7 дней. Это read-only интел для оператора — на блокировки не влияет.
 
 Интерактивное меню: `[2]` CrowdSec bans, `[3]` whitelist, `[6]` recent history, `[7]` top attackers (all-time), `[8]` unban all, `[s]` settings.
 
@@ -147,8 +167,8 @@ sudo guard self-test  # быстрые проверки ноды
 
 ## Конфигурация
 
-- `/etc/shieldnode/limits.conf` — все лимиты + ручки ctguard (`SHIELD_CTG_ENFORCE`, `SHIELD_CTG_LIVE_FRAC`, `SHIELD_CTG_PHANTOM_RATIO`, `SHIELD_CTG_PHANTOM_MIN`, `SHIELD_CTG_AGG_CAP`, `SHIELD_CTG_ACTIVE_FLOOR`, `SHIELD_CTG_CT_MAX_CEIL`, `SHIELD_CTG_COARSE_MULT`). Файл sourced'ится с проверкой прав (root:root, 0640).
-- `/etc/shieldnode/shieldnode.conf` — фичи: `SHIELD_SYNPROXY`, `SHIELD_CTGUARD`, `BLOCK_TOR`, `TRUSTED_IPS` (single IP и CIDR), и др.
+- `/etc/shieldnode/limits.conf` — все лимиты + ручки ctguard (`SHIELD_CTG_ENFORCE`, `SHIELD_CTG_LIVE_FRAC`, `SHIELD_CTG_PHANTOM_RATIO`, `SHIELD_CTG_PHANTOM_MIN`, `SHIELD_CTG_AGG_CAP`, `SHIELD_CTG_ACTIVE_FLOOR`, `SHIELD_CTG_CT_MAX_CEIL`, `SHIELD_CTG_COARSE_MULT`). v3.27: `SHIELD_CGNAT_SAFE` (превышение per-IP лимита режет только избыток, не банит общий CGNAT-IP — дефолт 1), `SHIELD_CTG_ANOM_WINDOW` (анти-pulsing скользящее окно), `SHIELD_GLOBAL_NEWCONN_CEIL` (opt-in глобальный backstop new-conn/с на protected-TCP, дефолт 0 — для НЕ-CGNAT нод), `SHIELD_CTG_CT_RAM_PCT` (потолок авто-роста conntrack от RAM — анти-OOM). Файл sourced'ится с проверкой прав (root:root, 0640).
+- `/etc/shieldnode/shieldnode.conf` — фичи: `SHIELD_SYNPROXY`, `SHIELD_SYNPROXY_SSH` (synproxy и для SSH, дефолт 1), `SHIELD_CTGUARD`, `BLOCK_TOR`, `SHIELD_V6_REJECT` (RST вместо drop для v6-TCP на VPN-портах, дефолт 0), `TRUSTED_IPS` (single IP и CIDR), и др.
 
 После изменения лимитов: `sudo systemctl restart shieldnode-nftables.service` (для nft) и `sudo systemctl restart shieldnode-ctguard` (для ctguard), либо `sudo guard upgrade`.
 
@@ -174,6 +194,12 @@ curl -fL https://raw.githubusercontent.com/SpofyJet/shield/main/shieldnode.sh | 
 ---
 
 ## Изменения (последние)
+
+- **v3.27.2** — актуализация внешних фидов/API (сам код свежий, но третьи стороны поменялись в 2024–2025). **Feodotracker убран** из `threat` (датасет abuse.ch пуст + обязательный `Auth-Key` с 06.2025 + миграция под Spamhaus). **Spamhaus DROP: txt → JSON** (`drop_v4.json` + `drop_v6.json`; txt у Spamhaus на пути к deprecation) — JSON парсится существующей jq-веткой; `drop_v6.json` теперь наполняет `threat_blocklist_v6`. **ASN-lookup в `guard`: ipinfo.io → Team Cymru whois** (без ключа/квоты, без утечки IP коммерческому geoIP; пакет `whois` best-effort). Удалён мёртвый `SHIELD_CT_EVICT_MIN`. v6 threat-флор /32→/29 (под Spamhaus drop_v6). Рантайм-тулчейн (nftables/conntrack/iproute2/systemd/curl/sqlite3/jq/python3/crowdsec) — актуален, дрейф был только во внешних data-feeds.
+
+- **v3.27.1** — red-team раунд 2, закрыто без риска для CGNAT. **Анти-pulsing**: дебаунс капа переведён со строго-последовательного счётчика на **скользящее окно** (`SHIELD_CTG_ANOM_WINDOW`, ≥N аномалий в окне) — атака «вкл/выкл» больше не уходит от глобального капа; одиночный всплеск по-прежнему кап НЕ включает (анти-FP сохранён). **SYNPROXY покрывает SSH** (`SHIELD_SYNPROXY_SSH=1`) — спуф-SYN на SSH-порт больше не течёт conntrack.
+
+- **v3.27.0** — red-team раунд 1: закрыто 11 дыр без регрессий для CGNAT. **CGNAT-safe rate-shape** (`SHIELD_CGNAT_SAFE=1`): превышение per-IP лимита режет избыток, не банит общий CGNAT-IP. **conntrack анти-OOM**: авто-рост `nf_conntrack_max` ограничен % от RAM (`SHIELD_CTG_CT_RAM_PCT`). **ctguard капает и UDP** в attack-mode (спуф/распределённый UDP). **ctguard CPU-приоритет** понижен (не отбирает CPU у xray под атакой). **Распределённый connect-and-hold**: 2-й проход эвикта (`live==0`, CGNAT щадится). **SYNPROXY fail-loud** (degraded-маркер + `DEGRADED` в guard). **bridge/whitelist-drift advisory** в guard. **IPv6 threat-feeds (#7)**: v6-параллели блоклистов + v6 drop-правила + v6-парсинг апдейтера (отдельной транзакцией). v6 happy-eyeballs (`SHIELD_V6_REJECT`). Опц. глобальный new-conn ceiling (`SHIELD_GLOBAL_NEWCONN_CEIL`, для не-CGNAT). Аггрегатор: cap журнала на тик (анти-OOM).
 
 - **v3.26.5** — авто-апгрейд зависимостей при install/upgrade: управляемые apt-пакеты (nftables, conntrack, iproute2, tcpdump, sqlite3, jq, curl, zstd, xz-utils, `crowdsec` + firewall-bouncer) держатся на последней версии репо (security-патчи). Апгрейд только если репо-версия строго новее (downgrade исключён через `--only-upgrade`). Foreign-CrowdSec не трогается (только подсказка). Заморозить: `SHIELD_UPGRADE_DEPS=0`.
 

@@ -1,6 +1,120 @@
 #!/bin/bash
 
 # ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.27.2 — DEPENDENCY/FEED CURRENCY
+#
+#  Внешние фиды/API дрейфанули в 2024–2025 (сам код свежий, но третьи стороны
+#  поменялись) — приведено к актуальному:
+#    FEED#1 abuse.ch Feodo УБРАН из threat: датасет сейчас пустой + abuse.ch ввёл
+#           обязательный Auth-Key (30 июня 2025) и мигрирует под Spamhaus → отдавал
+#           ~0 IP и ломался бы на 401. Убран мёртвый груз.
+#    FEED#2 Spamhaus DROP: drop.txt → drop_v4.json + drop_v6.json. Текстовые файлы
+#           Spamhaus на пути к deprecation, рекомендован JSON (+jq). JSON парсится
+#           существующей jq-веткой апдейтера (расширена на v6); drop_v6.json теперь
+#           КОРМИТ threat_blocklist_v6 (раньше пустой). eDROP уже влит в DROP — ок.
+#    FEED#3 ASN-lookup в guard: ipinfo.io (legacy free API) → Team Cymru whois.
+#           ipinfo без токена = 1000 req/день ОБЩИЕ на исходящий IP + deprecation +
+#           утечка IP атакующих коммерческому geoIP. Cymru: без ключа, поддерживается,
+#           ASN+owner одним запросом. Пакет 'whois' ставится best-effort (нет → "?"
+#           в дашборде, без лагов). Кэш/offline-fallback сохранены.
+#    CLEAN#6 удалён мёртвый knob SHIELD_CT_EVICT_MIN (DEPRECATED с v3.26, не читался).
+#
+#  Аудит рантайм-зависимостей (всё актуально): nftables, conntrack, iproute2,
+#  systemd, curl, sqlite3, jq, gawk/coreutils, python3 — текущие поддерживаемые
+#  инструменты, версий-проблем нет. CrowdSec ставится официальным инсталлятором
+#  (всегда latest). Дрейф был ТОЛЬКО во внешних data-feeds/API (выше), не в тулчейне.
+#
+# ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.27.1 — RED-TEAM ROUND 2 (CGNAT-safe closes)
+#
+#  Закрыто без риска для CGNAT (две дыры, которые открыли патчи v3.27.0 / остались):
+#    FIX#1  (pulsing обходил дебаунс #9): счётчик аномалий заменён на СКОЛЬЗЯЩЕЕ ОКНО.
+#           Раньше STREAK сбрасывался в 0 на любом чистом тике → атака «вкл/выкл»
+#           держала STREAK=1, кап не включался никогда. Теперь sustained, если в окне
+#           SHIELD_CTG_ANOM_WINDOW (4 тика) накопилось >= ATTACK_MIN_TICKS (2) аномалий
+#           (не обязательно подряд). Одиночный/редкий всплеск кап НЕ включает → анти-FP
+#           сохранён (CGNAT-safe, поведение как было). Побочно усиливает #4: infra-
+#           фронтовый флуд теперь надёжно ловится ctguard-капом (capnew до infra-accept),
+#           т.к. пульсацией от него больше не уйти. EWMA не учится при ANOM_CNT>0.
+#    FIX#6  (спуф-SYN на SSH-порт тёк conntrack): SYNPROXY теперь покрывает и SSH
+#           (SHIELD_SYNPROXY_SSH=1, дефолт). SSH не в protected_ports_tcp → раньше не
+#           покрыт ни synproxy, ни ctguard-капом → спуф-SYN с уник. src создавал
+#           SYN_RECV-conntrack. Модуль детектит sshd-listener'ы в рантайме; ports-updater
+#           сохраняет SSH в sp_ports при смене портов. SSH≠CGNAT → нулевой CGNAT-риск;
+#           прозрачно для легит-хендшейков, established SSH не рвётся.
+#
+#  НЕ закрыто — нельзя без риска CGNAT/CDN (осознанно оставлено):
+#    #2  live connect-and-hold: эвикт живых сокетов = масс-эвикт тяжёлых CGNAT-юзеров
+#        (байтовый детект уже пробовали в <v3.26 → критфикс-откат). Держим live==0.
+#    #3-side (CGNAT-safe убрал быстрый бан одиночного src): быстрый confirmed_attack
+#        вернул бы 15-мин бан общих CGNAT-IP. Покрывается auto-promote (syn/udp_escalate).
+#    #4  infrastructure-bypass: сужение = ложные баны CDN-fronted легита (Private Relay
+#        и т.п.). Оставлено по решению оператора; #1-фикс закрыл худший infra+pulsing кейс.
+#    #9-UDP CPU-burn под капом / RAM-clamp ceiling: понижение порогов = риск легит-QUIC
+#        и CGNAT-conntrack. Оставлено (OOM уже закрыт #1/#13 v3.27.0).
+#    Volumetric / насыщение канала: архитектурно нелечимо на хосте (нужен upstream-scrub).
+#
+# ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.27.0 (Commercial Edition) — SECURITY HARDENING
+#
+#  v3.27.0 (red-team batch 1 — анти-takedown / анти-self-DoS):
+#    FIX#1  (spoofed/distributed UDP-флуд): ctguard apply_cap теперь капает И UDP
+#           new-flow на protected-портах в attack-mode (раньше TCP-only). Spoofed-UDP
+#           обходит per-saddr meter ddos_protect и течёт conntrack → теперь приток
+#           новых flow режется глобально (established QUIC не трогается). Пол
+#           SHIELD_CTG_UDP_FLOOR (3000/с). Детект — через существующий conntrack-fill.
+#    FIX#13 (анти-OOM): авто-рост nf_conntrack_max ограничен SHIELD_CTG_CT_RAM_PCT
+#           (25%) от MemAvailable. Раньше рост до 1М (~384МБ) OOM-killил Xray —
+#           защита сама конвертила conntrack-fill в RAM-exhaustion. Если RAM-потолок
+#           ниже текущего max — НЕ поднимаем (дроп переживаемее OOM).
+#    FIX#8  (CGNAT collateral): SHIELD_CGNAT_SAFE=1 (дефолт) — превышение per-IP
+#           new-conn/SYN/UDP режет только избыточные пакеты (rate-shape) + логирует,
+#           но НЕ заносит общий CGNAT-IP в confirmed_attack (15-мин blackhole новых
+#           конн на ~200 абонентов за одним IP). =0 → прежний escalate.
+#    FIX#12 (ctguard как усилитель): Nice -5 → 10 + CPUWeight=20 + IOSchedulingClass=
+#           idle. Guard под атакой (дорогой conntrack -L каждые 15с) больше не
+#           отбирает CPU у Xray → частичная атака не перерастает в полный аутаж.
+#    FIX#14 (агрегатор OOM): per-tick journal cap 200k → 50k строк (nft-дропы идут
+#           независимо). Наблюдаемость деградирует плавно, не падает.
+#    --- batch 2 ---
+#    FIX#2  (distributed connect-and-hold): 2-й проход эвикта phantom_evict_distributed —
+#           много IP по чуть-чуть. Порог ниже (PH_MIN_DIST=800), но условие СТРОЖЕ:
+#           эвикт ТОЛЬКО при live==0 (чистый abandon) → CGNAT с активными юзерами
+#           щадится. Только в sustained-attack и если 1-й (концентрированный) проход пуст.
+#    FIX#9  (ложный attack-mode): дебаунс — глобальный кап включается лишь при
+#           ATTACK_MIN_TICKS=2 тиках подряд (≈30с), КРОМЕ PCT>=HIGH (капаем сразу).
+#           Один tick всплеска (легит reconnect/утренний ramp) больше не душит ноду и
+#           не отравляет EWMA-базлайн (учёба только на чистом тике). Отдельный
+#           CAP_FLOOR=1000 (был общий FLOOR_RATE=200 — слишком низкий потолок капа).
+#    FIX#5  (тихая деградация SYNPROXY): fail-loud — при неудаче enable пишем
+#           /var/lib/shieldnode/.synproxy-degraded, громкий ALERT в установке, journald
+#           и индикатор DEGRADED в 'guard'. Подсказка как починить (modules-extra/ядро).
+#    FIX#3  (distributed handshake-флуд): opt-in глобальный new-conn ceiling на
+#           protected-TCP (SHIELD_GLOBAL_NEWCONN_CEIL, ДЕФОЛТ 0=off — глоб. потолки
+#           опасны для CGNAT). Не-CGNAT ноды могут включить жёсткий backstop. В
+#           attack-mode аггрегатный кап ctguard и так покрывает (через PassiveOpens).
+#    FIX#11 (v6 UX): SHIELD_V6_REJECT (дефолт 0=drop/стелс). 1 → RST новым v6-TCP на
+#           VPN-портах → мгновенный happy-eyeballs fallback на v4 (без SYN-timeout).
+#    FIX#10 (bridge/whitelist drift): read-only advisory в 'guard' — TRUSTED_IPS из conf,
+#           которых нет в живом nft manual_whitelist_v4 (их трафик идёт через лимиты →
+#           мост/upstream рискует баном и аутажом downstream). O(1) проверка, без conntrack.
+#    --- batch 3 ---
+#    FIX#7  (IPv6 нет threat-feeds): добавлены v6-параллели blocklist-сетов
+#           (scanner/threat/custom/tor _v6) + v6 drop-правила ПЕРЕД остальным v6
+#           (бьют и SSH-over-v6). Updater теперь параллельно парсит v6 из того же фида:
+#           префикс-флор (threat /29 [v3.27.2], прочие /24 — анти-::/0), фильтр bogon/ULA/
+#           link-local/multicast/doc/v4-mapped/NAT64, структурная валидация против
+#           обрезков greedy-grep. v6 применяется ОТДЕЛЬНОЙ nft-транзакцией (битый v6
+#           НЕ ломает v4) и только если v6-set существует (backward-compat со старой
+#           таблицей). v6==0 в фиде — норма (min-check к v6 не применяется). guard
+#           показывает суммарный v6-счётчик; toggle Tor чистит и v6-сет.
+#    Решения по остатку:
+#      #6 (ban обходится ротацией) — НЕ чиним subnet-баном НАМЕРЕННО: на RU-мобайл
+#         CGNAT целый /24 = тысячи легит-юзеров, авто-/24-бан = массовый аутаж. Ротацию
+#         закрывает CrowdSec CAPI (community blocklist). Оставляем как осознанный trade-off.
+#      #4 (infrastructure-bypass) — НАМЕРЕННО не трогаем (по решению оператора).
+#
+# ==============================================================================
 #  VPN NODE DDoS PROTECTION v3.26.5 (Commercial Edition) — SECURITY HARDENING
 #
 #  v3.26.5 (dependency auto-upgrade):
@@ -492,7 +606,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.26.5"
+SHIELDNODE_VERSION="3.27.2"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -692,14 +806,18 @@ DEFAULT_LOCAL_BLOCKLISTS=(
 # Объединение URL'ов через запятую → один set
 DEFAULT_REMOTE_BLOCKLISTS=(
     "scanner=https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/antiscanner.list,https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/government_networks.list,https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_cidr.txt"
-    "threat=https://www.spamhaus.org/drop/drop.txt,https://iplists.firehol.org/files/firehol_level1.netset,https://feodotracker.abuse.ch/downloads/ipblocklist.txt"
+    "threat=https://www.spamhaus.org/drop/drop_v4.json,https://www.spamhaus.org/drop/drop_v6.json,https://iplists.firehol.org/files/firehol_level1.netset"
     # v3.23.14 FALSE-POSITIVE FIX: убраны blocklist.de/all и stamparm/ipsum L3 —
     # это АГРЕГАТОРЫ abuse-репортов. Они часто содержат публичные CGNAT/PAT-адреса
     # мобильных операторов и переиспользованные IP, за которыми сидят ОБЫЧНЫЕ
     # клиенты VPN. Эти IP попадали в threat_blocklist_v4 → drop NEW-соединений →
     # юзер не может подключиться / не грузятся сайты. Оставлены только
     # high-confidence источники: Spamhaus DROP (угнанные/криминальные блоки),
-    # FireHOL Level1 (bogon + dshield top, курируется как safe), Feodo (живые C2).
+    # FireHOL Level1 (bogon + dshield top, курируется как safe).
+    # v3.27.2: Spamhaus drop.txt → drop_v4.json + drop_v6.json (txt на пути к
+    #   deprecation; JSON парсится существующей jq-веткой; v6 кормит threat_v6-сет).
+    #   Feodo abuse.ch УБРАН — датасет сейчас пустой + abuse.ch требует Auth-Key
+    #   (июнь 2025) и мигрирует под Spamhaus → мёртвый груз + будущие 401.
     # Вернуть шумные фиды (НЕ рекомендуется для user-facing ноды) можно через
     # REMOTE_BLOCKLISTS в /etc/shieldnode/shieldnode.conf.
     "tor=https://check.torproject.org/torbulkexitlist"
@@ -742,21 +860,29 @@ SHIELD_RATE_UDP_BURST="${SHIELD_RATE_UDP_BURST:-20000}"
 SHIELD_SSH_CT_LIMIT="${SHIELD_SSH_CT_LIMIT:-5}"
 SHIELD_SSH_NEWCONN_RATE="${SHIELD_SSH_NEWCONN_RATE:-8/minute}"
 SHIELD_SSH_NEWCONN_BURST="${SHIELD_SSH_NEWCONN_BURST:-20}"
+# v3.27.0 FIX(#8): 1=rate-shape per-IP-превышений new-conn/SYN/UDP (дроп только избыточных
+# пакетов, НЕ заносить общий CGNAT-IP в confirmed_attack/15-мин blackhole); 0=старый escalate.
+SHIELD_CGNAT_SAFE="${SHIELD_CGNAT_SAFE:-1}"
+# v3.27.0 FIX(#3): глобальный backstop new-conn/с на protected-TCP. 0=off (CGNAT-safe дефолт).
+SHIELD_GLOBAL_NEWCONN_CEIL="${SHIELD_GLOBAL_NEWCONN_CEIL:-0}"
+# v3.27.0 FIX(#11): 1=RST новым v6-TCP на VPN-портах (быстрый happy-eyeballs fallback), 0=drop (стелс).
+SHIELD_V6_REJECT="${SHIELD_V6_REJECT:-0}"
 SHIELD_AUTOPROMOTE_THRESHOLD="${SHIELD_AUTOPROMOTE_THRESHOLD:-800}"
 # v3.24.0: SYNPROXY (conntrack-exhaustion защита). 1=вкл (дефолт), 0=выкл.
 SHIELD_SYNPROXY="${SHIELD_SYNPROXY:-1}"
+# v3.27.1 FIX(#6): покрывать ли SSH-порт SYNPROXY (анти-спуф-SYN на SSH). 1=да (дефолт), 0=нет.
+SHIELD_SYNPROXY_SSH="${SHIELD_SYNPROXY_SSH:-1}"
 # v3.24.0: conntrack-pressure guard (anti-exhaustion backstop)
 SHIELD_CTGUARD="${SHIELD_CTGUARD:-1}"
 SHIELD_CT_WARN_PCT="${SHIELD_CT_WARN_PCT:-80}"
 SHIELD_CT_HIGH_PCT="${SHIELD_CT_HIGH_PCT:-90}"
 SHIELD_CT_RECOVER_PCT="${SHIELD_CT_RECOVER_PCT:-70}"
-SHIELD_CT_EVICT_MIN="${SHIELD_CT_EVICT_MIN:-10000}"
 SHIELD_AUTOPROMOTE_WINDOW_HOURS="${SHIELD_AUTOPROMOTE_WINDOW_HOURS:-24}"
 SHIELD_CUSTOM_LOCAL_TTL_DAYS="${SHIELD_CUSTOM_LOCAL_TTL_DAYS:-90}"
 SHIELD_EVENTS_DB_RETENTION_DAYS="${SHIELD_EVENTS_DB_RETENTION_DAYS:-90}"
 SHIELD_PCAP_TRIGGER_DROPS="${SHIELD_PCAP_TRIGGER_DROPS:-10000}"
 SHIELD_PCAP_RETENTION_DAYS="${SHIELD_PCAP_RETENTION_DAYS:-30}"
-SHIELD_AGG_JOURNAL_LINES="${SHIELD_AGG_JOURNAL_LINES:-200000}"
+SHIELD_AGG_JOURNAL_LINES="${SHIELD_AGG_JOURNAL_LINES:-50000}"  # v3.27.0 FIX(#14): 200k→50k per-tick (анти-OOM/CPU агрегатора под лог-штормом; nft-дропы идут независимо)
 SHIELD_AGG_MAX_UNIQUE_IPS="${SHIELD_AGG_MAX_UNIQUE_IPS:-50000}"
 
 # Load operator overrides if present
@@ -788,13 +914,17 @@ shield_ensure_numeric SHIELD_RATE_UDP_BURST 20000
 shield_ensure_numeric SHIELD_SSH_CT_LIMIT 5
 shield_ensure_numeric SHIELD_SSH_NEWCONN_BURST 20
 shield_ensure_numeric SHIELD_AUTOPROMOTE_THRESHOLD 800
+shield_ensure_numeric SHIELD_CGNAT_SAFE 1
+shield_ensure_numeric SHIELD_GLOBAL_NEWCONN_CEIL 0
+shield_ensure_numeric SHIELD_V6_REJECT 0
 shield_ensure_numeric SHIELD_SYNPROXY 0
+shield_ensure_numeric SHIELD_SYNPROXY_SSH 1
 shield_ensure_numeric SHIELD_AUTOPROMOTE_WINDOW_HOURS 24
 shield_ensure_numeric SHIELD_CUSTOM_LOCAL_TTL_DAYS 90
 shield_ensure_numeric SHIELD_EVENTS_DB_RETENTION_DAYS 90
 shield_ensure_numeric SHIELD_PCAP_TRIGGER_DROPS 10000
 shield_ensure_numeric SHIELD_PCAP_RETENTION_DAYS 30
-shield_ensure_numeric SHIELD_AGG_JOURNAL_LINES 200000
+shield_ensure_numeric SHIELD_AGG_JOURNAL_LINES 50000
 shield_ensure_numeric SHIELD_AGG_MAX_UNIQUE_IPS 50000
 
 # Pre-compute derived values to avoid $((...)) inside heredoc (some bash
@@ -1599,6 +1729,15 @@ if ! command -v jq >/dev/null 2>&1; then
     print_status "Устанавливаю jq (для парсинга nft JSON в guard)..."
     DEBIAN_FRONTEND=noninteractive apt-get install -y jq >/dev/null 2>&1 || \
         print_warn "jq не установлен — guard будет использовать text-парсинг (хрупко)"
+fi
+
+# v3.27.2 FIX(#3): whois для ASN/owner top-attackers через Team Cymru (заменил ipinfo).
+# Опционально — нет → дашборд покажет IP без владельца ("?"), без лагов.
+if ! command -v whois >/dev/null 2>&1; then
+    wait_for_apt_lock
+    print_status "Устанавливаю whois (ASN/owner в guard через Team Cymru)..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y whois >/dev/null 2>&1 || \
+        print_warn "whois не установлен — в guard top-attackers без ASN-владельца (не критично)"
 fi
 
 # v3.22.0: conntrack — для unban_all с очисткой conntrack entries разбаненного IP.
@@ -2631,6 +2770,18 @@ SHIELD_SSH_CT_LIMIT=5
 SHIELD_SSH_NEWCONN_RATE="8/minute"
 SHIELD_SSH_NEWCONN_BURST=20
 
+# ─── CGNAT-safe overflow (v3.27.0 FIX#8) ───
+# 1 = превышение per-IP new-conn/SYN/UDP режет только избыточные пакеты, НЕ банит
+# общий CGNAT-IP в confirmed_attack (15-мин blackhole новых конн). 0 = старый escalate.
+SHIELD_CGNAT_SAFE=1
+
+# ─── Опц. backstop'ы (v3.27.0) ───
+# Глобальный new-conn/с ceiling на protected-TCP (анти-distributed-handshake). 0=off.
+# ВКЛЮЧАТЬ ТОЛЬКО на НЕ-CGNAT нодах и много выше суммарного легит-пика new-conn/с.
+SHIELD_GLOBAL_NEWCONN_CEIL=0
+# v6-TCP на VPN-портах: 1=reject(RST) для быстрого happy-eyeballs fallback, 0=drop (стелс).
+SHIELD_V6_REJECT=0
+
 # ─── Auto-promote (events.db → custom-local.txt permanent ban) ───
 # IP с >=THRESHOLD hits за WINDOW_HOURS попадает в local blocklist на TTL_DAYS.
 # v3.23.15 P1-1: 800 (раньше 2000 — недостижимо за 24ч под log-meter 1/min).
@@ -2640,6 +2791,11 @@ SHIELD_AUTOPROMOTE_WINDOW_HOURS=24
 # v3.24.0: SYNPROXY (conntrack-exhaustion). 1=вкл (дефолт), 0=выкл.
 # Безопасно: ядро не тянет → авто-fallback на ddos_protect; verify mss/wscale + авто-откат.
 SHIELD_SYNPROXY=1
+# v3.27.1 FIX(#6): SYNPROXY покрывает и SSH-порт (анти-спуф-SYN→conntrack). 0=выключить.
+SHIELD_SYNPROXY_SSH=1
+# v3.27.1 FIX(#1): анти-pulsing — sustained если >= SHIELD_CTG_ATTACK_MIN_TICKS аномалий
+# в скользящем окне из SHIELD_CTG_ANOM_WINDOW тиков (не обязательно подряд).
+SHIELD_CTG_ANOM_WINDOW=4
 
 # v3.26: conntrack-guard — основная защита от connect-and-hold (фантом) флуда + backstop
 # против conntrack-exhaustion. Изолированная таблица shield_ctguard. Эвиктит источники,
@@ -2659,10 +2815,11 @@ SHIELD_CTG_AGG_CAP=0         # агрегатный кап new-conn по фан�
 SHIELD_CTG_ACTIVE_FLOOR=20   # > стольких ЖИВЫХ сокетов у источника => shared-front/CGNAT => НЕ трогаем
 SHIELD_CTG_CT_MAX_CEIL=1048576  # авто-поднимать nf_conntrack_max до этого потолка при заполнении
 SHIELD_CTG_COARSE_MULT=3     # perf: полный conntrack-дамп только если conntrack > ss_total×это
+SHIELD_CTG_UDP_FLOOR=3000    # v3.27.0 FIX#1: пол агрегатного UDP-капа new-flow/с в attack-mode (анти-spoofed-UDP)
+SHIELD_CTG_CT_RAM_PCT=25     # v3.27.0 FIX#13: conntrack ≤ этого %% MemAvailable при авто-росте max (анти-OOM)
 SHIELD_CT_WARN_PCT=80        # %% заполнения conntrack → WARN-алерт
 SHIELD_CT_HIGH_PCT=90        # %% → fill-триггер attack-mode + авто-подъём nf_conntrack_max
 SHIELD_CT_RECOVER_PCT=70     # %% → выход из attack-mode (auto-recovery)
-SHIELD_CT_EVICT_MIN=10000    # DEPRECATED (v3.26): старый байтовый детектор удалён, не используется
 SHIELD_CUSTOM_LOCAL_TTL_DAYS=90
 
 # ─── Retention ───
@@ -2674,7 +2831,7 @@ SHIELD_PCAP_TRIGGER_DROPS=10000
 # JOURNAL_LINES — лимит на journalctl --lines (cap per-tick).
 # MAX_UNIQUE_IPS — hard cap на bash hash size per-type. После cap'а новые IP
 # дропаются (но nft drops продолжают работать независимо).
-SHIELD_AGG_JOURNAL_LINES=200000
+SHIELD_AGG_JOURNAL_LINES=50000
 SHIELD_AGG_MAX_UNIQUE_IPS=50000
 LIMITS_EOF
     chmod 0640 "$SHIELD_LIMITS_FILE"
@@ -2768,11 +2925,20 @@ else
 fi
 
 # === v3.23.15 P0-1: базовая IPv6-защита (дешёвый вариант; полный v6-ruleset — 2-я волна) ===
+# v3.27.0 FIX(#11): SHIELD_V6_REJECT=1 → новые v6-TCP на VPN-порты получают RST вместо
+# тихого DROP. Dual-stack клиент по happy-eyeballs мгновенно фейловерит на v4 (без
+# SYN-timeout-задержки). Дефолт 0 (drop = стелс). UDP/QUIC всегда drop (RST невозможен).
+SHIELD_V6_REJECT="${SHIELD_V6_REJECT:-0}"
+if [ "$SHIELD_V6_REJECT" = "1" ]; then
+    V6_TCP_VERDICT='counter name conn6_blocked reject with tcp reset'
+else
+    V6_TCP_VERDICT='counter name conn6_blocked drop'
+fi
 SHIELD_V6_SETS=""
 SHIELD_V6_RULES=""
 if ip -6 addr show scope global 2>/dev/null | grep -qE 'inet6 (2[0-9a-f]|3[0-9a-f])'; then
     print_warn "Публичный IPv6 обнаружен — включаю базовую v6-защиту (P0-1)"
-    print_info "  VPN-порты: новые v6-соединения DROP (клиенты идут по v4/CGNAT)"
+    print_info "  VPN-порты: новые v6-соединения $([ "$SHIELD_V6_REJECT" = "1" ] && echo "REJECT(reset)" || echo "DROP") (клиенты идут по v4/CGNAT)"
     print_info "  SSH over v6: rate-limit как v4 (без hard-deny → без lockout)"
     print_info "  Полноценный v6 rate-limit на VPN-портах — следующий релиз"
     SHIELD_V6_SETS="    set ssh_connlimit_v6 {
@@ -2789,10 +2955,54 @@ if ip -6 addr show scope global 2>/dev/null | grep -qE 'inet6 (2[0-9a-f]|3[0-9a-
     counter conn6_blocked { }
     counter ssh6_flood { }"
     SHIELD_V6_RULES="        # === v3.23.15 P0-1: базовая IPv6-защита (established уже принят выше) ===
-        meta nfproto ipv6 tcp dport @protected_ports_tcp ct state new counter name conn6_blocked drop
+        # v3.27.0 FIX(#7): v6 blocklist-drops ПЕРЕД остальным (бьют и SSH-over-v6).
+        meta nfproto ipv6 ip6 saddr @threat_blocklist_v6 counter drop
+        meta nfproto ipv6 ip6 saddr @custom_blocklist_v6 counter drop
+        meta nfproto ipv6 ip6 saddr @scanner_blocklist_v6 counter drop
+        meta nfproto ipv6 ip6 saddr @tor_exit_blocklist_v6 counter drop
+        meta nfproto ipv6 tcp dport @protected_ports_tcp ct state new $V6_TCP_VERDICT
         meta nfproto ipv6 udp dport @protected_ports_udp ct state new counter name conn6_blocked drop
         meta nfproto ipv6 tcp dport { $SSH_PORTS_NFT } ct state new add @ssh_connlimit_v6 { ip6 saddr ct count over $SHIELD_SSH_CT_LIMIT } counter name ssh6_flood drop
         meta nfproto ipv6 tcp dport { $SSH_PORTS_NFT } ct state new add @ssh_newconn_v6 { ip6 saddr limit rate over $SHIELD_SSH_NEWCONN_RATE burst $SHIELD_SSH_NEWCONN_BURST packets } counter name ssh6_flood drop"
+fi
+
+# === v3.27.0 FIX(#3): опц. ГЛОБАЛЬНЫЙ new-conn ceiling на protected-TCP (backstop против
+# распределённого handshake-флуда, который проходит per-IP лимиты). ДЕФОЛТ 0 (off) —
+# глобальные потолки опасны для CGNAT (память: исключены намеренно). Включать ТОЛЬКО на
+# не-CGNAT нодах: SHIELD_GLOBAL_NEWCONN_CEIL=<pps>. Значение должно быть много выше
+# суммарного легит-пика new-conn/с ноды. ctguard уже даёт аггрегатный кап в attack-mode;
+# это статический backstop для тех, кто хочет жёсткий потолок. ===
+SHIELD_GLOBAL_NEWCONN_CEIL="${SHIELD_GLOBAL_NEWCONN_CEIL:-0}"
+SHIELD_GLOBAL_NEWCONN_RULE=""
+if [ "${SHIELD_GLOBAL_NEWCONN_CEIL:-0}" -gt 0 ] 2>/dev/null; then
+    _gnc_burst=$(( SHIELD_GLOBAL_NEWCONN_CEIL * 2 ))
+    SHIELD_GLOBAL_NEWCONN_RULE="        # v3.27.0 FIX(#3): глобальный backstop new-conn/с на protected-TCP (opt-in)
+        tcp dport @protected_ports_tcp ct state new limit rate over ${SHIELD_GLOBAL_NEWCONN_CEIL}/second burst ${_gnc_burst} packets counter name global_newconn_drop drop"
+fi
+
+# v3.27.0 FIX(#8): тела overflow-цепочек генерируются здесь по SHIELD_CGNAT_SAFE.
+# CGNAT-safe (=1, дефолт): превышение per-IP лимита РЕЖЕТ только избыточные пакеты
+# (rate-shaping) и логирует для events.db, но НЕ заносит source-IP в confirmed_attack
+# (что блэкхолило ВСЕ новые конны с IP на 15 мин). На общем CGNAT-IP оператора
+# (до ~200 абонентов) старый escalate клал всех при reconnect-шторме/стриминг-пике.
+# confirmed_attack по-прежнему дропается (set и правило живы) — просто эти три rate-
+# сигнала больше не банят IP целиком. SYN/UDP сохраняют [shield:*_escalate] лог
+# (attribution/auto-promote не теряются). =0 → прежнее поведение (escalate→confirmed).
+if [ "${SHIELD_CGNAT_SAFE:-1}" = "1" ]; then
+    NEWCONN_OVERFLOW_BODY='counter name newconn_flood_v4 drop'
+    SYN_OVERFLOW_BODY='meter shield_syn_escalate_log { ip saddr limit rate 1/minute burst 5 packets } log prefix "[shield:syn_escalate] " level info flags ip options
+        counter name syn_confirmed_v4 drop'
+    UDP_OVERFLOW_BODY='meter shield_udp_escalate_log { ip saddr limit rate 1/minute burst 5 packets } log prefix "[shield:udp_escalate] " level info flags ip options
+        counter name udp_confirmed_v4 drop'
+else
+    NEWCONN_OVERFLOW_BODY='ip saddr @suspect_v4 add @confirmed_attack_v4 { ip saddr } counter name newconn_flood_v4 drop
+        add @suspect_v4 { ip saddr } counter name newconn_flood_v4'
+    SYN_OVERFLOW_BODY='ip saddr @suspect_v4 meter shield_syn_escalate_log { ip saddr limit rate 1/minute burst 5 packets } log prefix "[shield:syn_escalate] " level info flags ip options
+        ip saddr @suspect_v4 add @confirmed_attack_v4 { ip saddr } counter name syn_confirmed_v4 drop
+        add @suspect_v4 { ip saddr }'
+    UDP_OVERFLOW_BODY='ip saddr @suspect_v4 meter shield_udp_escalate_log { ip saddr limit rate 1/minute burst 5 packets } log prefix "[shield:udp_escalate] " level info flags ip options
+        ip saddr @suspect_v4 add @confirmed_attack_v4 { ip saddr } counter name udp_confirmed_v4 drop
+        add @suspect_v4 { ip saddr }'
 fi
 
 cat > "$NFT_DDOS_CONF" <<EOF
@@ -2886,6 +3096,33 @@ $XRAY_PORTS_UDP_INIT
     # Если выключен — set пустой, правило 'ip saddr @... drop' no-op.
     set tor_exit_blocklist_v4 {
         type ipv4_addr
+        flags interval
+        auto-merge
+        size 8192
+    }
+    # --- v3.27.0 FIX(#7): IPv6-параллели blocklist-сетов ---
+    # Заполняются тем же shieldnode-update-blocklist.sh (v6-парсинг фидов). Пустые,
+    # пока фид не отдал v6 — правила 'ip6 saddr @..._v6 drop' тогда no-op. Type ipv6_addr.
+    set scanner_blocklist_v6 {
+        type ipv6_addr
+        flags interval
+        auto-merge
+        size 65536
+    }
+    set threat_blocklist_v6 {
+        type ipv6_addr
+        flags interval
+        auto-merge
+        size 65536
+    }
+    set custom_blocklist_v6 {
+        type ipv6_addr
+        flags interval
+        auto-merge
+        size 16384
+    }
+    set tor_exit_blocklist_v6 {
+        type ipv6_addr
         flags interval
         auto-merge
         size 8192
@@ -3031,6 +3268,7 @@ $INFRASTRUCTURE_V6_INIT
     # v3.5: counters для HTTP/connection-flood защиты
     counter conn_flood_v4 { }     # ct count > 400 на src (v3.12.0: CGNAT-friendly)
     counter newconn_flood_v4 { }  # >50 new conn/min на src
+    counter global_newconn_drop { } # v3.27.0 FIX(#3): глобальный new-conn backstop (opt-in SHIELD_GLOBAL_NEWCONN_CEIL)
     counter tcp_invalid { }       # invalid TCP flag combos
     # v3.21.0: SSH pre-auth flood counters (v3.21.4: лимиты ужесточены)
     counter ssh_conn_flood_v4 { }     # ct count > 3 на src для SSH-порта (было 5 до v3.21.4)
@@ -3325,6 +3563,7 @@ $SHIELD_V6_RULES
         udp dport @protected_ports_udp \\
             add @udp_flood_v4 { ip saddr limit rate over $SHIELD_RATE_UDP burst $SHIELD_RATE_UDP_BURST packets } \\
             jump udp_overflow
+$SHIELD_GLOBAL_NEWCONN_RULE
     }
 
     # === v3.10.2: подцепочки overflow-обработки ===
@@ -3332,38 +3571,18 @@ $SHIELD_V6_RULES
     # уже обнаружил overflow (rate over limit). Решают: confirm-vs-suspect.
     # Не трогают meter-set'ы → не могут вызвать double-charge.
     chain newconn_overflow {
-        # Уже под наблюдением → escalate в confirmed (бан 1ч)
-        # v3.20.3: log УБРАН — раньше каждое срабатывание писало строку в kern.log,
-        # при атаке это давало большой поток логов. Counter newconn_flood_v4
-        # считает все drops, видно в guard dashboard.
-        ip saddr @suspect_v4 add @confirmed_attack_v4 { ip saddr } \\
-            counter name newconn_flood_v4 drop
-        # Первое нарушение → suspect (наблюдение 30мин, без drop)
-        add @suspect_v4 { ip saddr } counter name newconn_flood_v4
+        # v3.27.0 FIX(#8): тело из \$NEWCONN_OVERFLOW_BODY (CGNAT-safe rate-shape vs escalate).
+        $NEWCONN_OVERFLOW_BODY
     }
 
     chain syn_overflow {
-        # v3.15.3 / v3.23.0: log prefix [shield:syn_escalate] на момент ESCALATION
-        # в confirmed_attack_v4. v3.23.13 BUG-004 + SR-FIX-1 + SR-FIX-6: log
-        # ВСЕГДА активен, per-IP rate-limit через meter, БЕЗ дублирующего
-        # 'add @confirmed_attack_v4' (второе правило это делает).
-        # Это escalation-event (suspect → confirmed), очень low-volume:
-        # один IP escalate'ится один раз, дальше дропается через @confirmed_attack_v4.
-        ip saddr @suspect_v4 \\
-            meter shield_syn_escalate_log { ip saddr limit rate 1/minute burst 5 packets } \\
-            log prefix "[shield:syn_escalate] " level info flags ip options
-        ip saddr @suspect_v4 add @confirmed_attack_v4 { ip saddr } counter name syn_confirmed_v4 drop
-        add @suspect_v4 { ip saddr }
+        # v3.27.0 FIX(#8): тело из \$SYN_OVERFLOW_BODY. CGNAT-safe: shape+log без escalate.
+        $SYN_OVERFLOW_BODY
     }
 
     chain udp_overflow {
-        # v3.15.3 / v3.23.0: log prefix [shield:udp_escalate]. v3.23.13 BUG-004
-        # + SR-FIX-1 + SR-FIX-6: log ВСЕГДА активен, per-IP meter, без дубликата add.
-        ip saddr @suspect_v4 \\
-            meter shield_udp_escalate_log { ip saddr limit rate 1/minute burst 5 packets } \\
-            log prefix "[shield:udp_escalate] " level info flags ip options
-        ip saddr @suspect_v4 add @confirmed_attack_v4 { ip saddr } counter name udp_confirmed_v4 drop
-        add @suspect_v4 { ip saddr }
+        # v3.27.0 FIX(#8): тело из \$UDP_OVERFLOW_BODY. CGNAT-safe: shape+log без escalate.
+        $UDP_OVERFLOW_BODY
     }
 
     # === v3.20.5: MSS clamping moved to vpn-node-setup (ШАГ 7.8) ===
@@ -3412,7 +3631,8 @@ cat > /usr/local/sbin/shieldnode-synproxy.sh <<'SYNPROXY_MODULE_EOF'
 # shieldnode-synproxy v0.2 — opt-in SYNPROXY (защита от conntrack-exhaustion).
 # SYN перехватывается ДО conntrack (syncookies); запись в conntrack только после
 # завершённого 3-way → SYN-флуд не течёт таблицу. Изолированная table
-# inet shield_synproxy (ddos_protect не трогает, откат = удаление). SSH не трогает.
+# inet shield_synproxy (ddos_protect не трогает, откат = удаление). v3.27.1: SSH ТОЖЕ
+# покрыт по умолчанию (анти-спуф-SYN на SSH-порт; SHIELD_SYNPROXY_SSH=0 чтобы выключить).
 # enable: verify mss/wscale против бэкенда + проверка untracked с авто-откатом
 # (если другой фаервол дропает untracked — иначе оборвало бы клиентов).
 set -euo pipefail
@@ -3442,6 +3662,17 @@ detect_ports(){
     [ -n "$raw" ] && { echo "$raw"; return; }
     echo "443"
 }
+# v3.27.1 FIX(#6): SSH-порты для SYNPROXY (спуф-SYN на SSH иначе течёт conntrack —
+# SSH не в protected_ports_tcp, значит не покрыт ни synproxy, ни ctguard-капом).
+# Детектим listener'ы sshd в рантайме (как установщик). Пусто → ничего не добавляем.
+detect_ssh_ports(){
+    ss -tlnpH 2>/dev/null | awk '
+        /users:\(.*"sshd"/ {
+            split($4, a, ":"); port = a[length(a)]
+            if ($4 ~ /^127\./ || $4 ~ /^\[::1\]/) next
+            print port
+        }' | sort -un | tr '\n' ',' | sed 's/,$//'
+}
 detect_mss(){ local m; m=$(cat "/sys/class/net/$(detect_dev)/mtu" 2>/dev/null || echo 1500); echo $((m-40)); }
 detect_wscale(){
     local rmax space=65535 w=0
@@ -3452,6 +3683,13 @@ detect_wscale(){
 }
 
 PORTS="${SHIELD_SYNPROXY_PORTS:-$(detect_ports)}"
+# v3.27.1 FIX(#6): по умолчанию покрываем и SSH (спуф-SYN-флуд на SSH иначе течёт
+# conntrack). SYNPROXY прозрачен для легитимных хендшейков; established SSH-сессии не
+# рвутся (accept по ct established выше). Отключить: SHIELD_SYNPROXY_SSH=0.
+if [ "${SHIELD_SYNPROXY_SSH:-1}" = "1" ]; then
+    _sshp="$(detect_ssh_ports || true)"
+    [ -n "${_sshp:-}" ] && PORTS="${PORTS:+$PORTS,}${_sshp}"
+fi
 MSS="${SHIELD_SYNPROXY_MSS:-$(detect_mss)}"
 WSCALE="${SHIELD_SYNPROXY_WSCALE:-$(detect_wscale)}"
 FIRST_PORT="$(echo "$PORTS" | tr ',' '\n' | head -1 | cut -d- -f1)"
@@ -3649,9 +3887,31 @@ WantedBy=multi-user.target
 SPUNIT
         systemctl daemon-reload 2>/dev/null || true
         systemctl enable shieldnode-synproxy.service >/dev/null 2>&1 || true
+        rm -f /var/lib/shieldnode/.synproxy-degraded 2>/dev/null || true   # v3.27.0 FIX(#5): снимаем degraded-маркер
         print_ok "SYNPROXY активен и переживёт ребут"
     else
-        print_warn "SYNPROXY НЕ включён (см. вывод модуля выше) — ddos_protect работает штатно"
+        # v3.27.0 FIX(#5): fail-loud. Раньше тихо падали на ddos_protect rate-limit —
+        # на стоковом ядре без nf_synproxy (и без интернета для modules-extra) это
+        # СЛАБЕЕ: SYN под per-src лимитом проходит → создаёт SYN_RECV-conntrack →
+        # таблица течёт → conntrack-exhaustion при SYN-флуде. Оператор должен ЗНАТЬ.
+        mkdir -p /var/lib/shieldnode 2>/dev/null || true
+        {
+            echo "degraded_at=$(date -u +%FT%TZ)"
+            echo "reason=synproxy_enable_failed"
+            echo "kernel=$(uname -r)"
+            echo "note=ddos_protect rate-limit активен, но conntrack-exhaustion-защита SYN ослаблена"
+        } > /var/lib/shieldnode/.synproxy-degraded 2>/dev/null || true
+        logger -t shieldnode "ALERT: SYNPROXY запрошен (SHIELD_SYNPROXY=1), но НЕ включился — нода на ослабленной SYN-защите (см. /var/lib/shieldnode/.synproxy-degraded)"
+        print_error "════════════════════════════════════════════════════════════════"
+        print_error "⚠ SYNPROXY НЕ ВКЛЮЧИЛСЯ — нода на ОСЛАБЛЕННОЙ защите от SYN-флуда!"
+        print_error "  ddos_protect rate-limit работает, но conntrack может переполниться"
+        print_error "  при SYN-флуде (SYN под per-src лимитом создаёт conntrack-записи)."
+        print_warn  "  Причина обычно: нет модуля ядра nf_synproxy (стоковое ядро без"
+        print_warn  "  linux-modules-extra) или ядро < 5.14, либо не было интернета."
+        print_info  "  Починить:  sudo apt install linux-modules-extra-\$(uname -r) && sudo shieldnode-synproxy.sh on"
+        print_info  "  Либо обнови ядро (XanMod несёт nf_synproxy встроенным)."
+        print_info  "  Маркер degraded виден в 'sudo guard'. Скрытно деградировать не будем."
+        print_error "════════════════════════════════════════════════════════════════"
     fi
 else
     print_info "SYNPROXY выключен (SHIELD_SYNPROXY=0). Дефолт — вкл. Включить: sudo shieldnode-synproxy.sh on"
@@ -3692,17 +3952,24 @@ AGG_CAP="${SHIELD_CTG_AGG_CAP:-0}"               # v3.26.4: агрегатный
 ENFORCE="${SHIELD_CTG_ENFORCE:-1}"               # 1=выселять; 0=только лог (наблюдение)
 CT_MAX_CEIL="${SHIELD_CTG_CT_MAX_CEIL:-1048576}" # до какого потолка авто-поднимать nf_conntrack_max
 COARSE_MULT="${SHIELD_CTG_COARSE_MULT:-3}"       # perf: полный conntrack-дамп только если conntrack > ss_total×это (или attack-mode)
+UDP_FLOOR="${SHIELD_CTG_UDP_FLOOR:-3000}"        # v3.27.0 FIX(#1): пол агрегатного UDP-капа new-flow/с в attack-mode (QUIC reconnect выше TCP)
+CT_RAM_PCT="${SHIELD_CTG_CT_RAM_PCT:-25}"        # v3.27.0 FIX(#13): conntrack не более этого %% от MemAvailable (анти-OOM при авто-росте max)
+PH_MIN_DIST="${SHIELD_CTG_PHANTOM_MIN_DIST:-800}" # v3.27.0 FIX(#2): порог 2-го прохода (распределённый connect-and-hold); эвикт ТОЛЬКО при live==0
+DISTRIBUTED="${SHIELD_CTG_DISTRIBUTED:-1}"        # v3.27.0 FIX(#2): 2-й проход против распределённого hold (1=вкл, только в sustained-attack)
+ATTACK_MIN_TICKS="${SHIELD_CTG_ATTACK_MIN_TICKS:-2}" # v3.27.0 FIX(#9)/v3.27.1: порог аномалий В ОКНЕ для глоб. капа (PCT>=HIGH капает сразу)
+ANOM_WINDOW="${SHIELD_CTG_ANOM_WINDOW:-4}"        # v3.27.1 FIX(#1 pulsing): размер скользящего окна тиков (≥ATTACK_MIN_TICKS аномалий в окне → sustained)
+CAP_FLOOR="${SHIELD_CTG_CAP_FLOOR:-1000}"         # v3.27.0 FIX(#9): мин. значение глобального TCP-капа new-conn/с (не душить легит reconnect)
 CSCLI="${SHIELD_CTG_CSCLI:-1}"; CSCLI_TTL="${SHIELD_CTG_CSCLI_TTL:-6h}"
 ALPHA_NUM="${SHIELD_CTG_ALPHA_NUM:-5}"           # EWMA alpha = ALPHA_NUM/100
 TAG=shieldnode-ctguard
 RUN=/run/shieldnode; ST=/var/lib/shieldnode
 mkdir -p "$RUN" "$ST" 2>/dev/null || true
 TIER_F="$RUN/ctguard.tier"; EVICT_F="$RUN/ctguard.evicted"; MODE_F="$RUN/ctguard.mode"
-PREV_F="$RUN/ctguard.prev"; BASE_F="$ST/ctguard-base"
+PREV_F="$RUN/ctguard.prev"; BASE_F="$ST/ctguard-base"; STREAK_F="$RUN/ctguard.attackstreak"
 
 if [ "$SHIELD_CTGUARD" != "1" ]; then
     nft delete table inet shield_ctguard 2>/dev/null || true
-    rm -f "$TIER_F" "$EVICT_F" "$MODE_F" "$PREV_F" "$BASE_F" 2>/dev/null || true
+    rm -f "$TIER_F" "$EVICT_F" "$MODE_F" "$PREV_F" "$BASE_F" "$STREAK_F" 2>/dev/null || true
     exit 0
 fi
 
@@ -3786,12 +4053,25 @@ ensure_table || logger -t "$TAG" "WARN: не смог создать shield_ctgu
 date +%s > "$RUN/ctguard.heartbeat" 2>/dev/null || true   # v3.26.3: для детекта залипшего таймера
 
 # v3.26.0 conntrack-exhaustion guard: поднять max при заполнении (легит начинает дропаться)
+# v3.27.0 FIX(#13): потолок подъёма ограничен долей MemAvailable. Иначе авто-рост до
+# CT_MAX_CEIL (1М × ~384Б ≈ 384МБ) OOM-killил Xray на малых нодах — защита сама
+# конвертила conntrack-fill в RAM-exhaustion. Если RAM-потолок ниже текущего max —
+# НЕ поднимаем (дроп новых пакетов переживаемее, чем OOM активных сессий).
 if [ "$PCT" -ge "$HIGH" ] 2>/dev/null && [ "$MAX" -lt "$CT_MAX_CEIL" ] 2>/dev/null; then
     NEWMAX=$(( MAX * 2 )); [ "$NEWMAX" -gt "$CT_MAX_CEIL" ] && NEWMAX="$CT_MAX_CEIL"
-    if [ "$ENFORCE" = "1" ]; then
-        sysctl -wq net.netfilter.nf_conntrack_max="$NEWMAX" 2>/dev/null && logger -t "$TAG" "conntrack fill ${PCT}% → nf_conntrack_max ${MAX}→${NEWMAX}" && MAX="$NEWMAX" && PCT=$(( CNT * 100 / MAX ))
+    MEM_KB=$(awk '/^MemAvailable:/{print $2; f=1} END{if(!f)print 0}' /proc/meminfo 2>/dev/null); MEM_KB="${MEM_KB:-0}"
+    [ "$MEM_KB" -gt 0 ] 2>/dev/null || MEM_KB=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null)
+    RAM_CAP=0
+    [ "${MEM_KB:-0}" -gt 0 ] 2>/dev/null && RAM_CAP=$(( MEM_KB * 1024 / 100 * CT_RAM_PCT / 384 ))
+    if [ "$RAM_CAP" -gt 0 ] 2>/dev/null && [ "$NEWMAX" -gt "$RAM_CAP" ]; then
+        NEWMAX="$RAM_CAP"
+    fi
+    if [ "$NEWMAX" -le "$MAX" ] 2>/dev/null; then
+        logger -t "$TAG" "WARN: conntrack ${PCT}% но RAM-потолок (${CT_RAM_PCT}% avail ≈ ${NEWMAX}) <= текущего max (${MAX}) — НЕ поднимаю (дроп предпочтительнее OOM Xray)"
+    elif [ "$ENFORCE" = "1" ]; then
+        sysctl -wq net.netfilter.nf_conntrack_max="$NEWMAX" 2>/dev/null && logger -t "$TAG" "conntrack fill ${PCT}% → nf_conntrack_max ${MAX}→${NEWMAX} (RAM-capped ${CT_RAM_PCT}%)" && MAX="$NEWMAX" && PCT=$(( CNT * 100 / MAX ))
     else
-        logger -t "$TAG" "DRY: conntrack fill ${PCT}% → поднял бы nf_conntrack_max ${MAX}→${NEWMAX}"
+        logger -t "$TAG" "DRY: conntrack fill ${PCT}% → поднял бы nf_conntrack_max ${MAX}→${NEWMAX} (RAM-capped)"
     fi
 fi
 
@@ -3861,14 +4141,31 @@ fi
 PHANTOM_SIG=0
 [ "$PHR" -ge "$PHR_TRIG" ] 2>/dev/null && [ "$CT_INB" -ge "$SNAP_FLOOR" ] 2>/dev/null && PHANTOM_SIG=1
 
-apply_cap(){  # глобальный кап new-conn на protected-порты (НЕ per-IP → safe для CDN/моста)
-    local cap="$1" ports; ports=$(protected_ports)
+udp_protected_ports(){ nft list set inet ddos_protect protected_ports_udp 2>/dev/null | tr -d '\n' | grep -oE 'elements = \{[^}]*\}' | sed -E 's/.*\{ *//; s/ *\}.*//'; }
+
+apply_cap(){  # глобальный кап new-conn на protected-порты (НЕ per-IP → safe для CDN/моста/CGNAT)
+    # v3.27.0 FIX(#1): кап теперь и на UDP. Spoofed/distributed UDP-флуд обходит per-saddr
+    # meter ddos_protect (каждый src — свой счётчик → ничего не превышает) и течёт conntrack
+    # до OOM. Глобальный UDP-кап в attack-mode останавливает приток НОВЫХ flow; established
+    # QUIC (ct state established) не трогается. UDP-пол (UDP_FLOOR) выше TCP — у QUIC больше
+    # легит new-flow на reconnect-шторме.
+    local cap="$1" tports uports
+    tports=$(protected_ports); uports=$(udp_protected_ports)
     nft flush chain inet shield_ctguard capnew 2>/dev/null || true
-    [ -n "$ports" ] || { logger -t "$TAG" "WARN: protected_ports пуст — агрегатный кап не наложен"; return; }
-    local burst=$(( cap * 2 )); [ "$burst" -lt 100 ] && burst=100
-    nft add rule inet shield_ctguard capnew tcp dport "{ $ports }" ct state new \
-        limit rate over "${cap}/second" burst "${burst} packets" counter name ctguard_capdrop drop 2>/dev/null \
-        || logger -t "$TAG" "WARN: не наложил агрегатный кап (${cap}/s)"
+    if [ -n "$tports" ]; then
+        local burst=$(( cap * 2 )); [ "$burst" -lt 100 ] && burst=100
+        nft add rule inet shield_ctguard capnew tcp dport "{ $tports }" ct state new \
+            limit rate over "${cap}/second" burst "${burst} packets" counter name ctguard_capdrop drop 2>/dev/null \
+            || logger -t "$TAG" "WARN: не наложил TCP-кап (${cap}/s)"
+    fi
+    if [ -n "$uports" ]; then
+        local ucap="$cap"; [ "$ucap" -lt "$UDP_FLOOR" ] 2>/dev/null && ucap="$UDP_FLOOR"
+        local uburst=$(( ucap * 2 )); [ "$uburst" -lt 200 ] && uburst=200
+        nft add rule inet shield_ctguard capnew udp dport "{ $uports }" ct state new \
+            limit rate over "${ucap}/second" burst "${uburst} packets" counter name ctguard_capdrop drop 2>/dev/null \
+            || logger -t "$TAG" "WARN: не наложил UDP-кап (${ucap}/s)"
+    fi
+    [ -z "$tports" ] && [ -z "$uports" ] && logger -t "$TAG" "WARN: protected_ports пуст — агрегатный кап не наложен"
 }
 clear_cap(){ nft flush chain inet shield_ctguard capnew 2>/dev/null || true; }
 
@@ -3902,32 +4199,88 @@ phantom_evict(){  # v3.26.0: эвикт источников с conntrack ≫ ж
     done < "$RUN/ctg.ctsrc"
 }
 
-# v3.26.4 решение:
-#  • эвикт пробуем при phantom-сигнале — реальные холдеры (≥PH_MIN, low-live) ловятся,
-#    мобильный churn даёт 0 холдеров МОЛЧА (нет спама, нет attack-mode).
-#  • attack-mode входим ТОЛЬКО если есть что делать: настоящий флуд, найден холдер,
-#    или включён агрегатный кап для CDN/мост-ноды (SHIELD_CTG_AGG_CAP=1).
+phantom_evict_distributed(){  # v3.27.0 FIX(#2): распределённый connect-and-hold — много IP по чуть-чуть,
+    # каждый держит abandoned-конны с НУЛЁМ живых сокетов. Порог ниже (PH_MIN_DIST), но условие
+    # СТРОЖЕ: эвиктим ТОЛЬКО при live==0 (чистый abandon). CGNAT с любым активным юзером (live>=1)
+    # щадится. Запускается лишь в sustained-attack и только если 1-й проход не нашёл холдеров.
+    command -v conntrack >/dev/null 2>&1 || return
+    take_snap || return
+    local ip ct live
+    while read -r ct ip; do
+        [ -n "${ip:-}" ] || continue
+        [ "${ct:-0}" -ge "$PH_MIN_DIST" ] 2>/dev/null || continue
+        live=$(awk -v ip="$ip" '$2==ip{print $1;exit}' "$RUN/ctg.sslive" 2>/dev/null); live="${live:-0}"
+        [ "$live" -eq 0 ] 2>/dev/null || continue                         # хоть один живой сокет → НЕ трогаем (CGNAT-safe)
+        is_protected "$ip" && continue
+        FOUND_HOLDER=$((FOUND_HOLDER+1))
+        if [ "$ENFORCE" != "1" ]; then
+            logger -t "$TAG" "DRY: выселил бы (dist) $ip (conntrack=$ct live=0)"
+            echo "$ip conntrack=$ct live=0 DIST-DRY $(date '+%F %T')" >> "$EVICT_F" 2>/dev/null || true
+            continue
+        fi
+        if printf '%s' "$ip" | grep -q ':'; then
+            nft add element inet shield_ctguard evict6 "{ $ip timeout $EVICT_TTL }" 2>/dev/null || true
+        else
+            nft add element inet shield_ctguard evict4 "{ $ip timeout $EVICT_TTL }" 2>/dev/null || true
+        fi
+        conntrack -D -s "$ip" >/dev/null 2>&1 || true
+        [ "$CSCLI" = "1" ] && command -v cscli >/dev/null 2>&1 && cscli decisions add -i "$ip" -d "$CSCLI_TTL" -r "shieldnode distributed conn-hold" >/dev/null 2>&1 || true
+        echo "$ip conntrack=$ct live=0 DIST $(date '+%F %T')" >> "$EVICT_F" 2>/dev/null || true
+        logger -t "$TAG" "EVICT(dist) $ip: conntrack=$ct live=0 (distributed hold) — block ${EVICT_TTL} + conntrack -D"
+    done < "$RUN/ctg.ctsrc"
+}
+
+# v3.26.4 решение + v3.27.0 FIX(#9) дебаунс:
+#  • эвикт сконцентрированных холдеров — немедленно (abandoned-конны, безопасно).
+#  • ГЛОБАЛЬНЫЙ кап (потенциально режет легит) — только при SUSTAINED аномалии
+#    (ATTACK_MIN_TICKS тиков подряд), КРОМЕ настоящей переполненности conntrack
+#    (PCT>=HIGH → капаем сразу). Один tick всплеска (легит reconnect/утренний ramp
+#    после тихого окна) больше НЕ включает кап и НЕ отравляет EWMA-базлайн.
+# v3.27.1 FIX(#1 pulsing): СКОЛЬЗЯЩЕЕ ОКНО вместо строго-последовательного счётчика.
+# STREAK_F = битстрока последних ANOM_WINDOW тиков; sustained если в окне >= ATTACK_MIN_TICKS
+# аномалий (не обязательно подряд). Атака «вкл/выкл» больше НЕ обнуляет счётчик чистым
+# тиком → пульсацией от капа не уйти. Одиночный всплеск (1 аномалия в окне) кап НЕ
+# включает — анти-FP сохранён (CGNAT-safe, поведение как было). PCT>=HIGH/активная атака — сразу.
+ANOM_BIT=0; { [ "$FLOOD" = "1" ] || [ "$PHANTOM_SIG" = "1" ]; } && ANOM_BIT=1
+HIST=""; [ -r "$STREAK_F" ] && HIST=$(cat "$STREAK_F" 2>/dev/null | tr -cd '01')
+HIST="${HIST}${ANOM_BIT}"
+HLEN=${#HIST}; [ "$HLEN" -gt "$ANOM_WINDOW" ] 2>/dev/null && HIST="${HIST:HLEN-ANOM_WINDOW}"
+printf '%s' "$HIST" > "$STREAK_F" 2>/dev/null || true
+ANOM_CNT=$(printf '%s' "$HIST" | tr -cd '1' | wc -c); ANOM_CNT="${ANOM_CNT:-0}"
+SUSTAINED=0
+{ [ "$ANOM_CNT" -ge "$ATTACK_MIN_TICKS" ] 2>/dev/null || [ "$PCT" -ge "$HIGH" ] 2>/dev/null || [ "$PREV_MODE" = "attack" ]; } && SUSTAINED=1
+
 FOUND_HOLDER=0
 if [ "$PHANTOM_SIG" = "1" ] || { [ "$PREV_MODE" = "attack" ] && [ "$CT_INB" -ge "$SNAP_FLOOR" ] 2>/dev/null; }; then
     phantom_evict
 fi
+# v3.27.0 FIX(#2): распределённый connect-and-hold — только в sustained-attack и если
+# 1-й (сконцентрированный) проход пуст. Эвиктит лишь источники с live==0 → CGNAT щадится.
+if [ "$DISTRIBUTED" = "1" ] && [ "${FOUND_HOLDER:-0}" -eq 0 ] 2>/dev/null && [ "$PHANTOM_SIG" = "1" ] && [ "$SUSTAINED" = "1" ]; then
+    phantom_evict_distributed
+fi
 DO_CAP=0
-[ "$FLOOD" = "1" ] && DO_CAP=1                                   # настоящий new-conn/conntrack флуд → кап
-[ "$AGG_CAP" = "1" ] && [ "$PHANTOM_SIG" = "1" ] && DO_CAP=1     # CDN/мост (opt-in): per-IP эвикт невозможен → кап
+[ "$FLOOD" = "1" ] && [ "$SUSTAINED" = "1" ] && DO_CAP=1                          # настоящий new-conn/conntrack флуд (sustained) → кап
+[ "$AGG_CAP" = "1" ] && [ "$PHANTOM_SIG" = "1" ] && [ "$SUSTAINED" = "1" ] && DO_CAP=1  # CDN/мост (opt-in): per-IP эвикт невозможен → кап
 ATTACK=0
-[ "$FLOOD" = "1" ] && ATTACK=1
+[ "$FLOOD" = "1" ] && [ "$SUSTAINED" = "1" ] && ATTACK=1
 [ "${FOUND_HOLDER:-0}" -gt 0 ] 2>/dev/null && ATTACK=1
 [ "$DO_CAP" = "1" ] && ATTACK=1
+
+# Аномалия есть, но ещё не sustained → наблюдаем (без капа). EWMA ниже не обучаем (ANOM_CNT>0).
+if [ "$ATTACK" != "1" ] && { [ "$FLOOD" = "1" ] || [ "$PHANTOM_SIG" = "1" ]; }; then
+    logger -t "$TAG" "OBSERVE: аномалия ${ANOM_CNT}/${ATTACK_MIN_TICKS} в окне ${ANOM_WINDOW} (rate=${RATE}/s base≈${BASE_RATE} conntrack=${CNT}(${PCT}%) phr=${PHR}%) — глобальный кап отложен (анти-FP)"
+fi
 
 if [ "$ATTACK" = "1" ]; then
     echo attack > "$MODE_F" 2>/dev/null || true
     if [ "$DO_CAP" = "1" ]; then
-        cap=$(( BASE_RATE * MULT_OUT )); [ "$cap" -lt "$FLOOR_RATE" ] && cap="$FLOOR_RATE"
+        cap=$(( BASE_RATE * MULT_OUT )); [ "$cap" -lt "$CAP_FLOOR" ] && cap="$CAP_FLOOR"
         apply_cap "$cap"
     else
         clear_cap; cap="off(direct/no-flood)"
     fi
-    [ "$PREV_MODE" != "attack" ] && logger -t "$TAG" "ATTACK ON: rate=${RATE}/s (base≈${BASE_RATE}, trig>${trig_rate}) conntrack=${CNT}(${PCT}%) phantom-ratio=${PHR}% (live=${SS_LIVE}/${CT_INB}) holders=${FOUND_HOLDER} flood=${FLOOD} enforce=${ENFORCE} agg_cap=${AGG_CAP} — кап=${cap} + phantom-эвикт"
+    [ "$PREV_MODE" != "attack" ] && logger -t "$TAG" "ATTACK ON: rate=${RATE}/s (base≈${BASE_RATE}, trig>${trig_rate}) conntrack=${CNT}(${PCT}%) phantom-ratio=${PHR}% (live=${SS_LIVE}/${CT_INB}) holders=${FOUND_HOLDER} flood=${FLOOD} sustained=${SUSTAINED}(anom=${ANOM_CNT}/win${ANOM_WINDOW}) enforce=${ENFORCE} agg_cap=${AGG_CAP} — кап=${cap} + phantom-эвикт"
     echo "$PCT" > "$TIER_F" 2>/dev/null || true
     exit 0
 fi
@@ -3941,10 +4294,14 @@ if [ "$PREV_MODE" = "attack" ]; then
     logger -t "$TAG" "RECOVERY: rate=${RATE}/s conntrack=${CNT}(${PCT}%) phantom-ratio=${PHR}% ниже порогов — кап снят, evict очищен"
 fi
 echo normal > "$MODE_F" 2>/dev/null || true
-# EWMA только в normal (чтобы атака не отравляла норму)
-NB_RATE=$(awk -v o="$BASE_RATE" -v s="$RATE" -v a="$ALPHA_NUM" 'BEGIN{printf "%.0f", o*(100-a)/100 + s*a/100}')
-NB_CT=$(awk -v o="$BASE_CT" -v s="$CNT" -v a="$ALPHA_NUM" 'BEGIN{printf "%.0f", o*(100-a)/100 + s*a/100}')
-echo "$NB_RATE $NB_CT" > "$BASE_F" 2>/dev/null || true
+# EWMA только в normal И только на ЧИСТОМ окне (ANOM_CNT==0). v3.27.0 FIX(#9)/v3.27.1: иначе
+# аномалия в окне дебаунса (streak>0, ещё не attack) подняла бы базлайн и сделала
+# будущий ×N-триггер недостижимым (атакующий «приучает» норму).
+if [ "${ANOM_CNT:-0}" -eq 0 ] 2>/dev/null; then
+    NB_RATE=$(awk -v o="$BASE_RATE" -v s="$RATE" -v a="$ALPHA_NUM" 'BEGIN{printf "%.0f", o*(100-a)/100 + s*a/100}')
+    NB_CT=$(awk -v o="$BASE_CT" -v s="$CNT" -v a="$ALPHA_NUM" 'BEGIN{printf "%.0f", o*(100-a)/100 + s*a/100}')
+    echo "$NB_RATE $NB_CT" > "$BASE_F" 2>/dev/null || true
+fi
 if [ "$PCT" -ge "$WARN" ] 2>/dev/null && [ "$PCT" -lt "$HIGH" ] 2>/dev/null; then
     logger -t "$TAG" "WARN: conntrack ${PCT}% (${CNT}/${MAX}) — наблюдаю"
 fi
@@ -3960,7 +4317,13 @@ Wants=shieldnode-nftables.service
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/shieldnode-ctguard.sh
-Nice=-5
+# v3.27.0 FIX(#12): Nice -5 → 10. В attack-mode ctguard делает дорогой conntrack -L
+# дамп каждые 15с; с отрицательным nice он отбирал CPU у Xray ИМЕННО когда тот
+# критичен → частичная атака превращалась в полный аутаж. Guard теперь уступает
+# VPN-сервису (положительный nice + idle-IO + низкий CPUWeight).
+Nice=10
+CPUWeight=20
+IOSchedulingClass=idle
 SPCTU
 
 cat > /etc/systemd/system/shieldnode-ctguard.timer <<'SPCTT'
@@ -4084,6 +4447,8 @@ LOG_TAG="protected-ports"
 FIREWALL_TYPE="$FIREWALL_TYPE"
 # v3.10.2 BUG-7: SSH_PORTS — все sshd-listener порты (для multi-SSH setup'ов)
 SSH_PORTS="$SSH_PORTS"
+# v3.27.1 FIX(#6): включать ли SSH-порты в synproxy sp_ports при ресинке портов
+SHIELD_SYNPROXY_SSH="${SHIELD_SYNPROXY_SSH}"
 
 # Если nft-таблицы нет — выходим
 if ! nft list table inet ddos_protect >/dev/null 2>&1; then
@@ -4365,9 +4730,13 @@ if [ $? -eq 0 ]; then
     # sp_ports заполнялся один раз при install — без этого synproxy защищал бы старые
     # порты после смены портов фаервола. Сет не пересоздаём → flags interval+auto-merge
     # сохраняются (add element в существующий set авто-мёрджит пересечения).
+    # v3.27.1 FIX(#6): добавляем SSH-порты (если SHIELD_SYNPROXY_SSH=1), иначе ресинк
+    # затёр бы SSH-покрытие, добавленное модулем.
     if [ -n "$NEW_TCP" ] && nft list table inet shield_synproxy >/dev/null 2>&1; then
-        SYN_ERR=$(printf 'flush set inet shield_synproxy sp_ports\nadd element inet shield_synproxy sp_ports { %s }\n' "$(echo "$NEW_TCP" | sed 's/,/, /g')" | nft -f - 2>&1) \
-            && logger -t "$LOG_TAG" "synproxy sp_ports синхронизирован: {$NEW_TCP}" \
+        SP_PORTS_SYNC="$NEW_TCP"
+        [ "${SHIELD_SYNPROXY_SSH:-1}" = "1" ] && [ -n "${SSH_PORTS:-}" ] && SP_PORTS_SYNC="${SP_PORTS_SYNC},${SSH_PORTS}"
+        SYN_ERR=$(printf 'flush set inet shield_synproxy sp_ports\nadd element inet shield_synproxy sp_ports { %s }\n' "$(echo "$SP_PORTS_SYNC" | sed 's/,/, /g')" | nft -f - 2>&1) \
+            && logger -t "$LOG_TAG" "synproxy sp_ports синхронизирован: {$SP_PORTS_SYNC}" \
             || logger -t "$LOG_TAG" "WARN: synproxy sp_ports sync failed: $SYN_ERR"
     fi
 else
@@ -4560,10 +4929,10 @@ FAIL_COUNTER="$STATE_DIR/${NAME}_fail_count"
 
 # nft set name (legacy compat для tor → tor_exit_blocklist_v4)
 case "$NAME" in
-    scanner)   NFT_SET="scanner_blocklist_v4" ;;
-    threat)    NFT_SET="threat_blocklist_v4"  ;;
-    tor)       NFT_SET="tor_exit_blocklist_v4" ;;
-    custom)    NFT_SET="custom_blocklist_v4"  ;;
+    scanner)   NFT_SET="scanner_blocklist_v4" ; NFT_SET_V6="scanner_blocklist_v6" ;;
+    threat)    NFT_SET="threat_blocklist_v4"  ; NFT_SET_V6="threat_blocklist_v6"  ;;
+    tor)       NFT_SET="tor_exit_blocklist_v4" ; NFT_SET_V6="tor_exit_blocklist_v6" ;;
+    custom)    NFT_SET="custom_blocklist_v4"  ; NFT_SET_V6="custom_blocklist_v6"  ;;
     # v3.20.0: mobile_ru + broadband_ru УБРАНЫ
 esac
 
@@ -4628,10 +4997,12 @@ if [ -n "$REMOTE_URLS" ]; then
         url="${url## }"; url="${url%% }"   # trim spaces
         [ -z "$url" ] && continue
         REMOTE_TRIED=$((REMOTE_TRIED + 1))
-        # JSON-формат (MISP/CIRCL) — отдельная обработка через jq
+        # JSON-формат (MISP/CIRCL/Spamhaus DROP) — отдельная обработка через jq
         if echo "$url" | grep -qE '\.json($|\?)' && command -v jq >/dev/null 2>&1; then
             if curl -fsSL --max-time 30 --retry 2 "$url" -o "$TMP/dl-$REMOTE_TRIED.json" 2>/dev/null; then
-                jq -r '..|strings? | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+(/[0-9]+)?$"))' \
+                # v3.27.2: эмитим И v4, И v6 CIDR-строки (Spamhaus drop_v6.json → threat_v6).
+                # v6-валидация/bogon-фильтр делает v6-парсер ниже; nft валидит при add.
+                jq -r '..|strings? | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+(/[0-9]+)?$") or test("^[0-9a-fA-F:]*:[0-9a-fA-F:]*(/[0-9]+)?$"))' \
                     "$TMP/dl-$REMOTE_TRIED.json" 2>/dev/null >> "$TMP/all.raw" && \
                     REMOTE_DOWNLOADED=$((REMOTE_DOWNLOADED + 1))
             else
@@ -4752,6 +5123,43 @@ if [ "$V4_COUNT" -gt "$MAX_FEED_ENTRIES" ]; then
     exit 1
 fi
 
+# 5.1) v3.27.0 FIX(#7): параллельный IPv6-парсинг того же фида. v6 часто 0 — это НЕ
+# ошибка (min-check к v6 НЕ применяем). Префикс-флор V6_MIN_PREFIX отсекает ::/0 и
+# слишком широкие блоки (compromised feed). Bogons/ULA/link-local/multicast/doc — drop.
+# nft valid'ит каждый элемент при add (backstop против битого синтаксиса).
+case "$NAME" in
+    threat) V6_MIN_PREFIX=29 ;;   # v3.27.2: было /32 — отвергало /29 Spamhaus drop_v6 (RIR-min). /29 = практический потолок широты v6-блока
+    *)      V6_MIN_PREFIX=24 ;;
+esac
+grep -oiE '^[[:space:]]*([0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}(/[0-9]{1,3})?' "$TMP/all.raw" 2>/dev/null | \
+    awk '{ sub(/^[[:space:]]+/, ""); print tolower($0) }' | \
+    awk -v minp="$V6_MIN_PREFIX" '
+    {
+        raw = $0; addr = raw; pfx = 128; hascidr = 0
+        if (index(raw, "/") > 0) { split(raw, a, "/"); addr = a[1]; pfx = a[2] + 0; hascidr = 1 }
+        if (pfx < minp || pfx > 128) next
+        if (addr == "::" || addr == "::1") next                  # unspecified / loopback
+        if (addr ~ /^fe[89ab]/) next                              # fe80::/10 link-local
+        if (addr ~ /^f[cd]/)    next                              # fc00::/7 ULA
+        if (addr ~ /^ff/)       next                              # ff00::/8 multicast
+        if (addr ~ /^2001:0?db8:/) next                           # 2001:db8::/32 documentation
+        if (addr ~ /^::ffff:/)  next                              # v4-mapped (обрабатывается как v4)
+        if (addr ~ /^64:ff9b:/) next                              # NAT64 well-known
+        if (addr !~ /:/) next                                     # обязан содержать ":"
+        # структурная валидация (анти-truncation от greedy grep: отсекаем обрезки "2606:4700:")
+        if (addr ~ /:$/ && addr !~ /::$/) next                    # одиночный ":" в конце → обрезок
+        if (addr ~ /^:/  && addr !~ /^::/) next                   # одиночный ":" в начале
+        tmp = addr; ncol = gsub(/:/, ":", tmp)                    # счётчик ":" (tmp не меняется)
+        if (addr ~ /::/) { if (ncol > 7) next }                   # с компрессией: не больше 7 ":"
+        else { if (ncol != 7) next }                              # без компрессии: ровно 8 групп (7 ":")
+        print (hascidr ? addr "/" pfx : addr)
+    }' | sort -u > "$TMP/parsed6.list"
+V6_COUNT=$(wc -l < "$TMP/parsed6.list"); V6_COUNT="${V6_COUNT:-0}"
+if [ "$V6_COUNT" -gt "$MAX_FEED_ENTRIES" ]; then
+    logger -t "$LOG_TAG" "ABORT(v6): feed has $V6_COUNT v6 entries (>$MAX_FEED_ENTRIES) — suspicious, пропускаю v6"
+    : > "$TMP/parsed6.list"; V6_COUNT=0
+fi
+
 # 5.5) v3.23.4: Health warning — если получили намного меньше чем когда-то.
 # Источники могут "тихо умирать": URL поменялся, repo удалили, ToS-change.
 # Сохраняем peak в state-файле. Auto-reset: если current >= 80% от peak,
@@ -4793,7 +5201,12 @@ if [ "$V4_COUNT" -lt "$MIN_ENTRIES" ]; then
     exit 1
 fi
 
-# 7) Атомарный flush + add (одна nft транзакция)
+# 7) v4 — атомарный flush + add (как раньше). v6 — ОТДЕЛЬНОЙ транзакцией ниже, чтобы
+# битый v6-элемент (например, обрезок от greedy-парсинга) НЕ ломал применение v4.
+HAVE_V6_SET=0
+if [ -n "${NFT_SET_V6:-}" ] && nft list set inet ddos_protect "$NFT_SET_V6" >/dev/null 2>&1; then
+    HAVE_V6_SET=1
+fi
 {
     echo "flush set inet ddos_protect $NFT_SET"
     if [ -s "$TMP/parsed.list" ]; then
@@ -4805,16 +5218,37 @@ fi
     fi
 } > "$TMP/nft-batch"
 
+V4_OK=0
 if nft -f "$TMP/nft-batch" 2>"$TMP/nft.err"; then
-    # Reset fail counter on success
     echo 0 > "$FAIL_COUNTER"
-    logger -t "$LOG_TAG" "Updated $NFT_SET: $V4_COUNT IPv4 подсетей (remote=$REMOTE_DOWNLOADED/$REMOTE_TRIED, local=$LOCAL_FOUND)"
-    exit 0
+    V4_OK=1
 else
     logger -t "$LOG_TAG" "ERROR: nft -f failed: $(cat "$TMP/nft.err")"
-    CURRENT=$(cat "$FAIL_COUNTER" 2>/dev/null || echo 0)
-    CURRENT="${CURRENT:-0}"
+    CURRENT=$(cat "$FAIL_COUNTER" 2>/dev/null || echo 0); CURRENT="${CURRENT:-0}"
     echo $((CURRENT + 1)) > "$FAIL_COUNTER"
+fi
+
+# 7.1) v3.27.0 FIX(#7): v6-транзакция (изолирована — не влияет на статус/exit v4).
+V6_APPLIED=0
+if [ "$HAVE_V6_SET" = "1" ] && [ -s "$TMP/parsed6.list" ]; then
+    {
+        echo "flush set inet ddos_protect $NFT_SET_V6"
+        awk -v setname="$NFT_SET_V6" '
+            NR % 1000 == 1 { if (NR > 1) print "}"; printf "add element inet ddos_protect %s { ", setname }
+            { printf "%s%s", (NR % 1000 == 1 ? "" : ", "), $0 }
+            END { print " }" }' "$TMP/parsed6.list"
+    } > "$TMP/nft-batch6"
+    if nft -f "$TMP/nft-batch6" 2>"$TMP/nft6.err"; then
+        V6_APPLIED="$V6_COUNT"
+    else
+        logger -t "$LOG_TAG" "WARN(v6): nft -f failed for $NFT_SET_V6 ($(cat "$TMP/nft6.err")) — v6 пропущен, v4 не затронут"
+    fi
+fi
+
+if [ "$V4_OK" = "1" ]; then
+    logger -t "$LOG_TAG" "Updated $NFT_SET: $V4_COUNT IPv4 + $V6_APPLIED IPv6 подсетей (remote=$REMOTE_DOWNLOADED/$REMOTE_TRIED, local=$LOCAL_FOUND)"
+    exit 0
+else
     exit 1
 fi
 UPDATER_EOF
@@ -6490,7 +6924,7 @@ CREATE TABLE IF NOT EXISTS aggregator_state (
 );
 
 -- v3.12.0: ASN/owner кэш для guard CLI top-attackers column
--- TTL 7 дней (cached_at + 604800 < now → re-fetch from ipinfo.io/<IP>)
+-- TTL 7 дней (cached_at + 604800 < now → re-lookup via Team Cymru whois)
 CREATE TABLE IF NOT EXISTS asn_cache (
     ip         TEXT PRIMARY KEY,
     asn        TEXT,
@@ -7833,7 +8267,7 @@ human_num() {
     printf "%'d" "${1:-0}" 2>/dev/null || echo "${1:-0}"
 }
 
-# v3.12.0: ASN/owner lookup для top attackers через ipinfo.io.
+# v3.12.0: ASN/owner lookup для top attackers. v3.27.2: через Team Cymru whois.
 # Кэш в events.db (asn_cache table), TTL 7 дней.
 # При no-internet или rate-limit возвращает "?" — guard продолжает работать.
 asn_ttl=604800   # 7 дней
@@ -7864,38 +8298,32 @@ asn_cache_put() {
 }
 
 asn_lookup_remote() {
-    # v3.22.0: таймаут 2s → 0.5s. Защита от 40-сек freeze guard при недоступности
-    # ipinfo.io. Эмпирически RU→US latency = 200-400ms, 500ms даёт запас 25%.
-    # Если стабильно >500ms — IP остаётся "?" в дашборде, но guard не лагает.
-    # Также: ASN_OFFLINE_MODE marker — если первый запрос за этот run guard'а
-    # упал → дальше пропускаем ipinfo.io вообще (все остальные IP → "?" мгновенно).
+    # v3.27.2 FIX(#3): ipinfo.io (legacy free API) заменён на Team Cymru whois.
+    # Причина: ipinfo legacy без токена = 1000 req/день ОБЩИЕ на исходящий IP +
+    # deprecation-путь + утечка IP атакующих коммерческому geoIP. Team Cymru: без
+    # ключа, поддерживается, отдаёт ASN+owner одним запросом, стандарт в netsec.
+    # Нужен пакет 'whois' (best-effort ставится; нет → "?" в дашборде, не лагает).
     local ip="$1"
-    # Offline-mode short-circuit
     if [ -n "${SHIELDNODE_ASN_OFFLINE:-}" ]; then
         return 1
     fi
+    command -v whois >/dev/null 2>&1 || { export SHIELDNODE_ASN_OFFLINE=1; return 1; }
     local resp
-    resp=$(curl -fsSL --max-time 0.5 "https://ipinfo.io/${ip}" 2>/dev/null)
+    # timeout-обёртка: whois может зависнуть; 2с — запас для RU→Cymru.
+    resp=$(timeout 2 whois -h whois.cymru.com " -v $ip" 2>/dev/null)
     if [ -z "$resp" ]; then
-        # Помечаем offline для последующих вызовов в текущем процессе
         export SHIELDNODE_ASN_OFFLINE=1
         return 1
     fi
-    # Парсим без jq (минимизация зависимостей):
-    #   "org": "AS12958 T2 Mobile LLC"
-    #   "country": "RU"
-    local org country asn owner
-    org=$(echo "$resp"     | grep -oE '"org"[[:space:]]*:[[:space:]]*"[^"]*"' | sed -E 's/.*"([^"]*)"$/\1/')
-    country=$(echo "$resp" | grep -oE '"country"[[:space:]]*:[[:space:]]*"[^"]*"' | sed -E 's/.*"([^"]*)"$/\1/')
-    if [ -n "$org" ]; then
-        asn=$(echo "$org"   | awk '{print $1}')
-        owner=$(echo "$org" | cut -d' ' -f2-)
-    fi
-    echo "${asn:-?}|${owner:-?}|${country:-?}"
+    # Формат Cymru -v (pipe-delimited): AS | IP | BGP Prefix | CC | Registry | Allocated | AS Name
+    # Берём строку, где первое поле — чистое число (данные, не заголовок/NA).
+    echo "$resp" | awk -F'|' '
+        { for (i=1;i<=NF;i++){ gsub(/^[ \t]+|[ \t]+$/,"",$i) } }
+        $1 ~ /^[0-9]+$/ { printf "AS%s|%s|%s\n", $1, ($7==""?"?":$7), ($4==""?"?":$4); exit }'
 }
 
 # Lookup IP → "owner (country)" string (для отображения).
-# Использует кэш + если miss/expired → один запрос к ipinfo.io.
+# Использует кэш + если miss/expired → один lookup через Team Cymru whois.
 asn_owner_string() {
     local ip="$1"
     local cached; cached=$(asn_cache_get "$ip")
@@ -7971,6 +8399,13 @@ draw_snapshot() {
     [ "$THREAT_SET_SIZE" -gt 0 ] && bl_summary+=", threat=$(human_num "$THREAT_SET_SIZE")"
     [ "$TOR_SET_SIZE"    -gt 0 ] && bl_summary+=", tor=$(human_num "$TOR_SET_SIZE")"
     bl_summary+=", custom=$(human_num "$CUSTOM_SET_SIZE")"   # v3.23.18: всегда видно (даже 0)
+    # v3.27.0 FIX(#7): суммарный v6-blocklist (если фиды отдали v6)
+    BL_V6_TOTAL=0
+    for s in scanner_blocklist_v6 threat_blocklist_v6 custom_blocklist_v6 tor_exit_blocklist_v6; do
+        _n=$(nft list set inet ddos_protect "$s" 2>/dev/null | tr '\n' ' ' | grep -oiE '([0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}(/[0-9]+)?' | grep -c ':')
+        BL_V6_TOTAL=$(( BL_V6_TOTAL + ${_n:-0} ))
+    done
+    [ "$BL_V6_TOTAL" -gt 0 ] 2>/dev/null && bl_summary+=", ${C}v6=$(human_num "$BL_V6_TOTAL")${N}"
     printf  "  └─ ${DIM}blocklists${N}          %s\n" "$bl_summary"
     # v3.20.0+: mobile-RU и broadband-RU whitelist строки УБРАНЫ (whitelist'ы удалены)
     echo ""
@@ -8015,6 +8450,29 @@ draw_snapshot() {
     # ===== SYNPROXY (v3.26.1) =====
     if nft list table inet shield_synproxy >/dev/null 2>&1; then
         printf "  ${B}synproxy${N}    ${G}active${N} ${DIM}(SYN перехват до conntrack)${N}\n"
+    elif [ -f /var/lib/shieldnode/.synproxy-degraded ]; then
+        # v3.27.0 FIX(#5): не молчим о деградации
+        printf "  ${B}synproxy${N}    ${R}DEGRADED${N} ${DIM}(не включился — SYN-защита ослаблена; %s)${N}\n" "$(grep -m1 '^reason=' /var/lib/shieldnode/.synproxy-degraded 2>/dev/null | cut -d= -f2)"
+        printf "             ${DIM}fix: apt install linux-modules-extra-\$(uname -r) && shieldnode-synproxy.sh on${N}\n"
+    fi
+
+    # ===== v3.27.0 FIX(#10): BRIDGE/WHITELIST DRIFT ADVISORY (read-only, O(1) на IP) =====
+    # TRUSTED_IPS из conf, которых НЕТ в живом nft manual_whitelist_v4 → их трафик
+    # пойдёт через conn_flood/rate-лимиты. Для bridge/upstream-ноды (агрегирует всех
+    # клиентов с одного IP) это = риск бана и аутажа downstream. Подсказываем, не чиним.
+    if [ -r /etc/shieldnode/shieldnode.conf ] && nft list set inet ddos_protect manual_whitelist_v4 >/dev/null 2>&1; then
+        _ti=$(grep -E '^TRUSTED_IPS=' /etc/shieldnode/shieldnode.conf 2>/dev/null | head -1 | sed -E 's/^TRUSTED_IPS="?([^"]*)"?.*/\1/')
+        _miss=""
+        IFS=',' read -ra _arr <<< "$_ti"
+        for _ip in "${_arr[@]}"; do
+            _ip=$(echo "$_ip" | tr -d ' '); [ -z "$_ip" ] && continue
+            case "$_ip" in */*) continue ;; esac   # CIDR живёт в whitelist-local, не в single-set
+            nft get element inet ddos_protect manual_whitelist_v4 "{ $_ip }" >/dev/null 2>&1 || _miss="${_miss:+$_miss }$_ip"
+        done
+        if [ -n "$_miss" ]; then
+            printf "  ${Y}⚠ whitelist drift${N} ${DIM}TRUSTED_IPS не в nft manual_whitelist_v4:${N} ${Y}%s${N}\n" "$_miss"
+            printf "             ${DIM}их трафик идёт через лимиты — мост/upstream рискует баном. Проверь UFW 'ALLOW from' / whitelist-local.txt${N}\n"
+        fi
     fi
 
     # ===== PROTECTED PORTS =====
@@ -8561,6 +9019,7 @@ show_settings_menu() {
                     _write_setting "BLOCK_TOR" "0"
                     rm -f /etc/shieldnode/block_tor
                     nft flush set inet ddos_protect tor_exit_blocklist_v4 2>/dev/null
+                    nft flush set inet ddos_protect tor_exit_blocklist_v6 2>/dev/null   # v3.27.0 FIX(#7): v6 parity
                     systemctl disable --now shieldnode-update@tor.timer >/dev/null 2>&1
                     echo -e "  ${G}✓${N} Tor blocklist ${R}disabled${N}"
                 else
