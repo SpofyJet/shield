@@ -1,6 +1,33 @@
 #!/bin/bash
 
 # ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.28.0 — REMNAWAVE FLEET AUTO-SYNC
+#
+#  Боль: при ручном whitelist'е (TRUSTED_IPS/BRIDGE_IPS) добавление новой ноды
+#  требовало идти и обновлять список IP на КАЖДОЙ ноде флота. Теперь — авто.
+#
+#  Что добавлено:
+#    - Даёшь токен Remnawave-панели (REMNAWAVE_URL + REMNAWAVE_TOKEN) → shieldnode
+#      в фоне (systemd-таймер, дефолт 5 мин) тянет GET /api/nodes по Bearer-токену,
+#      резолвит address каждой ноды (IP или hostname → getent A/AAAA) и держит
+#      nft-сеты remnawave_nodes_v4/v6 в актуальном виде. Новую ноду добавил в
+#      панель → ВСЕ ноды подхватят её на следующем тике, без ручной правки.
+#    - Эти сеты accept'ятся сразу после manual_whitelist (bypass всех лимитов) —
+#      это СВОИ серверы, не CGNAT → CGNAT-safe. Логическое завершение FIX#10.
+#    - Включается авто, если заданы URL+TOKEN (SHIELD_REMNAWAVE_SYNC=auto|1|0).
+#      Передать при install:  REMNAWAVE_URL=... REMNAWAVE_TOKEN=... curl ... | sudo bash
+#    - Токен НЕ в shieldnode.conf (0640) — в /etc/shieldnode/remnawave.env (root:root
+#      0600). На re-install/upgrade восстанавливается из него (env заново не нужен).
+#    - FAIL-SAFE: панель недоступна / кривой ответ / 0 валидных IP → текущий whitelist
+#      нод НЕ трогаем (last-known-good). Иначе сбой панели «разбанил» бы весь флот и
+#      ноды начали бы лимитировать друг друга. Применение — ОТДЕЛЬНОЙ nft-транзакцией
+#      (битые данные не ломают ddos_protect) и только если сет существует.
+#    - guard показывает статус fleet-sync + число нод (v4/v6) + время последнего синка.
+#    - uninstall чистит юнит/скрипт/токен-файл.
+#
+#  Зависимости: curl + jq (уже требуются). Резолв hostname — getent (без новых пакетов).
+#
+# ==============================================================================
 #  VPN NODE DDoS PROTECTION v3.27.2 — DEPENDENCY/FEED CURRENCY
 #
 #  Внешние фиды/API дрейфанули в 2024–2025 (сам код свежий, но третьи стороны
@@ -606,7 +633,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.27.2"
+SHIELDNODE_VERSION="3.28.0"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -946,6 +973,19 @@ SHIELD_CT_CONN_FLOOD_MINUS_1=$((SHIELD_CT_CONN_FLOOD - 1))
 # Управление через 'sudo guard' → [s] settings → [t] Trusted IPs.
 TRUSTED_IPS="${TRUSTED_IPS:-}"
 
+# v3.28.0: Remnawave fleet auto-sync. Вместо ручного перечисления IP нод/бриджей в
+# TRUSTED_IPS на КАЖДОЙ ноде — даёшь токен панели, и shieldnode в фоне (таймер)
+# тянет GET /api/nodes и держит nft-сет remnawave_nodes_v4/v6 в актуальном виде.
+# Новую ноду добавил в панель → все ноды подхватят её сами. Это СВОИ серверы →
+# whitelist безопасен (не CGNAT). Токен НЕ кладётся в shieldnode.conf (0640) —
+# хранится в /etc/shieldnode/remnawave.env (root:root 0600). Передать при install:
+#   REMNAWAVE_URL="https://panel.example.com" REMNAWAVE_TOKEN="ey..." curl ... | sudo bash
+# SHIELD_REMNAWAVE_SYNC: auto (вкл, если есть URL+TOKEN) | 1 (форс) | 0 (выкл).
+REMNAWAVE_URL="${REMNAWAVE_URL:-}"
+REMNAWAVE_TOKEN="${REMNAWAVE_TOKEN:-}"
+SHIELD_REMNAWAVE_SYNC="${SHIELD_REMNAWAVE_SYNC:-auto}"
+SHIELD_REMNAWAVE_INTERVAL="${SHIELD_REMNAWAVE_INTERVAL:-5min}"
+
 # v3.23.13 LEGACY CLEANUP:
 # Удалены deprecated переменные (v3.20.0):
 #   ENABLE_RU_MOBILE_WHITELIST, ENABLE_RU_BROADBAND_WHITELIST,
@@ -1001,6 +1041,7 @@ if [ "${1:-}" = "--uninstall" ]; then
                 shieldnode-logrotate.timer shieldnode-logrotate.service \
                 shieldnode-cleanup.timer shieldnode-cleanup.service \
                 shieldnode-whitelist.path shieldnode-whitelist.service \
+                shieldnode-remnawave-sync.timer shieldnode-remnawave-sync.service \
                 shieldnode-synproxy.service; do
         systemctl disable --now "$unit" 2>/dev/null || true
         rm -f "/etc/systemd/system/$unit"
@@ -1027,6 +1068,7 @@ if [ "${1:-}" = "--uninstall" ]; then
     rm -f /usr/local/sbin/shieldnode-whitelist-updater.sh
     rm -f /usr/local/sbin/shieldnode-synproxy.sh /etc/shieldnode/synproxy.nft /etc/sysctl.d/99-shieldnode-synproxy.conf  # v3.23.16
     rm -f /usr/local/sbin/shieldnode-ctguard.sh  # v3.24.0
+    rm -f /usr/local/sbin/shieldnode-remnawave-sync.sh /etc/shieldnode/remnawave.env /var/lib/shieldnode/remnawave-nodes.list  # v3.28.0
     rm -f /etc/systemd/system/shieldnode-ctguard.service /etc/systemd/system/shieldnode-ctguard.timer  # v3.24.0
     nft delete table inet shield_ctguard 2>/dev/null || true  # v3.24.0
     rm -f /usr/local/sbin/shieldnode-defaults.sh
@@ -2955,6 +2997,8 @@ if ip -6 addr show scope global 2>/dev/null | grep -qE 'inet6 (2[0-9a-f]|3[0-9a-
     counter conn6_blocked { }
     counter ssh6_flood { }"
     SHIELD_V6_RULES="        # === v3.23.15 P0-1: базовая IPv6-защита (established уже принят выше) ===
+        # v3.28.0: ноды флота (v6) из Remnawave — bypass как whitelist. Пустой сет = no-op.
+        meta nfproto ipv6 ip6 saddr @remnawave_nodes_v6 counter name remnawave_nodes_pass_v6 accept
         # v3.27.0 FIX(#7): v6 blocklist-drops ПЕРЕД остальным (бьют и SSH-over-v6).
         meta nfproto ipv6 ip6 saddr @threat_blocklist_v6 counter drop
         meta nfproto ipv6 ip6 saddr @custom_blocklist_v6 counter drop
@@ -3236,6 +3280,25 @@ $SHIELD_V6_SETS
 $MANUAL_WHITELIST_V4_INIT
     }
 
+    # v3.28.0: авто-дискавери нод флота через Remnawave-панель. Заполняется
+    # shieldnode-remnawave-sync.sh (GET /api/nodes по Bearer-токену) → IP всех нод
+    # флота. Это СВОИ серверы (бриджи/ноды), не CGNAT-юзеры → whitelist безопасен.
+    # Пусто, пока синк не отработал/выключен → accept по пустому сету = no-op.
+    # Новую ноду добавил в панель — все ноды подхватят её на следующем тике, без
+    # ручного редактирования TRUSTED_IPS на каждой.
+    set remnawave_nodes_v4 {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        size 4096
+    }
+    set remnawave_nodes_v6 {
+        type ipv6_addr
+        flags interval
+        auto-merge
+        size 4096
+    }
+
     # v3.21.5: Infrastructure bypass — крупные CDN/cloud провайдеры
     # обходят rate-limit и conn_flood/newconn_rate, не попадая в events.db
     # как "атакующие". См. блок 3) Embedded CIDR baseline ниже.
@@ -3277,6 +3340,8 @@ $INFRASTRUCTURE_V6_INIT
     # Без log prefix — слишком много трафика. Только counter для observability.
     counter infrastructure_passes_v4 { }
     counter infrastructure_passes_v6 { }
+    counter remnawave_nodes_pass_v4 { } # v3.28.0: трафик от нод флота (auto-whitelist)
+    counter remnawave_nodes_pass_v6 { }
 
     chain prerouting {
         # v3.18.1: priority динамический ($SHIELD_PREROUTING_PRIO).
@@ -3290,6 +3355,10 @@ $INFRASTRUCTURE_V6_INIT
 
         # Manual whitelist (всегда первым приоритетом)
         ip saddr @manual_whitelist_v4 accept
+
+        # v3.28.0: ноды флота из Remnawave-панели (auto-discovery) — свои серверы,
+        # bypass всех лимитов как whitelist. Пустой сет = no-op.
+        ip saddr @remnawave_nodes_v4 counter name remnawave_nodes_pass_v4 accept
 
         # SSH защита перенесена ниже scanner_blocklist для эффективности
         # (см. блок === SSH PRE-AUTH FLOOD PROTECTION ===).
@@ -4847,6 +4916,172 @@ if [ "$HAS_PATH_UNIT" = "1" ]; then
     print_ok "Auto-sync активен: path-unit (мгновенно) + timer (5min catch-all)"
 else
     print_ok "Timer активен (синхронизация каждые 5 минут)"
+fi
+
+# ==============================================================================
+# ШАГ 5.6: REMNAWAVE FLEET AUTO-SYNC (v3.28.0)
+#   Авто-дискавери IP нод флота через Remnawave-панель → nft-whitelist в фоне.
+#   Решает боль «завёл новую ноду — иди обнови TRUSTED_IPS на всех нодах руками».
+# ==============================================================================
+RW_URL="${REMNAWAVE_URL:-}"; RW_TOKEN="${REMNAWAVE_TOKEN:-}"
+RW_SYNC="${SHIELD_REMNAWAVE_SYNC:-auto}"; RW_INTERVAL="${SHIELD_REMNAWAVE_INTERVAL:-5min}"
+# re-install/upgrade: если заново не передали — восстановим из сохранённого env
+if [ -z "$RW_URL" ] && [ -z "$RW_TOKEN" ] && [ -r /etc/shieldnode/remnawave.env ]; then
+    # shellcheck source=/dev/null
+    . /etc/shieldnode/remnawave.env 2>/dev/null || true
+    RW_URL="${REMNAWAVE_URL:-}"; RW_TOKEN="${REMNAWAVE_TOKEN:-}"
+fi
+RW_ENABLED=0
+if [ "$RW_SYNC" = "1" ] || { [ "$RW_SYNC" = "auto" ] && [ -n "$RW_URL" ] && [ -n "$RW_TOKEN" ]; }; then
+    RW_ENABLED=1
+fi
+
+if [ "$RW_ENABLED" = "1" ] && { [ -z "$RW_URL" ] || [ -z "$RW_TOKEN" ]; }; then
+    print_warn "Remnawave fleet-sync запрошен (SHIELD_REMNAWAVE_SYNC=1), но нет REMNAWAVE_URL/REMNAWAVE_TOKEN — пропускаю"
+    RW_ENABLED=0
+fi
+
+if [ "$RW_ENABLED" = "1" ]; then
+    # --- секретный env (токен НЕ в shieldnode.conf 0640) ---
+    ( umask 077; cat > /etc/shieldnode/remnawave.env <<EOF
+# v3.28.0: доступ к Remnawave-панели для авто-дискавери IP нод флота.
+# Токен чувствителен — root:root 0600. Токен: панель → Remnawave Settings → API Tokens.
+REMNAWAVE_URL="$RW_URL"
+REMNAWAVE_TOKEN="$RW_TOKEN"
+EOF
+    )
+    chown root:root /etc/shieldnode/remnawave.env 2>/dev/null || true
+    chmod 0600 /etc/shieldnode/remnawave.env 2>/dev/null || true
+
+    # --- sync-скрипт ---
+    cat > /usr/local/sbin/shieldnode-remnawave-sync.sh <<'RWEOF'
+#!/usr/bin/env bash
+# shieldnode-remnawave-sync.sh — тянет IP нод флота из Remnawave (GET /api/nodes)
+# и держит nft-сеты remnawave_nodes_v4/v6 в актуальном виде. Fail-safe: при любой
+# ошибке (панель недоступна / кривой ответ / 0 валидных IP) текущий whitelist НЕ
+# трогаем (last-known-good) — иначе сбой панели «разбанил» бы весь флот и ноды
+# начали бы лимитировать друг друга. -e НЕ ставим намеренно (ошибки обрабатываем).
+set -uo pipefail
+TAG="shieldnode-remnawave"
+ENVFILE="/etc/shieldnode/remnawave.env"
+STATE="/var/lib/shieldnode"; LIST="$STATE/remnawave-nodes.list"
+TABLE="inet ddos_protect"; SET4="remnawave_nodes_v4"; SET6="remnawave_nodes_v6"
+
+[ -r "$ENVFILE" ] || { logger -t "$TAG" "нет $ENVFILE — синк выключен"; exit 0; }
+# shellcheck source=/dev/null
+. "$ENVFILE"
+URL="${REMNAWAVE_URL:-}"; TOKEN="${REMNAWAVE_TOKEN:-}"
+[ -n "$URL" ] && [ -n "$TOKEN" ] || { logger -t "$TAG" "REMNAWAVE_URL/TOKEN пуст — выкл"; exit 0; }
+URL="${URL%/}"
+command -v curl >/dev/null 2>&1 || { logger -t "$TAG" "нет curl"; exit 1; }
+command -v jq   >/dev/null 2>&1 || { logger -t "$TAG" "нет jq (нужен для /api/nodes)"; exit 1; }
+mkdir -p "$STATE" 2>/dev/null || true
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+
+# 1) fetch — fail-safe при недоступности панели
+HTTP="$(curl -fsS --max-time 15 -o "$TMP/resp.json" -w '%{http_code}' \
+        -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
+        "$URL/api/nodes" 2>/dev/null || true)"
+if [ "$HTTP" != "200" ] || [ ! -s "$TMP/resp.json" ]; then
+    logger -t "$TAG" "панель недоступна (HTTP=$HTTP) — оставляю текущий whitelist нод (last-known-good)"
+    exit 0
+fi
+
+# 2) address каждой ноды (IP или hostname). Робастно к обёртке {response:[...]}.
+jq -r '.. | objects | .address? // empty' "$TMP/resp.json" 2>/dev/null | awk 'NF' | sort -u > "$TMP/addrs.txt"
+if [ ! -s "$TMP/addrs.txt" ]; then
+    logger -t "$TAG" "в ответе /api/nodes нет address — оставляю текущий whitelist (защита от кривого ответа)"
+    exit 0
+fi
+
+# 3) hostname → IP (getent: A и AAAA, без доп. зависимостей), разносим v4/v6
+: > "$TMP/v4.txt"; : > "$TMP/v6.txt"
+while IFS= read -r a; do
+    a="$(printf '%s' "$a" | tr -d '[:space:]')"; [ -n "$a" ] || continue
+    if printf '%s' "$a" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then echo "$a" >> "$TMP/v4.txt"; continue; fi
+    if printf '%s' "$a" | grep -qiE '^[0-9a-f]*:[0-9a-f:]+$'; then echo "$a" >> "$TMP/v6.txt"; continue; fi
+    getent ahosts "$a" 2>/dev/null | awk '{print $1}' | sort -u | while IFS= read -r ip; do
+        if printf '%s' "$ip" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then echo "$ip" >> "$TMP/v4.txt"
+        elif printf '%s' "$ip" | grep -qiE '^[0-9a-f]*:[0-9a-f:]+$'; then echo "$ip" >> "$TMP/v6.txt"; fi
+    done
+done < "$TMP/addrs.txt"
+
+# 4) финальная валидация + дедуп (октеты ≤255, не loopback/unspecified)
+awk -F. 'NF==4 && $1<=255 && $2<=255 && $3<=255 && $4<=255 && $1!=0 && $1!=127' "$TMP/v4.txt" | sort -u > "$TMP/v4.clean"
+grep -viE '^(::1|::)$' "$TMP/v6.txt" 2>/dev/null | sort -u > "$TMP/v6.clean"
+N4="$(wc -l < "$TMP/v4.clean" 2>/dev/null)"; N4="${N4:-0}"
+N6="$(wc -l < "$TMP/v6.clean" 2>/dev/null)"; N6="${N6:-0}"
+if [ "$N4" -eq 0 ] && [ "$N6" -eq 0 ]; then
+    logger -t "$TAG" "после резолва 0 валидных IP нод — оставляю текущий whitelist (fail-safe)"
+    exit 0
+fi
+
+# 5) применяем ОТДЕЛЬНОЙ nft-транзакцией (битые данные не ломают ddos_protect),
+#    только если сет существует (backward-compat со старой таблицей)
+apply_set(){
+    local set="$1" lf="$2"
+    nft list set "$TABLE" "$set" >/dev/null 2>&1 || return 0
+    {
+        echo "flush set $TABLE $set"
+        if [ -s "$lf" ]; then
+            awk -v s="$set" -v t="$TABLE" '
+                NR%500==1{ if(NR>1) print "}"; printf "add element %s %s { ", t, s }
+                { printf "%s%s", (NR%500==1?"":", "), $0 }
+                END{ if(NR>0) print " }" }' "$lf"
+        fi
+    } | nft -f - 2>"$TMP/nfterr"
+}
+RC=0
+apply_set "$SET4" "$TMP/v4.clean" || { logger -t "$TAG" "WARN: $SET4: $(cat "$TMP/nfterr" 2>/dev/null)"; RC=1; }
+apply_set "$SET6" "$TMP/v6.clean" || { logger -t "$TAG" "WARN: $SET6: $(cat "$TMP/nfterr" 2>/dev/null)"; RC=1; }
+
+# 6) persist для guard/visibility
+{ echo "# updated $(date -u +%FT%TZ) v4=$N4 v6=$N6 src=$URL/api/nodes"; cat "$TMP/v4.clean" "$TMP/v6.clean" 2>/dev/null; } > "$LIST" 2>/dev/null || true
+[ "$RC" = "0" ] && logger -t "$TAG" "whitelist нод обновлён: $N4 IPv4 + $N6 IPv6 (из $URL/api/nodes)"
+exit "$RC"
+RWEOF
+    chmod 0755 /usr/local/sbin/shieldnode-remnawave-sync.sh
+
+    # --- service + timer ---
+    cat > /etc/systemd/system/shieldnode-remnawave-sync.service <<EOF
+[Unit]
+Description=Sync Remnawave fleet node IPs into shieldnode whitelist
+After=nftables.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/shieldnode-remnawave-sync.sh
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RuntimeDirectory=shieldnode
+RuntimeDirectoryMode=0755
+ReadWritePaths=/var/lib/shieldnode /run/shieldnode
+EOF
+    cat > /etc/systemd/system/shieldnode-remnawave-sync.timer <<EOF
+[Unit]
+Description=Remnawave fleet sync (node IPs → whitelist) every $RW_INTERVAL
+Requires=shieldnode-remnawave-sync.service
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=$RW_INTERVAL
+AccuracySec=30s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now shieldnode-remnawave-sync.timer >/dev/null 2>&1
+    /usr/local/sbin/shieldnode-remnawave-sync.sh >/dev/null 2>&1 || true
+    print_ok "Remnawave fleet-sync активен (каждые $RW_INTERVAL): IP нод панели → whitelist авто"
+    print_info "  токен в /etc/shieldnode/remnawave.env (root:root 0600); лог: journalctl -t shieldnode-remnawave"
+    print_info "  новую ноду добавил в панель → все ноды подхватят её сами, TRUSTED_IPS править не нужно"
+else
+    print_info "Remnawave fleet-sync выкл — задай REMNAWAVE_URL + REMNAWAVE_TOKEN (env при install), чтобы IP нод подтягивались автоматически (без ручного TRUSTED_IPS на каждой ноде)"
 fi
 
 # ==============================================================================
@@ -8056,6 +8291,7 @@ HELP
         systemctl start protected-ports-update.timer 2>/dev/null || true
         systemctl start shieldnode-whitelist.path 2>/dev/null || true
         systemctl start shieldnode-update@custom.path 2>/dev/null || true
+        systemctl start shieldnode-remnawave-sync.service 2>/dev/null || true  # v3.28.0: переналить whitelist нод после reload
 
         echo ""
         echo "Rollback complete. Версия: $FROM_VER"
@@ -8472,6 +8708,18 @@ draw_snapshot() {
         if [ -n "$_miss" ]; then
             printf "  ${Y}⚠ whitelist drift${N} ${DIM}TRUSTED_IPS не в nft manual_whitelist_v4:${N} ${Y}%s${N}\n" "$_miss"
             printf "             ${DIM}их трафик идёт через лимиты — мост/upstream рискует баном. Проверь UFW 'ALLOW from' / whitelist-local.txt${N}\n"
+        fi
+    fi
+
+    # ===== v3.28.0: REMNAWAVE FLEET-SYNC STATUS =====
+    if [ -f /etc/shieldnode/remnawave.env ]; then
+        _rwn4=$(nft list set inet ddos_protect remnawave_nodes_v4 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u | wc -l)
+        _rwn6=$(nft list set inet ddos_protect remnawave_nodes_v6 2>/dev/null | tr ',' '\n' | grep -ciE '[0-9a-f]*:[0-9a-f:]+')
+        _rwts=$(grep -m1 -oE 'updated [0-9T:-]+Z' /var/lib/shieldnode/remnawave-nodes.list 2>/dev/null | sed 's/updated //')
+        if systemctl is-active --quiet shieldnode-remnawave-sync.timer 2>/dev/null; then
+            printf "  ${B}fleet-sync${N}  ${G}active${N} ${DIM}(ноды Remnawave → whitelist: %s v4 + %s v6%s)${N}\n" "${_rwn4:-0}" "${_rwn6:-0}" "${_rwts:+, last $_rwts}"
+        else
+            printf "  ${B}fleet-sync${N}  ${Y}настроен, таймер не активен${N} ${DIM}(systemctl enable --now shieldnode-remnawave-sync.timer)${N}\n"
         fi
     fi
 
