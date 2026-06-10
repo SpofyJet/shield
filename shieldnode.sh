@@ -1,6 +1,29 @@
 #!/bin/bash
 
 # ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.28.3 — FIX интерактивного выбора (объединение)
+#
+#  Баг (репорт): при `guard upgrade` показывался СТАРЫЙ вопрос про bridge-IP, а
+#  выбора «токен или IP» (v3.28.1) не было.
+#  Причины:
+#    1) Выбор v3.28.1 и существующий с v3.18 промпт «Bridge/Upstream nodes» — это
+#       были ДВА РАЗНЫХ вопроса. На настроенной/обычной ноде они дублировались бы
+#       (спросили бы дважды). Теперь это ОДИН вопрос: старый bridge-промпт заменён
+#       на выбор 1) Remnawave токен / 2) вручную IP бриджей / 3) пропустить.
+#    2) Старый промпт читал stdin и был завязан на `[ -t 0 ]` → в pipe-режиме
+#       (curl|bash) он пропускался. Теперь интерактивность определяется по наличию
+#       /dev/tty, а чтение идёт с /dev/tty → вопрос работает И в `guard upgrade`,
+#       И в `curl|bash`. Headless/CI (нет /dev/tty) — тихо пропуск (env), как было.
+#    3) Опрос пропускается, если whitelist нод уже настроен (BRIDGE_IPS, TRUSTED_IPS,
+#       remnawave.env или REMNAWAVE_URL+TOKEN) → апгрейды настроенных нод не
+#       переспрашивают. Вариант (2) кормит прежнюю логику BRIDGE_IPS; вариант (1) —
+#       fleet-sync (токен пишется в remnawave.env на ШАГ 5.6).
+#
+#  ВАЖНО про деплой: `guard upgrade` тянет shieldnode.sh с GitHub (ветка main).
+#  Чтобы выбор появился на нодах — сначала задеплой эту версию (deploy-shield.sh),
+#  потом `guard upgrade` на ноде.
+#
+# ==============================================================================
 #  VPN NODE DDoS PROTECTION v3.28.2 — FIX отображения v6 в guard
 #
 #  В строке "blocklists" дашборда вокруг счётчика v6 печатался сырой
@@ -663,7 +686,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.28.2"
+SHIELDNODE_VERSION="3.28.3"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -1319,68 +1342,8 @@ if [ -r "$PREINSTALL_CONF" ]; then
     shield_safe_source "$PREINSTALL_CONF"
 fi
 
-# ============================================================================
-# v3.28.1: интерактивный выбор метода whitelist'а нод флота (ПЕРЕД установкой).
-#   Спрашиваем РАНО (до apt/долгих операций), чтобы оператор ответил и ушёл.
-#   1) Remnawave токен → авто-дискавери всех нод (новую ноду добавил в панель →
-#      все ноды подхватят сами). 2) Вручную IP нод/бриджей (TRUSTED_IPS). 3) Skip.
-#   Показываем ТОЛЬКО если ещё не сконфигурено (env/conf/remnawave.env/TRUSTED_IPS),
-#   синк не выключен жёстко и есть управляющий терминал. В headless/CI (нет /dev/tty)
-#   — тихо пропускаем (работает env). В pipe-режиме (curl|bash) stdin=pipe → /dev/tty.
-# ============================================================================
+# v3.28.3: helper — есть ли управляющий терминал (работает и в curl|bash через /dev/tty).
 shield_have_tty(){ { true >/dev/tty; } 2>/dev/null && [ -r /dev/tty ]; }
-_wl_have_token=0
-{ [ -n "${REMNAWAVE_URL:-}" ] && [ -n "${REMNAWAVE_TOKEN:-}" ]; } && _wl_have_token=1
-[ -r /etc/shieldnode/remnawave.env ] && _wl_have_token=1
-_wl_have_trusted=0; [ -n "${TRUSTED_IPS:-}" ] && _wl_have_trusted=1
-
-if [ "$_wl_have_token" = "0" ] && [ "$_wl_have_trusted" = "0" ] && \
-   [ "${SHIELD_REMNAWAVE_SYNC:-auto}" != "0" ] && [ "${SHIELD_WL_PROMPT:-1}" = "1" ] && \
-   shield_have_tty; then
-    {
-        printf '\n─── Whitelist нод флота (бриджей) ───\n'
-        printf 'Чтобы ноды/бриджи не резались лимитами, их IP должны быть в whitelist.\n'
-        printf '  1) Remnawave токен  — авто: тянем IP всех нод из панели и держим\n'
-        printf '                        актуальными. Новую ноду добавил в панель →\n'
-        printf '                        все ноды подхватят сами. (рекомендуется)\n'
-        printf '  2) Вручную IP       — перечислить IP нод/бриджей (TRUSTED_IPS).\n'
-        printf '  3) Пропустить       — настрою позже (sudo guard → settings).\n'
-        printf 'Выбор [1/2/3] (Enter=3): '
-    } > /dev/tty
-    read -r _wl_choice < /dev/tty || _wl_choice=""
-    case "${_wl_choice:-3}" in
-        1)
-            printf 'URL панели Remnawave (https://panel.example.com): ' > /dev/tty
-            read -r _rw_url < /dev/tty || _rw_url=""
-            printf 'API-токен (Remnawave Settings → API Tokens; ввод скрыт): ' > /dev/tty
-            read -rs _rw_tok < /dev/tty || _rw_tok=""
-            printf '\n' > /dev/tty
-            _rw_url="$(printf '%s' "$_rw_url" | tr -d '[:space:]')"
-            if printf '%s' "$_rw_url" | grep -qiE '^https?://[^/]' && [ -n "$_rw_tok" ]; then
-                REMNAWAVE_URL="$_rw_url"; REMNAWAVE_TOKEN="$_rw_tok"
-                export REMNAWAVE_URL REMNAWAVE_TOKEN
-                print_ok "Remnawave fleet-sync будет включён — IP нод панели подтянутся в whitelist автоматически"
-            else
-                print_warn "URL должен быть http(s)://… и токен не пустым — пропускаю. Включить позже: env REMNAWAVE_URL/REMNAWAVE_TOKEN при reinstall, либо sudo guard."
-            fi
-            ;;
-        2)
-            printf 'IP нод/бриджей через запятую (1.2.3.4,5.6.7.8): ' > /dev/tty
-            read -r _tr_ips < /dev/tty || _tr_ips=""
-            _tr_ips="$(printf '%s' "$_tr_ips" | tr -d '[:space:]')"
-            if [ -n "$_tr_ips" ]; then
-                TRUSTED_IPS="$_tr_ips"; export TRUSTED_IPS
-                print_ok "TRUSTED_IPS принят: $TRUSTED_IPS (применю к whitelist/UFW/CrowdSec)"
-                print_info "Подсказка: вариант (1) с токеном избавил бы от ручного обновления IP на каждой ноде"
-            else
-                print_info "IP не введены — whitelist нод пропущен"
-            fi
-            ;;
-        *)
-            print_info "Whitelist нод пропущен — настроишь позже (sudo guard → settings, либо env REMNAWAVE_TOKEN при reinstall)"
-            ;;
-    esac
-fi
 
 # v3.20.5: panel auto-detect через docker ps удалён.
 # Раньше priorities менялись динамически на основе detected panel:
@@ -1399,16 +1362,25 @@ if [ -z "${PANEL_TYPE:-}" ]; then
 fi
 
 # Не интерактивный режим — пропускаем опрос (но auto-detect выше уже отработал)
-if [ "${SHIELDNODE_NONINTERACTIVE:-0}" = "1" ] || [ ! -t 0 ]; then
+# v3.28.3: интерактивность определяем по /dev/tty (а не stdin -t 0), чтобы вопрос
+# работал и в pipe-режиме (curl|bash), где stdin занят пайпом. Жёстко выключить
+# опрос: SHIELDNODE_NONINTERACTIVE=1 или SHIELD_WL_PROMPT=0.
+if [ "${SHIELDNODE_NONINTERACTIVE:-0}" = "1" ] || [ "${SHIELD_WL_PROMPT:-1}" = "0" ] || ! shield_have_tty; then
     PREINSTALL_SKIP=1
     print_info "Non-interactive mode — pre-install опрос пропущен (PANEL_TYPE=$PANEL_TYPE)"
 fi
 
-# Если bridge IPs уже есть в conf — пропускаем интерактивный опрос
-if [ -n "${BRIDGE_IPS:-}" ]; then
+# Если whitelist нод уже сконфигурён — пропускаем интерактивный опрос.
+# v3.28.3: учитываем не только BRIDGE_IPS, но и Remnawave-токен (env или
+# сохранённый remnawave.env) и TRUSTED_IPS → апгрейды настроенных нод не
+# переспрашивают.
+if [ -n "${BRIDGE_IPS:-}" ] || [ -n "${TRUSTED_IPS:-}" ] || [ -r /etc/shieldnode/remnawave.env ] || \
+   { [ -n "${REMNAWAVE_URL:-}" ] && [ -n "${REMNAWAVE_TOKEN:-}" ]; }; then
     PREINSTALL_SKIP=1
-    print_status "Используем существующие настройки из $PREINSTALL_CONF:"
-    print_info "  Bridge IPs: ${BRIDGE_IPS:-(нет)}"
+    print_status "Используем существующие настройки whitelist'а нод:"
+    [ -n "${BRIDGE_IPS:-}" ]   && print_info "  Bridge IPs: $BRIDGE_IPS"
+    [ -n "${TRUSTED_IPS:-}" ]  && print_info "  Trusted IPs: $TRUSTED_IPS"
+    { [ -r /etc/shieldnode/remnawave.env ] || [ -n "${REMNAWAVE_TOKEN:-}" ]; } && print_info "  Remnawave fleet-sync: настроен (токен сохранён)"
     print_info "  Panel type: ${PANEL_TYPE:-none}"
 fi
 
@@ -1452,37 +1424,65 @@ if [ -z "${PREINSTALL_SKIP:-}" ]; then
     echo "  и при reinstall переиспользуются автоматически."
     echo ""
 
-    # === Вопрос 1: Bridge/Upstream ноды ===
-    echo "─── Bridge/Upstream nodes ───"
-    echo ""
-    echo "  Если эта нода — front-сервер для bridge'а к upstream-ноде"
-    echo "  (например RU-front → FI bridge), то IP моста нужно whitelist'ить"
-    echo "  ДО включения защиты. Иначе shieldnode может его заблокировать"
-    echo "  и клиенты потеряют интернет."
-    echo ""
-    echo -n "  IP-адрес bridge-ноды (или несколько через запятую, Enter если нет): "
-    read -r BRIDGE_INPUT
-    BRIDGE_IPS=$(echo "$BRIDGE_INPUT" | tr -d ' ')
-
-    if [ -n "$BRIDGE_IPS" ]; then
-        # Валидация
-        VALID_IPS=""
-        IFS=',' read -ra IP_ARR <<< "$BRIDGE_IPS"
-        for ip in "${IP_ARR[@]}"; do
-            # v3.18.11 SH-NEW-10: строгая валидация (отклоняет 0.0.0.0/0 etc)
-            if validate_ipv4_or_cidr "$ip"; then
-                VALID_IPS="${VALID_IPS:+$VALID_IPS,}$ip"
+    # === Выбор метода whitelist'а нод флота (v3.28.3) ===
+    # Единый вопрос вместо старого «только bridge IP»: токен Remnawave
+    # (авто-дискавери) ЛИБО ручные IP бриджей. Читаем с /dev/tty (работает и в
+    # curl|bash, где stdin = пайп). Вариант 2 кормит существующую логику BRIDGE_IPS,
+    # вариант 1 — fleet-sync (ШАГ 5.6 запишет токен в remnawave.env).
+    {
+        printf '─── Whitelist нод флота (бриджей) ───\n\n'
+        printf '  Чтобы ноды/бриджи не резались лимитами, их IP должны быть в whitelist.\n'
+        printf '  Как это сделать:\n\n'
+        printf '    1) Remnawave токен — авто: тянем IP ВСЕХ нод из панели и держим\n'
+        printf '       актуальными. Новую ноду добавил в панель → все ноды подхватят\n'
+        printf '       сами, без правки на каждой. (рекомендуется для флота)\n'
+        printf '    2) Вручную IP      — перечислить IP нод/бриджей (single-node/простой случай).\n'
+        printf '    3) Пропустить      — настрою позже (sudo guard → settings).\n\n'
+        printf '  Выбор [1/2/3] (Enter=3): '
+    } > /dev/tty
+    read -r WL_CHOICE < /dev/tty || WL_CHOICE=""
+    case "${WL_CHOICE:-3}" in
+        1)
+            printf '  URL панели Remnawave (https://panel.example.com): ' > /dev/tty
+            read -r RW_URL_IN < /dev/tty || RW_URL_IN=""
+            printf '  API-токен (Remnawave Settings → API Tokens; ввод скрыт): ' > /dev/tty
+            read -rs RW_TOK_IN < /dev/tty || RW_TOK_IN=""
+            printf '\n' > /dev/tty
+            RW_URL_IN="$(printf '%s' "$RW_URL_IN" | tr -d '[:space:]')"
+            if printf '%s' "$RW_URL_IN" | grep -qiE '^https?://[^/]' && [ -n "$RW_TOK_IN" ]; then
+                REMNAWAVE_URL="$RW_URL_IN"; REMNAWAVE_TOKEN="$RW_TOK_IN"
+                export REMNAWAVE_URL REMNAWAVE_TOKEN
+                print_ok "Remnawave fleet-sync будет включён — IP нод панели подтянутся в whitelist автоматически"
             else
-                print_warn "Пропускаю невалидный IP: $ip (запрещены 0.0.0.0/x, multicast, prefix<8)"
+                print_warn "URL должен быть http(s)://… и токен не пустым — пропускаю токен. Включить позже: env REMNAWAVE_URL/REMNAWAVE_TOKEN при reinstall, либо sudo guard."
             fi
-        done
-        BRIDGE_IPS="$VALID_IPS"
-        if [ -n "$BRIDGE_IPS" ]; then
-            print_ok "Bridge IPs будут добавлены в whitelist: $BRIDGE_IPS"
-        fi
-    else
-        print_info "Bridge IPs не заданы (стандартная single-node установка)"
-    fi
+            ;;
+        2)
+            printf '  IP-адрес(а) нод/бриджей через запятую (1.2.3.4,5.6.7.8), Enter если нет: ' > /dev/tty
+            read -r BRIDGE_INPUT < /dev/tty || BRIDGE_INPUT=""
+            BRIDGE_IPS=$(echo "$BRIDGE_INPUT" | tr -d ' ')
+            if [ -n "$BRIDGE_IPS" ]; then
+                VALID_IPS=""
+                IFS=',' read -ra IP_ARR <<< "$BRIDGE_IPS"
+                for ip in "${IP_ARR[@]}"; do
+                    # v3.18.11 SH-NEW-10: строгая валидация (отклоняет 0.0.0.0/0 etc)
+                    if validate_ipv4_or_cidr "$ip"; then
+                        VALID_IPS="${VALID_IPS:+$VALID_IPS,}$ip"
+                    else
+                        print_warn "Пропускаю невалидный IP: $ip (запрещены 0.0.0.0/x, multicast, prefix<8)"
+                    fi
+                done
+                BRIDGE_IPS="$VALID_IPS"
+                [ -n "$BRIDGE_IPS" ] && print_ok "Bridge/node IPs будут добавлены в whitelist: $BRIDGE_IPS"
+                print_info "Подсказка: вариант (1) с токеном избавил бы от ручного обновления IP на каждой ноде при расширении флота"
+            else
+                print_info "IP не введены (стандартная single-node установка)"
+            fi
+            ;;
+        *)
+            print_info "Whitelist нод пропущен — настроишь позже (sudo guard → settings, либо env REMNAWAVE_TOKEN при reinstall)"
+            ;;
+    esac
     echo ""
 
     # v3.20.5: показываем PANEL_TYPE только если оператор явно установил его
