@@ -1,6 +1,99 @@
 #!/bin/bash
 
 # ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.28.9 — закрытие остатков из саморевью (2 фикса)
+#
+#  Мелкие, но реальные дыры робастности, найденные при аудите:
+#  (1) modprobe в shieldnode-synproxy.service был хардкодом /sbin/modprobe с '-'.
+#      На системах, где modprobe в /usr/sbin, шаг молча пропускался → модуль
+#      nf_synproxy не грузился при boot и SYNPROXY-фикс v3.28.7 не срабатывал.
+#      Теперь modprobe ищется через PATH (sh -c 'modprobe …').
+#  (2) Интерактивный chooser whitelist (v3.28.3) читал /dev/tty без таймаута —
+#      если терминал есть, но ввода нет (полу-автомат/CI с tty), `read` мог
+#      зависнуть навечно. Добавлен `read -t 300` на все 4 чтения → по таймауту
+#      пусто → дефолт «пропустить», установка едет дальше.
+#  Про #3 из саморевью (gateless main prerouting): СОЗНАТЕЛЬНО не трогаю —
+#  см. разбор. Гейт `fib daddr type local` на всей цепочке ddos_protect опасен
+#  (на хостах с DNAT-публикацией портов мог бы СНЯТЬ защиту с опубликованных
+#  портов), а реального вреда от форвардного трафика основная цепочка не несёт
+#  (rate-limit'ы пропускают под лимитом; единственный «ломатель» — synproxy
+#  notrack — уже закрыт в v3.28.4 через fib-гейт ТОЛЬКО на synproxy).
+#
+# ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.28.8 — FIX полноты `guard rollback`
+#
+#  Аудит install/upgrade выявил: snapshot для rollback был НЕПОЛНЫМ. Сохранялось
+#  7 скриптов из 15 и НИ ОДНОГО systemd-юнита. После `guard rollback` компоненты
+#  synproxy/ctguard/remnawave-sync/auto-promote/cleanup/pcap/mobile-ru и все юниты
+#  оставались на НОВОЙ версии, остальное откатывалось → рассинхрон (хуже любой из
+#  версий). Плюс nft-restore флашил только ddos_protect → shield_synproxy/
+#  shield_ctguard из снапшота конфликтовали с живыми при nft -f.
+#  Фиксы: (1) snapshot теперь глобит ВСЕ /usr/local/sbin/shieldnode-*.sh + guard;
+#  (2) snapshot'ятся и восстанавливаются systemd-юниты; (3) перед nft -f флашатся
+#  все три наши таблицы; (4) на rollback перезапускаются и synproxy/ctguard.
+#  Касается только пути upgrade/rollback — на сам runtime защиты не влияет.
+#
+# ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.28.7 — НАДЁЖНОСТЬ включения SYNPROXY (3 фикса)
+#
+#  Симптом: SYNPROXY не включился при install/boot (DEGRADED, synproxy_enable_
+#  failed), но вручную (shieldnode-synproxy.sh on) включается. Непостоянство =
+#  гонки. Найдено и исправлено три места:
+#
+#  1) verify_untracked_reaches давал ЛОЖНЫЙ откат. Проба смотрела ОДНО окно:
+#     "входящие SYN есть, а счётчик synproxy не растёт" → сразу disable+exit3.
+#     Но synproxy считает только UNTRACKED-new SYN; ретрансмиты/уже-tracked он
+#     законно не считает. При install (фоновые сканеры) одно окно ложно
+#     срабатывало → откат → DEGRADED. Теперь откат ТОЛЬКО при ДВУХ подтверждённых
+#     окнах; успех на любом окне = ок; неоднозначность = synproxy оставляем.
+#
+#  2) systemd-сервис не грузил модуль при ребуте. shieldnode-synproxy.service
+#     делал голый `nft -f synproxy.nft`. На ядрах где nf_synproxy — загружаемый
+#     модуль (стоковые + часть XanMod), при boot он мог быть не подгружен → nft
+#     падал → SYNPROXY не вставал после ребута. Добавлен ExecStartPre=modprobe.
+#
+#  3) enable() не снимал degraded-маркер при успехе (это делал только install-
+#     блок) → ручной `on` оставлял залежавшийся .synproxy-degraded. Теперь
+#     снимается и в enable().
+#
+# ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.28.6 — FIX отображения "All-time history (since —)"
+#
+#  Дата "since" бралась как MIN(first_seen) из events.db. На ноде, где событий
+#  ещё не было (пустая таблица), MIN возвращал NULL → печаталось "since —".
+#  Теперь при пустой БД since = время создания файла events.db (birth-time, с
+#  фолбэком на mtime) — т.е. реальная дата старта трекинга. Только отображение.
+#
+# ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.28.5 — FIX отображения подсказки synproxy DEGRADED
+#
+#  В guard (и в install-варнинге) строка "fix:" при DEGRADED печаталась с
+#  экранированным "\$(uname -r)" → пользователь видел буквально "$(uname -r)"
+#  вместо реальной версии ядра. Плюс совет "apt install linux-modules-extra-…"
+#  НЕВЕРЕН для XanMod: там nf_synproxy встроен в ядро и такого пакета не
+#  существует. Теперь подсказка kernel-aware: на XanMod говорит, что модуль
+#  встроен (ставить нечего) и направляет на 'shieldnode-synproxy.sh on' + dmesg;
+#  на стоковом ядре показывает РЕАЛЬНУЮ версию ядра в имени пакета. Только текст
+#  подсказки — на саму защиту не влияет.
+#
+# ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.28.4 — FIX: SYNPROXY ломал форвардный трафик
+#
+#  Симптом: на сервере с ПАНЕЛЬЮ (Remnawave в Docker) после апгрейда shieldnode
+#  одна нода ушла в offline. Та нода использовала control-порт 2223, и 2223 попал
+#  в защищаемые порты панели → SYNPROXY его покрыл.
+#  Причина: правило `notrack` в pre_raw (хук prerouting, prio -300) матчило
+#  `tcp dport @sp_ports` для ЛЮБОГО трафика, включая ТРАНЗИТНЫЙ — исходящее
+#  соединение контейнера панели к удалённой ноде (panel→node:2223) форвардится
+#  через хост, проходит prerouting, цепляет notrack → conntrack/NAT для этого
+#  коннекта ломается → ответ ноды не возвращается в контейнер → timeout.
+#  Хост-локальный `nc` работал (OUTPUT минует prerouting), а контейнер — нет.
+#  Фикс: notrack теперь только для трафика К САМОМУ ХОСТУ (`fib daddr type local`).
+#  Транзит (Docker/панель/роутер/VPN-exit) больше не трогается — SYNPROXY как и
+#  прежде защищает локальные сервисы хоста. На обычных нодах поведение не меняется
+#  (Xray проксирует через OUTPUT, не форвардит). Откат прост: модуль изолирован.
+#
+# ==============================================================================
 #  VPN NODE DDoS PROTECTION v3.28.3 — FIX интерактивного выбора (объединение)
 #
 #  Баг (репорт): при `guard upgrade` показывался СТАРЫЙ вопрос про bridge-IP, а
@@ -686,7 +779,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.28.3"
+SHIELDNODE_VERSION="3.28.9"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -1440,13 +1533,15 @@ if [ -z "${PREINSTALL_SKIP:-}" ]; then
         printf '    3) Пропустить      — настрою позже (sudo guard → settings).\n\n'
         printf '  Выбор [1/2/3] (Enter=3): '
     } > /dev/tty
-    read -r WL_CHOICE < /dev/tty || WL_CHOICE=""
+    # v3.28.9 FIX: -t 300 — если /dev/tty есть, но ввода нет (полу-автомат), read
+    # не виснет вечно: по таймауту → пусто → дефолт «3 / пропустить».
+    read -t 300 -r WL_CHOICE < /dev/tty || WL_CHOICE=""
     case "${WL_CHOICE:-3}" in
         1)
             printf '  URL панели Remnawave (https://panel.example.com): ' > /dev/tty
-            read -r RW_URL_IN < /dev/tty || RW_URL_IN=""
+            read -t 300 -r RW_URL_IN < /dev/tty || RW_URL_IN=""
             printf '  API-токен (Remnawave Settings → API Tokens; ввод скрыт): ' > /dev/tty
-            read -rs RW_TOK_IN < /dev/tty || RW_TOK_IN=""
+            read -t 300 -rs RW_TOK_IN < /dev/tty || RW_TOK_IN=""
             printf '\n' > /dev/tty
             RW_URL_IN="$(printf '%s' "$RW_URL_IN" | tr -d '[:space:]')"
             if printf '%s' "$RW_URL_IN" | grep -qiE '^https?://[^/]' && [ -n "$RW_TOK_IN" ]; then
@@ -1459,7 +1554,7 @@ if [ -z "${PREINSTALL_SKIP:-}" ]; then
             ;;
         2)
             printf '  IP-адрес(а) нод/бриджей через запятую (1.2.3.4,5.6.7.8), Enter если нет: ' > /dev/tty
-            read -r BRIDGE_INPUT < /dev/tty || BRIDGE_INPUT=""
+            read -t 300 -r BRIDGE_INPUT < /dev/tty || BRIDGE_INPUT=""
             BRIDGE_IPS=$(echo "$BRIDGE_INPUT" | tr -d ' ')
             if [ -n "$BRIDGE_IPS" ]; then
                 VALID_IPS=""
@@ -3914,25 +4009,41 @@ verify_backend_mss_wscale(){
 verify_untracked_reaches(){
     [ "${SHIELD_SYNPROXY_NOVERIFY:-0}" = "1" ] && return 0
     have tcpdump || { log "tcpdump не найден — проверку доходимости untracked пропускаю"; return 0; }
-    local dev before after syn_in
+    local dev before after syn_in i fails=0
     dev=$(detect_dev)
-    before=$(synproxy_syn_total)
-    log "Проверяю что untracked SYN доходит до synproxy (${PROBE_SECS}s)…"
-    syn_in=$(timeout "$PROBE_SECS" tcpdump -ni "$dev" -c1 \
-             "tcp dst port $FIRST_PORT and tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack = 0" 2>/dev/null | wc -l)
-    after=$(synproxy_syn_total)
-    if [ "${syn_in:-0}" -eq 0 ]; then
-        log "  (входящих SYN на :$FIRST_PORT за окно нет — пропускаю; повтори под нагрузкой/nc)"
-        return 0
-    fi
-    if [ "$after" -le "$before" ]; then
-        log "  ✖ ВХОДЯЩИЕ SYN ЕСТЬ, но synproxy их не видит (syn_received не растёт)."
+    log "Проверяю что untracked SYN доходит до synproxy (до 3×${PROBE_SECS}s)…"
+    # v3.28.7 FIX: откатываем ТОЛЬКО при ДВУХ подтверждённых окнах "SYN есть, а
+    # synproxy их не считает". Одиночное окно ложно срабатывает: ретрансмиты и
+    # уже-tracked SYN synproxy законно не считает (он видит лишь untracked-new),
+    # хотя слой исправен. Раньше одно такое окно → спонтанный disable+exit 3 при
+    # install (фоновые сканеры) → ложный synproxy_enable_failed/DEGRADED, хотя
+    # вручную позже включалось. Успех на ЛЮБОМ окне = слои уживаются.
+    for i in 1 2 3; do
+        before=$(synproxy_syn_total)
+        syn_in=$(timeout "$PROBE_SECS" tcpdump -ni "$dev" -c1 \
+                 "tcp dst port $FIRST_PORT and tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack = 0" 2>/dev/null | wc -l)
+        after=$(synproxy_syn_total)
+        if [ "${syn_in:-0}" -eq 0 ]; then
+            [ "$i" = "1" ] && { log "  (входящих SYN на :$FIRST_PORT за окно нет — пропускаю; повтори под нагрузкой/nc)"; return 0; }
+            continue
+        fi
+        if [ "$after" -gt "$before" ]; then
+            log "  ✔ untracked SYN доходит (syn_received растёт) — слои уживаются."
+            return 0
+        fi
+        fails=$((fails+1))
+        log "  ⚠ окно $i: входящие SYN есть, а synproxy их не считает (${fails}/2)"
+        [ "$fails" -ge 2 ] && break
+    done
+    if [ "${fails:-0}" -ge 2 ]; then
+        log "  ✖ ВХОДЯЩИЕ SYN ЕСТЬ, но synproxy их не видит (подтверждено ${fails} окнами)."
         log "    Другой фаервол (UFW/firewalld/кастом) дропает UNTRACKED раньше synproxy."
         log "    АВТО-ОТКАТ во избежание обрыва клиентов. Разбери конфликт слоёв и включи заново."
         disable
         exit 3
     fi
-    log "  ✔ untracked SYN доходит (syn_received растёт) — слои уживаются."
+    log "  (проверка неоднозначна — synproxy оставлен активным; повтори под нагрузкой: shieldnode-synproxy.sh on)"
+    return 0
 }
 
 write_conf(){
@@ -3961,7 +4072,11 @@ table inet shield_synproxy {
     }
     chain pre_raw {
         type filter hook prerouting priority -300; policy accept;
-        tcp dport @sp_ports tcp flags syn / fin,syn,rst,ack notrack
+        # v3.28.4: fib daddr type local — notrack ТОЛЬКО для трафика, адресованного
+        # самому хосту. Без этого на форвардящем хосте (Docker/панель/роутер) notrack
+        # цеплял ТРАНЗИТНЫЙ трафик контейнера к удалённой ноде на том же порту (напр.
+        # панель→node:2223) и ломал его conntrack/NAT → нода уходила в offline.
+        fib daddr type local tcp dport @sp_ports tcp flags syn / fin,syn,rst,ack notrack
     }
     chain in_synproxy {
         type filter hook input priority -275; policy accept;
@@ -3989,6 +4104,9 @@ SCTL
     log "✔ SYNPROXY включён: порты={${PORTS}} mss=${MSS} wscale=${WSCALE}"
     verify_untracked_reaches
     log "  conntrack_tcp_loose=0, syncookies=1 (persisted ${SYSCTL_FILE})"
+    # v3.28.7: enable дошёл до конца (verify не откатил) → снимаем degraded-маркер,
+    # как делает install-блок. Раньше ручной `on` оставлял залежавшийся маркер.
+    rm -f /var/lib/shieldnode/.synproxy-degraded 2>/dev/null || true
 }
 
 disable(){
@@ -4043,6 +4161,13 @@ ConditionPathExists=/etc/shieldnode/synproxy.nft
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# v3.28.7 FIX: на ядрах где nf_synproxy — загружаемый МОДУЛЬ (стоковые + часть
+# XanMod-сборок) при boot он может быть не подгружен → голый `nft -f` с synproxy-
+# правилом падал и SYNPROXY не вставал после ребута. Грузим модуль ДО применения.
+# v3.28.9 FIX: modprobe ищется через PATH (sh -c), а не хардкодом /sbin/modprobe —
+# на части систем он в /usr/sbin, и хардкод+'-' молча пропускал загрузку → баг
+# возвращался. 'true' в конце = шаг никогда не фейлит старт сервиса.
+ExecStartPre=-/bin/sh -c 'modprobe nf_synproxy 2>/dev/null; modprobe nf_conntrack 2>/dev/null; true'
 ExecStart=/usr/sbin/nft -f /etc/shieldnode/synproxy.nft
 [Install]
 WantedBy=multi-user.target
@@ -4070,8 +4195,13 @@ SPUNIT
         print_error "  при SYN-флуде (SYN под per-src лимитом создаёт conntrack-записи)."
         print_warn  "  Причина обычно: нет модуля ядра nf_synproxy (стоковое ядро без"
         print_warn  "  linux-modules-extra) или ядро < 5.14, либо не было интернета."
-        print_info  "  Починить:  sudo apt install linux-modules-extra-\$(uname -r) && sudo shieldnode-synproxy.sh on"
-        print_info  "  Либо обнови ядро (XanMod несёт nf_synproxy встроенным)."
+        if uname -r | grep -qi xanmod; then
+            print_info  "  Ядро XanMod: nf_synproxy встроен — пакет ставить НЕ надо. Запусти"
+            print_info  "  'sudo shieldnode-synproxy.sh on' и смотри dmesg | grep -i synproxy."
+        else
+            print_info  "  Починить:  sudo apt install linux-modules-extra-$(uname -r) && sudo shieldnode-synproxy.sh on"
+            print_info  "  Либо обнови ядро (XanMod несёт nf_synproxy встроенным)."
+        fi
         print_info  "  Маркер degraded виден в 'sudo guard'. Скрытно деградировать не будем."
         print_error "════════════════════════════════════════════════════════════════"
     fi
@@ -8278,15 +8408,19 @@ HELP
         fi
         # Текущий live-ruleset (для прямого восстановления через nft -f)
         nft list ruleset > "$SNAPSHOT_DIR/nft-ruleset.snapshot" 2>/dev/null || true
-        # Бинарники которые скрипт перезаписывает
-        for f in /usr/local/bin/guard \
-                 /usr/local/sbin/shieldnode-aggregator.sh \
-                 /usr/local/sbin/shieldnode-update-blocklist.sh \
-                 /usr/local/sbin/shieldnode-github-sync.sh \
-                 /usr/local/sbin/shieldnode-version-check.sh \
-                 /usr/local/sbin/shieldnode-whitelist-updater.sh \
-                 /usr/local/sbin/shieldnode-defaults.sh; do
+        # Бинарники которые скрипт перезаписывает.
+        # v3.28.8 FIX: глоб по ВСЕМ shieldnode-скриптам + guard. Раньше список был
+        # неполный — synproxy/ctguard/remnawave-sync/auto-promote/cleanup/pcap/
+        # mobile-ru НЕ сохранялись → rollback оставлял их на НОВОЙ версии (рассинхрон
+        # компонентов, хуже любой из версий).
+        for f in /usr/local/bin/guard /usr/local/sbin/shieldnode-*.sh; do
             [ -f "$f" ] && cp -a "$f" "$SNAPSHOT_DIR/$(basename "$f").previous" 2>/dev/null || true
+        done
+        # v3.28.8 FIX: snapshot systemd-юнитов (раньше не сохранялись вовсе → после
+        # rollback юниты оставались на новой версии, напр. изменённый synproxy.service).
+        mkdir -p "$SNAPSHOT_DIR/units"
+        for u in /etc/systemd/system/shieldnode-* /etc/systemd/system/protected-ports-update.*; do
+            [ -e "$u" ] && cp -a "$u" "$SNAPSHOT_DIR/units/" 2>/dev/null || true
         done
         # Запоминаем версию-источник для проверки совместимости при rollback
         echo "${SHIELDNODE_VERSION:-unknown}" > "$SNAPSHOT_DIR/.from_version"
@@ -8363,11 +8497,21 @@ HELP
             chmod +x "$dst"
             echo "  ✔ $dst восстановлен"
         done
+        # v3.28.8 FIX: восстанавливаем systemd-юниты из снапшота (раньше не
+        # восстанавливались → юниты оставались на новой версии, напр. synproxy.service).
+        if [ -d "$SNAP/units" ] && ls "$SNAP"/units/* >/dev/null 2>&1; then
+            cp -a "$SNAP"/units/* /etc/systemd/system/ 2>/dev/null || true
+            echo "  ✔ systemd-юниты восстановлены"
+        fi
 
         # Восстанавливаем nft ruleset напрямую — flush и применяем snapshot
         if [ -s "$SNAP/nft-ruleset.snapshot" ]; then
-            # Flush наших таблиц чтоб не было дублей
-            nft delete table inet ddos_protect 2>/dev/null || true
+            # v3.28.8 FIX: флашим ВСЕ наши таблицы (раньше только ddos_protect →
+            # shield_synproxy/shield_ctguard из снапшота конфликтовали с живыми
+            # при nft -f → частичный/битый restore).
+            for _t in ddos_protect shield_synproxy shield_ctguard; do
+                nft delete table inet "$_t" 2>/dev/null || true
+            done
             if nft -f "$SNAP/nft-ruleset.snapshot" 2>/tmp/.nft-rollback.err; then
                 echo "  ✔ nft ruleset восстановлен"
             else
@@ -8385,6 +8529,10 @@ HELP
         systemctl start shieldnode-whitelist.path 2>/dev/null || true
         systemctl start shieldnode-update@custom.path 2>/dev/null || true
         systemctl start shieldnode-remnawave-sync.service 2>/dev/null || true  # v3.28.0: переналить whitelist нод после reload
+        # v3.28.8 FIX: эти юниты раньше не перезапускались на rollback → их состояние
+        # не возвращалось к снапшоту.
+        systemctl start shieldnode-ctguard.timer 2>/dev/null || true
+        [ -f /etc/shieldnode/synproxy.nft ] && systemctl restart shieldnode-synproxy.service 2>/dev/null || true
 
         echo ""
         echo "Rollback complete. Версия: $FROM_VER"
@@ -8565,6 +8713,13 @@ collect_stats() {
 
         # Самое раннее событие — "since"
         FIRST_TS=$(sqlite3 "$SHIELD_DB" "SELECT MIN(first_seen) FROM events" 2>/dev/null)
+        # v3.28.6: событий ещё нет (пустая БД) → since = время создания БД (старт
+        # трекинга), а не прочерк. Раньше показывало "since —" — путало.
+        if [ -z "$FIRST_TS" ]; then
+            FIRST_TS=$(stat -c %W "$SHIELD_DB" 2>/dev/null)
+            { [ -z "$FIRST_TS" ] || [ "$FIRST_TS" = "0" ]; } && \
+                FIRST_TS=$(stat -c %Y "$SHIELD_DB" 2>/dev/null || stat -f %m "$SHIELD_DB" 2>/dev/null)
+        fi
         if [ -n "$FIRST_TS" ] && [ "$FIRST_TS" != "" ]; then
             DB_SINCE=$(LC_ALL=C date -d "@$FIRST_TS" '+%Y-%m-%d %H:%M' 2>/dev/null || LC_ALL=C date -r "$FIRST_TS" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "—")
         fi
@@ -8784,7 +8939,16 @@ draw_snapshot() {
     elif [ -f /var/lib/shieldnode/.synproxy-degraded ]; then
         # v3.27.0 FIX(#5): не молчим о деградации
         printf "  ${B}synproxy${N}    ${R}DEGRADED${N} ${DIM}(не включился — SYN-защита ослаблена; %s)${N}\n" "$(grep -m1 '^reason=' /var/lib/shieldnode/.synproxy-degraded 2>/dev/null | cut -d= -f2)"
-        printf "             ${DIM}fix: apt install linux-modules-extra-\$(uname -r) && shieldnode-synproxy.sh on${N}\n"
+        # v3.28.5: kernel-aware подсказка. Раньше печаталось буквально "$(uname -r)"
+        # (экранированный $) + совет "apt install linux-modules-extra" неверен для XanMod,
+        # где nf_synproxy встроен в ядро и такого пакета не существует.
+        _kr="$(uname -r)"
+        if printf '%s' "$_kr" | grep -qi xanmod; then
+            printf "             ${DIM}fix: на XanMod nf_synproxy встроен — пакет не нужен. Запусти${N}\n"
+            printf "             ${DIM}     shieldnode-synproxy.sh on  и смотри причину (dmesg | grep -i synproxy)${N}\n"
+        else
+            printf "             ${DIM}fix: apt install linux-modules-extra-%s && shieldnode-synproxy.sh on${N}\n" "$_kr"
+        fi
     fi
 
     # ===== v3.27.0 FIX(#10): BRIDGE/WHITELIST DRIFT ADVISORY (read-only, O(1) на IP) =====
