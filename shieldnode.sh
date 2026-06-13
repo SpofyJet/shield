@@ -1,6 +1,85 @@
 #!/bin/bash
 
 # ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.30.2 — SYNPROXY → opt-in + единый реапер устаревшего
+#
+#  SYNPROXY переведён в OPT-IN (дефолт SHIELD_SYNPROXY=0). На VPN-relay он несёт
+#  seqadj/window-риски (требует be_liberal=1), убивает TCP Fast Open на защищённых
+#  портах и даёт per-packet overhead; его уникальную пользу — анти-СПУФ-SYN через
+#  notrack — на нодах без conntrack-давления дублируют tcp_syncookies=1 + per-IP
+#  ct-лимиты, а против connect-and-hold / PPS-флуда он не помогает вовсе. Включить
+#  под реальный спуфнутый SYN-флуд: SHIELD_SYNPROXY=1 (или shieldnode-synproxy.sh on).
+#  Единый legacy-реапер (ШАГ 1) дополнен пунктом 8: при выключенном SYNPROXY сам
+#  снимает артефакты прошлого включения (table shield_synproxy, synproxy.nft,
+#  99-shieldnode-synproxy.conf, сервис, degraded-маркер), возвращает be_liberal→0 и
+#  выгружает nf_synproxy — идемпотентно на каждом install/upgrade. disable() в
+#  shieldnode-synproxy.sh тоже откатывает be_liberal→0 (tcp_loose/syncookies не трогает
+#  — их держит 90-shieldnode.conf; в ddos_protect нет ct-state-invalid-drop → безопасно).
+#
+# ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.30.1 — аудит-фиксы (F1/F2/F9/F10/F11/F4/X1)
+#
+#  F2 (CRITICAL): /etc/modules-load.d/shieldnode.conf форсит nf_conntrack при boot ДО
+#    systemd-sysctl → nf_conntrack_* ключи (est-timeout, udp-таймауты, be_liberal, acct)
+#    больше не скипаются молча после ребута на standalone-ноде.
+#  F1: v4 SSH-accept загейчен `meta nfproto ipv4` → v6-SSH проваливается в свои (ранее
+#    недостижимые) ssh_connlimit_v6 / ssh_newconn_v6 лимиты; chain policy=accept.
+#  F11: парсер счётчиков pcap-archiver переписан (трекинг имени counter'а, исключая pass)
+#    → archive-on-attack реально срабатывает на v4-флуде (раньше суммировал мусор).
+#  F10: auto-promote ловит и newconn_flood. F9: экранированы backticks → guard rollback
+#    без снапшота не запускает переустановку. F4: uninstall сносит pcap/auto-promote
+#    юниты+скрипты+/var/log/pcap+modules-load.
+#  X1: nf_conntrack_tcp_timeout_established 1800→7200 (скоординировано с vpn-node-setup;
+#    по проду 5 нод idle p99≤361s, conntrack ≤1% → запас огромный, exhaustion держат
+#    per-IP ct>лимит + conn_flood + ctguard, а не est-timeout).
+#
+# ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.30.0 — FIX: SYNPROXY рвал клиентский трафик
+#  (be_liberal)
+#
+#  Симптом после включения SYNPROXY: клиенты подключаются, но НИЧЕГО не грузится —
+#  ни сайты, ничего, большой пинг, таймаут после коннекта. Корень: не выставлялся
+#  net.netfilter.nf_conntrack_tcp_be_liberal=1. SYNPROXY делает seq-adjustment
+#  (правит sequence на всю жизнь коннекта), а строгий window-tracking conntrack
+#  помечает data-пакеты ВЫСОКОНАГРУЖЕННОГО туннеля (а весь трафик клиента идёт
+#  внутри одного VLESS-TCP-коннекта на 443) как INVALID → правило `ct state invalid
+#  drop` в in_synproxy их дропает → хендшейк проходит (мелкие пакеты), но данные
+#  встают → у клиента всё мертво. Канонический iptables-пример SYNPROXY живёт без
+#  be_liberal на low-throughput HTTP, но на VPN-туннеле window-tracking срабатывает.
+#  Фикс: enable() ставит и персистит be_liberal=1. Откат: SHIELD_SYNPROXY_BE_LIBERAL=0.
+#
+#  СРОЧНОЕ восстановление до апгрейда: `shieldnode-synproxy.sh off` на ноде (клиенты
+#  оживают мгновенно — это и подтверждает, что причина в SYNPROXY). NB: идентичный
+#  симптом даёт FORWARD policy=DROP при bridge-сети remnanode (egress Xray к сайтам
+#  рубится) — это ДРУГАЯ причина, чинится v3.29.x. `synproxy off` различает: ожило →
+#  SYNPROXY/be_liberal; не ожило → egress/FORWARD.
+#
+# ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.29.1 — v3.29.0 без рестарта docker
+#  Саморевью v3.29.0 выявило: `systemctl restart docker` в forward-policy хелпере
+#  был и не нужен (reload с policy=ACCEPT чинит egress сам — MASQUERADE в nat-таблице
+#  reload не трогает), и вреден (бранч remnanode/панели = моргание VPN/сервиса на
+#  каждом апгрейде, меняющем политику). Убран — остаётся только `ufw reload`.
+#  Также HEALTHCHECK не врёт «OK», если FORWARD policy не определилась.
+#
+# ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.29.0 — авто-фикс UFW forward-policy на Docker-хостах
+#
+#  Корень повторяющихся «после установки бот/панель/нода не выходит наружу»:
+#  UFW из коробки ставит DEFAULT_FORWARD_POLICY="DROP" → FORWARD chain policy=drop
+#  → egress Docker-контейнеров на bridge-сети рвётся. shieldnode сам это НЕ создаёт
+#  (работает в prerouting), НО триггерит рецидив: при раскатке TRUSTED_IPS он дёргает
+#  `ufw reload`, и каждый reload заново применяет DROP → egress контейнеров отваливается
+#  до `systemctl restart docker`. Это роняло панель и telegram-бот несколько раз.
+#  Фикс: при ДЕТЕКТЕ Docker shieldnode выставляет DEFAULT_FORWARD_POLICY="ACCEPT" в
+#  /etc/default/ufw в ШАГ 2 (ДО своих ufw reload) и применяет немедленно, если ufw
+#  активен. Это документированный фикс Docker+ufw — форвард всё равно фильтрует
+#  цепочка DOCKER-USER, дырой не является. На НЕ-Docker нодах ничего не меняется
+#  (UFW-DROP остаётся). Отключается knob'ом SHIELD_UFW_FORWARD_ACCEPT=0. HEALTHCHECK
+#  (ШАГ 13) предупреждает, если Docker есть, а FORWARD policy всё ещё DROP.
+#  Раскатывается на весь флот через `guard upgrade` (re-exec прогоняет ШАГ 2).
+#
+# ==============================================================================
 #  VPN NODE DDoS PROTECTION v3.28.9 — закрытие остатков из саморевью (2 фикса)
 #
 #  Мелкие, но реальные дыры робастности, найденные при аудите:
@@ -779,7 +858,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.28.9"
+SHIELDNODE_VERSION="3.30.2"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -1042,7 +1121,7 @@ SHIELD_GLOBAL_NEWCONN_CEIL="${SHIELD_GLOBAL_NEWCONN_CEIL:-0}"
 SHIELD_V6_REJECT="${SHIELD_V6_REJECT:-0}"
 SHIELD_AUTOPROMOTE_THRESHOLD="${SHIELD_AUTOPROMOTE_THRESHOLD:-800}"
 # v3.24.0: SYNPROXY (conntrack-exhaustion защита). 1=вкл (дефолт), 0=выкл.
-SHIELD_SYNPROXY="${SHIELD_SYNPROXY:-1}"
+SHIELD_SYNPROXY="${SHIELD_SYNPROXY:-0}"
 # v3.27.1 FIX(#6): покрывать ли SSH-порт SYNPROXY (анти-спуф-SYN на SSH). 1=да (дефолт), 0=нет.
 SHIELD_SYNPROXY_SSH="${SHIELD_SYNPROXY_SSH:-1}"
 # v3.24.0: conntrack-pressure guard (anti-exhaustion backstop)
@@ -1188,6 +1267,9 @@ if [ "${1:-}" = "--uninstall" ]; then
                 shieldnode-cleanup.timer shieldnode-cleanup.service \
                 shieldnode-whitelist.path shieldnode-whitelist.service \
                 shieldnode-remnawave-sync.timer shieldnode-remnawave-sync.service \
+                shieldnode-pcap.service \
+                shieldnode-pcap-archiver.timer shieldnode-pcap-archiver.service \
+                shieldnode-auto-promote.timer shieldnode-auto-promote.service \
                 shieldnode-synproxy.service; do
         systemctl disable --now "$unit" 2>/dev/null || true
         rm -f "/etc/systemd/system/$unit"
@@ -1219,6 +1301,14 @@ if [ "${1:-}" = "--uninstall" ]; then
     nft delete table inet shield_ctguard 2>/dev/null || true  # v3.24.0
     rm -f /usr/local/sbin/shieldnode-defaults.sh
     rm -f /usr/local/sbin/shieldnode-cleanup.sh  # v3.20.3
+    # v3.30.1 FIX(F4): pcap/auto-promote — раньше НЕ удалялись → tcpdump продолжал
+    # писать /var/log/pcap после uninstall, таймеры висели.
+    rm -f /usr/local/sbin/shieldnode-pcap-archiver.sh /usr/local/sbin/shieldnode-auto-promote.sh
+    rm -f /etc/systemd/system/shieldnode-pcap.service
+    rm -f /etc/systemd/system/shieldnode-pcap-archiver.service /etc/systemd/system/shieldnode-pcap-archiver.timer
+    rm -f /etc/systemd/system/shieldnode-auto-promote.service /etc/systemd/system/shieldnode-auto-promote.timer
+    rm -f /etc/modules-load.d/shieldnode.conf
+    rm -rf /var/log/pcap /var/lib/shieldnode/pcap-archive
     rm -f /usr/local/bin/guard
     print_ok "Скрипты удалены (включая команду guard)"
 
@@ -1437,6 +1527,44 @@ fi
 
 # v3.28.3: helper — есть ли управляющий терминал (работает и в curl|bash через /dev/tty).
 shield_have_tty(){ { true >/dev/tty; } 2>/dev/null && [ -r /dev/tty ]; }
+
+# v3.29.0: Docker присутствует? (бинарь + живой демон/сокет)
+shield_docker_present(){
+    command -v docker >/dev/null 2>&1 || return 1
+    docker info >/dev/null 2>&1 && return 0
+    systemctl is-active --quiet docker 2>/dev/null && return 0
+    [ -S /var/run/docker.sock ] && return 0
+    return 1
+}
+
+# v3.29.0: на Docker-хостах UFW-дефолт DEFAULT_FORWARD_POLICY="DROP" ломает egress
+# контейнеров (бот/панель/remnanode на bridge-сети). Хуже: shieldnode сам дёргает
+# `ufw reload` при раскатке TRUSTED_IPS → каждый reload заново применяет DROP →
+# рецидив «после установки контейнер не выходит наружу». Ставим ACCEPT — форвард
+# всё равно фильтрует цепочка DOCKER-USER, так что это не дыра, а документированный
+# фикс Docker+ufw. Только при реально установленном Docker; на не-Docker нодах
+# UFW-DROP остаётся. Отключается knob'ом SHIELD_UFW_FORWARD_ACCEPT=0.
+shield_fix_ufw_forward_for_docker(){
+    [ "${SHIELD_UFW_FORWARD_ACCEPT:-1}" = "0" ] && return 0
+    [ -f /etc/default/ufw ] || return 0
+    shield_docker_present || return 0
+    local cur
+    cur=$(grep -oE '^DEFAULT_FORWARD_POLICY="?(ACCEPT|DROP)"?' /etc/default/ufw 2>/dev/null | grep -oE 'ACCEPT|DROP' | head -1)
+    [ "$cur" = "ACCEPT" ] && { print_ok "Docker есть, DEFAULT_FORWARD_POLICY уже ACCEPT — egress контейнеров защищён"; return 0; }
+    if grep -qE '^DEFAULT_FORWARD_POLICY=' /etc/default/ufw; then
+        sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+    else
+        echo 'DEFAULT_FORWARD_POLICY="ACCEPT"' >> /etc/default/ufw
+    fi
+    print_ok "Docker обнаружен → DEFAULT_FORWARD_POLICY=ACCEPT (egress контейнеров переживёт ufw reload/ребут; форвард фильтрует DOCKER-USER). Откат: SHIELD_UFW_FORWARD_ACCEPT=0"
+    # применить немедленно, если ufw активен (иначе подхватится при следующем enable).
+    # v3.29.1: БЕЗ `systemctl restart docker` — reload с policy=ACCEPT уже чинит egress
+    # (MASQUERADE в nat-таблице reload не трогает, forward с ACCEPT пропускает). Рестарт
+    # docker бесполезно бил бы по remnanode/панели (моргание VPN/сервиса) на каждом апгрейде.
+    if command -v ufw >/dev/null 2>&1 && LANG=C LC_ALL=C ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw reload >/dev/null 2>&1 || true
+    fi
+}
 
 # v3.20.5: panel auto-detect через docker ps удалён.
 # Раньше priorities менялись динамически на основе detected panel:
@@ -2100,6 +2228,16 @@ if [ -f /etc/sysctl.d/99-shieldnode.conf ]; then
 fi
 
 SYSCTL_FILE="/etc/sysctl.d/90-shieldnode.conf"
+# v3.30.1 FIX(F2): на standalone-ноде (без vpn-node-setup) nf_conntrack — модуль,
+# грузится лениво ПОЗЖЕ systemd-sysctl → все nf_conntrack_* ключи ниже (be_liberal,
+# tcp_loose, est-timeout, udp-таймауты, acct) на буте молча скипались → после ребута
+# возвращался баг "коннект есть, трафика нет" (be_liberal=0 при активном SYNPROXY).
+# Форсим загрузку модуля при boot ДО sysctl (systemd-sysctl: After=systemd-modules-load).
+mkdir -p /etc/modules-load.d
+cat > /etc/modules-load.d/shieldnode.conf <<'MODLOAD_EOF'
+# Generated by shieldnode: ensure nf_conntrack loads at boot so nf_conntrack_* sysctls apply.
+nf_conntrack
+MODLOAD_EOF
 cat > "$SYSCTL_FILE" <<'SYSCTL_EOF'
 # Shieldnode kernel hardening v3.23.0
 # Префикс 90 — security-полка поверх базы (80-vpn-node-tuning.conf).
@@ -2204,7 +2342,10 @@ net.netfilter.nf_conntrack_udp_timeout_stream = 600
 # nf_conntrack-зона, НЕ tcp_*-сокеты (их по-прежнему ведёт setup).
 net.netfilter.nf_conntrack_acct = 1
 net.netfilter.nf_conntrack_tcp_loose = 0
-net.netfilter.nf_conntrack_tcp_timeout_established = 1800
+# v3.30.1: 1800 -> 7200 (скоординировано с vpn-node-setup 80-: одно значение, без
+# лексикографического сюрприза). 7200 = ~12x наблюдаемого idle живых коннектов на
+# проде; exhaustion и так держат per-IP ct>лимит + conn_flood + ctguard.
+net.netfilter.nf_conntrack_tcp_timeout_established = 7200
 net.netfilter.nf_conntrack_tcp_timeout_close_wait = 30
 net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 30
 net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
@@ -2419,6 +2560,30 @@ fi
 rm -f /var/lib/shieldnode/mobile_ru_fail_count 2>/dev/null
 rm -f /var/lib/shieldnode/broadband_ru_fail_count 2>/dev/null
 
+# 8) v3.30.2: SYNPROXY стал OPT-IN. Если выключен (SHIELD_SYNPROXY!=1), но на ноде
+#    остались артефакты прошлого включения — единый реапер снимает их здесь.
+#    be_liberal=1 ставил ТОЛЬКО SYNPROXY → возвращаем в kernel-default 0. tcp_loose/
+#    syncookies НЕ трогаем (их держит 90-shieldnode.conf). В ddos_protect нет
+#    ct-state-invalid-drop (только флаговые tcp_invalid) → откат be_liberal безопасен.
+if [ "$SHIELD_SYNPROXY" != "1" ]; then
+    _sp_found=0
+    nft list table inet shield_synproxy >/dev/null 2>&1 && { _sp_found=1; nft delete table inet shield_synproxy 2>/dev/null || true; }
+    for f in /etc/shieldnode/synproxy.nft /etc/sysctl.d/99-shieldnode-synproxy.conf /var/lib/shieldnode/.synproxy-degraded; do
+        [ -f "$f" ] && { _sp_found=1; rm -f "$f"; }
+    done
+    if systemctl list-unit-files shieldnode-synproxy.service 2>/dev/null | grep -q shieldnode-synproxy; then
+        _sp_found=1
+        systemctl disable --now shieldnode-synproxy.service 2>/dev/null || true
+        rm -f /etc/systemd/system/shieldnode-synproxy.service
+    fi
+    if [ "$_sp_found" = "1" ]; then
+        LEGACY_FOUND=1
+        sysctl -qw net.netfilter.nf_conntrack_tcp_be_liberal=0 2>/dev/null || true
+        modprobe -r nf_synproxy 2>/dev/null || true
+        print_ok "SYNPROXY-слой снят реапером (opt-in с v3.30.2; be_liberal→0)"
+    fi
+fi
+
 if [ "$LEGACY_FOUND" = "1" ]; then
     systemctl daemon-reload
     print_ok "Legacy-артефакты удалены"
@@ -2431,6 +2596,10 @@ fi
 # ==============================================================================
 
 print_header "ШАГ 2: AUTO-DETECT"
+
+# v3.29.0: на Docker-хостах сразу чиним UFW forward-policy (ДО любых наших ufw reload
+# в ШАГ 8/12.5), иначе egress контейнеров рвётся. No-op без Docker / если уже ACCEPT.
+shield_fix_ufw_forward_for_docker
 
 # v1.7: порты берутся из ПРАВИЛ ФАЕРВОЛА. Юзер сам решил что открыть —
 # это и защищаем. SSH-порт исключаем (он защищается CrowdSec'ом и не
@@ -3018,9 +3187,13 @@ SHIELD_V6_REJECT=0
 # Heavy-CGNAT нода? Подними обратно (conn_flood ложно срабатывает на CGNAT-пиках).
 SHIELD_AUTOPROMOTE_THRESHOLD=800
 SHIELD_AUTOPROMOTE_WINDOW_HOURS=24
-# v3.24.0: SYNPROXY (conntrack-exhaustion). 1=вкл (дефолт), 0=выкл.
-# Безопасно: ядро не тянет → авто-fallback на ddos_protect; verify mss/wscale + авто-откат.
-SHIELD_SYNPROXY=1
+# v3.30.2: SYNPROXY теперь OPT-IN (дефолт 0). Причина: на VPN-relay он несёт
+# seqadj/window-риски (нужен be_liberal=1), убивает TFO на защищённых портах и
+# даёт per-packet overhead, а уникальную пользу (анти-СПУФ-SYN через notrack) на
+# нодах без conntrack-давления дублируют tcp_syncookies=1 + per-IP ct-лимиты. Против
+# connect-and-hold/PPS он не помогает вовсе. Включить под реальный спуф-SYN-флуд:
+# SHIELD_SYNPROXY=1 (или sudo shieldnode-synproxy.sh on). 0=выкл (дефолт).
+SHIELD_SYNPROXY=0
 # v3.27.1 FIX(#6): SYNPROXY покрывает и SSH-порт (анти-спуф-SYN→conntrack). 0=выключить.
 SHIELD_SYNPROXY_SSH=1
 # v3.27.1 FIX(#1): анти-pulsing — sustained если >= SHIELD_CTG_ATTACK_MIN_TICKS аномалий
@@ -3684,7 +3857,10 @@ $SHIELD_LOG_TCP_INVALID
         tcp dport { $SSH_PORTS_NFT } ct state new add @ssh_connlimit_v4 { ip saddr ct count over $SHIELD_SSH_CT_LIMIT } counter name ssh_conn_flood_v4 drop
         tcp dport { $SSH_PORTS_NFT } ct state new add @ssh_newconn_rate_v4 { ip saddr limit rate over $SHIELD_SSH_NEWCONN_RATE burst $SHIELD_SSH_NEWCONN_BURST packets } counter name ssh_newconn_flood_v4 drop
         # Прошёл все blocklist'ы и оба лимита — пропускаем дальше к sshd.
-        tcp dport { $SSH_PORTS_NFT } accept
+        # v3.30.1 FIX(F1): гейт ipv4 — иначе bare-accept матчил и v6-SSH ДО $SHIELD_V6_RULES,
+        # делая v6 ssh_connlimit/ssh_newconn мёртвыми. Теперь v6-SSH проваливается в свои
+        # лимиты ниже (chain policy=accept → v6-SSH работает, но уже rate-limited).
+        meta nfproto ipv4 tcp dport { $SSH_PORTS_NFT } accept
 
         # === INFRASTRUCTURE BYPASS (v3.23.15 P0-2: перемещён сюда, ПОСЛЕ SSH) ===
         # CDN/edge accept без conn_flood/newconn/syn/udp (у них легит burst).
@@ -4093,17 +4269,25 @@ enable(){
     verify_backend_mss_wscale
     sysctl -qw net.netfilter.nf_conntrack_tcp_loose=0 2>/dev/null || true
     sysctl -qw net.ipv4.tcp_syncookies=1 2>/dev/null || true
+    # v3.30.0 КРИТИЧНО: be_liberal=1 для SYNPROXY. SYNPROXY делает seqadj (правит seq
+    # на всю жизнь коннекта); строгий window-tracking conntrack помечает data-пакеты
+    # высоконагруженного туннеля как INVALID → правило `ct state invalid drop` в
+    # in_synproxy их ДРОПАЕТ → клиент подключился, но НИЧЕГО не грузит / таймаут /
+    # «большой пинг» (ретрансмиты). На low-throughput HTTP канонический пример живёт
+    # и без него, на VPN-туннеле — нет. Откат: SHIELD_SYNPROXY_BE_LIBERAL=0.
+    [ "${SHIELD_SYNPROXY_BE_LIBERAL:-1}" = "1" ] && sysctl -qw net.netfilter.nf_conntrack_tcp_be_liberal=1 2>/dev/null || true
     cat > "$SYSCTL_FILE" <<SCTL
 # shieldnode SYNPROXY requirements
 net.netfilter.nf_conntrack_tcp_loose=0
 net.ipv4.tcp_syncookies=1
+$([ "${SHIELD_SYNPROXY_BE_LIBERAL:-1}" = "1" ] && echo 'net.netfilter.nf_conntrack_tcp_be_liberal=1')
 SCTL
     write_conf
     nft -c -f "$NFT_FILE" || die "сгенерированный ruleset не парсится"
     nft -f "$NFT_FILE" || die "применение ruleset не удалось (nft -f) — нет модуля ядра nf_synproxy? см. dmesg"
     log "✔ SYNPROXY включён: порты={${PORTS}} mss=${MSS} wscale=${WSCALE}"
     verify_untracked_reaches
-    log "  conntrack_tcp_loose=0, syncookies=1 (persisted ${SYSCTL_FILE})"
+    log "  conntrack_tcp_loose=0, syncookies=1, be_liberal=$([ "${SHIELD_SYNPROXY_BE_LIBERAL:-1}" = "1" ] && echo 1 || echo 0) (persisted ${SYSCTL_FILE})"
     # v3.28.7: enable дошёл до конца (verify не откатил) → снимаем degraded-маркер,
     # как делает install-блок. Раньше ручной `on` оставлял залежавшийся маркер.
     rm -f /var/lib/shieldnode/.synproxy-degraded 2>/dev/null || true
@@ -4112,12 +4296,17 @@ SCTL
 disable(){
     nft list table $TABLE >/dev/null 2>&1 && nft delete table $TABLE && log "table $TABLE удалена"
     rm -f "$NFT_FILE" "$SYSCTL_FILE"
-    log "✔ SYNPROXY выключен."
+    # v3.30.2: be_liberal=1 ставил ТОЛЬКО SYNPROXY (под seqadj). Возвращаем в дефолт 0
+    # (строгий window-tracking — корректно без seqadj). tcp_loose/syncookies НЕ трогаем:
+    # их независимо держит 90-shieldnode.conf. В основной ddos_protect нет ct-state-invalid-
+    # drop (только флаговые tcp_invalid) → откат be_liberal не вызывает дропов живого трафика.
+    sysctl -qw net.netfilter.nf_conntrack_tcp_be_liberal=0 2>/dev/null || true
+    log "✔ SYNPROXY выключен (be_liberal→0, table/файлы/persist сняты)."
 }
 
 status(){
     echo "ports = {${PORTS}}   mss = ${MSS}   wscale = ${WSCALE}"
-    echo "loose = $(sysctl -n net.netfilter.nf_conntrack_tcp_loose 2>/dev/null || echo '?')"
+    echo "loose = $(sysctl -n net.netfilter.nf_conntrack_tcp_loose 2>/dev/null || echo '?')   be_liberal = $(sysctl -n net.netfilter.nf_conntrack_tcp_be_liberal 2>/dev/null || echo '?')"
     echo ""
     if nft list table $TABLE >/dev/null 2>&1; then
         echo "SYNPROXY: ACTIVE"
@@ -4206,7 +4395,10 @@ SPUNIT
         print_error "════════════════════════════════════════════════════════════════"
     fi
 else
-    print_info "SYNPROXY выключен (SHIELD_SYNPROXY=0). Дефолт — вкл. Включить: sudo shieldnode-synproxy.sh on"
+    # v3.30.2: дефолт OFF. Зачистку артефактов прошлого включения делает единый
+    # legacy-реапер выше (ШАГ 1). Здесь только информируем.
+    print_info "SYNPROXY выключен (opt-in). Анти-SYN: tcp_syncookies=1 + per-IP ct-лимиты."
+    print_info "Вернуть при реальном спуф-SYN-флуде: SHIELD_SYNPROXY=1 sudo bash <установщик> (или sudo shieldnode-synproxy.sh on)."
 fi
 
 # ════════════════════════════════════════════════════════════════════
@@ -8443,7 +8635,7 @@ HELP
         if [[ $EUID -ne 0 ]]; then echo "Run as root: sudo guard rollback"; exit 1; fi
         SNAP_PTR="/var/lib/shieldnode/.last_upgrade_snapshot"
         if [ ! -f "$SNAP_PTR" ]; then
-            echo "Нет snapshot'а — `guard upgrade` ещё не запускался на этой версии."
+            echo "Нет snapshot'а — \`guard upgrade\` ещё не запускался на этой версии."
             exit 1
         fi
         SNAP=$(cat "$SNAP_PTR" 2>/dev/null)
@@ -10431,8 +10623,11 @@ if ! nft list table inet ddos_protect >/dev/null 2>&1; then
 fi
 
 # Текущий счётчик drop'ов из всех counters в ddos_protect
-CURRENT_DROPS=$(nft list table inet ddos_protect 2>/dev/null | \
-    awk '/counter packets/ {gsub(/[^0-9]/,"",$3); sum+=$3} END {print sum+0}')
+# v3.30.1 FIX(F11): named-counters в nft печатаются МНОГОСТРОЧНО → старый /counter packets/
+# матчил только анонимные v6-счётчики и суммировал мусор ("6" из ipv6) → trigger НИКОГДА
+# не срабатывал на v4-флуде. Трекаем имя counter'а и суммируем его packets, исключая pass.
+CURRENT_DROPS=$(nft list counters table inet ddos_protect 2>/dev/null | \
+    awk '/counter [a-z]/{n=$2} /^[[:space:]]*packets /{ if(n !~ /pass/) sum+=$2 } END{print sum+0}')
 
 # Предыдущий замер (из state файла)
 PREV_DROPS=$(cat "$STATE_FILE" 2>/dev/null || echo 0)
@@ -10588,7 +10783,7 @@ NEW_IPS=$(sqlite3 "$DB" "
     SELECT DISTINCT ip FROM events
     WHERE last_seen > strftime('%s','now') - ($PROMOTE_WINDOW_HOURS * 3600)
       AND count >= $PROMOTE_THRESHOLD
-      AND type IN ('conn_flood','syn_escalate','udp_escalate')
+      AND type IN ('conn_flood','syn_escalate','udp_escalate','newconn_flood')
     ORDER BY count DESC;
 " 2>/dev/null || true)
 
@@ -11248,6 +11443,20 @@ if [ "$BL_V4" -gt 0 ]; then
     print_ok "Scanner blocklist: $BL_V4 IPv4 подсетей"
 else
     print_warn "Scanner blocklist пуст — проверь journalctl -u shieldnode-update@scanner"
+fi
+
+# v3.29.0: на Docker-хостах FORWARD policy = DROP ломает egress контейнеров. Обычно
+# мы это уже починили (shield_fix_ufw_forward_for_docker в ШАГ 2), но проверяем на
+# случай если юзер вернул DROP / knob выключен.
+if shield_docker_present; then
+    FWD_POL=$(nft list chain ip filter FORWARD 2>/dev/null | grep -oE 'policy (accept|drop)' | head -1 | awk '{print $2}')
+    if [ "$FWD_POL" = "drop" ]; then
+        print_warn "Docker есть, но FORWARD policy=DROP → egress bridge-контейнеров (бот/панель) сломан. Фикс: sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY=\"ACCEPT\"/' /etc/default/ufw && ufw reload"
+    elif [ "$FWD_POL" = "accept" ]; then
+        print_ok "Docker + FORWARD policy=accept (egress контейнеров не блокируется)"
+    else
+        print_info "Docker есть; FORWARD policy не определил (iptables-legacy?) — проверь egress контейнера вручную"
+    fi
 fi
 
 # ==============================================================================
