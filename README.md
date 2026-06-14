@@ -1,74 +1,74 @@
 # shieldnode
 
-Коммерческий слой DDoS-защиты для VPN-нод на базе **nftables + CrowdSec**. Заточен под Remnawave / Xray (VLESS Reality, Hysteria2, Shadowsocks) и российский рынок: CGNAT-aware, без ложных банов за NAT, дружелюбен к DPI-evasion-топологиям.
+Защита VPN-нод от DDoS и сетевого абуза на базе **nftables**. Один скрипт ставит многослойную фильтрацию в `prerouting`, держит conntrack под контролем и переживает перезагрузки. Заточен под высоконагруженные релеи (VLESS/Reality, Hysteria2, Shadowsocks) и CGNAT-реалии: не банит абонентов за общим NAT.
 
-Работает в `prerouting` (до conntrack-логики), не конфликтует с UFW и Docker (фильтрация форварда остаётся в `DOCKER-USER`).
+---
 
-## Установка
+## Быстрый старт
 
 ```bash
 curl -fL https://raw.githubusercontent.com/SpofyJet/shield/main/shieldnode.sh | sudo bash
 ```
 
-Установка идемпотентна: повторный запуск/`guard upgrade` безопасно перенакатывает правила и подтягивает свежую версию.
+Повторный запуск безопасен — правила и сервисы перенакатываются идемпотентно, версия подтягивается свежая.
 
 ## Требования
 
-- Debian 12/13 (bookworm/trixie) или Ubuntu 24.04+
-- root
-- ядро с поддержкой nftables (штатно во всех поддерживаемых дистрибутивах)
+| | |
+|---|---|
+| ОС | Debian 12/13 · Ubuntu 24.04+ |
+| Права | root |
+| Ядро | с поддержкой nftables (штатно) |
 
-## Что делает
+## Возможности
 
-Многослойная защита, каждый слой независим:
-
-- **nftables prerouting** — rate-limit на SYN / UDP / новые соединения, per-IP conntrack-лимиты, дроп пакетов с невалидными комбинациями флагов (NULL / XMAS / SYN+FIN / SYN+RST / FIN+RST), пре-аутентификационная защита SSH от флуда.
-- **Блоклисты** (v4 + v6) — scanner / tor-exit / threat / custom, с курируемыми CIDR из реальных атак.
-- **ctguard** — страж исчерпания conntrack: следит за заполнением таблицы, в attack-mode поднимает лимиты и эвиктит, **CGNAT-aware** (не банит хосты за общим NAT). Порог конн-флуда per-IP по умолчанию 15000.
-- **auto-promote** — повторно атакующие IP автоматически уезжают в локальный блоклист с TTL.
-- **pcap-форензика** — при всплеске дропов (порог) снимается дамп для разбора, с ротацией.
+- **Rate-limiting в nftables** — пороги на SYN, UDP и новые соединения с burst-окнами.
+- **Per-IP conntrack-лимиты** — потолок одновременных коннектов с одного адреса (анти connect-and-hold).
+- **Дроп невалидных пакетов** — NULL / XMAS / SYN+FIN / SYN+RST / FIN+RST сканы режутся по флагам.
+- **Блоклисты v4/v6** — scanner / tor-exit / threat / custom, с курируемыми CIDR из боевых данных.
+- **ctguard** — страж исчерпания conntrack: следит за заполнением таблицы, в режиме атаки поднимает лимиты и эвиктит. CGNAT-aware.
+- **Авто-промоушн** — повторно атакующие адреса уезжают в локальный блоклист с TTL.
+- **Pcap-форензика** — при всплеске дропов снимается дамп для разбора, с ротацией.
 - **CrowdSec** — интеграция через bouncer.
-- **Remnawave node-sync** — IP нод панели автоматически держатся в whitelist (режим `auto`).
-- **SYNPROXY** — анти-спуф-SYN через notrack. **С v3.30.2 — opt-in (по умолчанию выключен)**: на VPN-туннеле несёт seqadj/window-риски и убивает TFO, а его пользу на нодах без conntrack-давления дублируют syncookies + per-IP ct-лимиты. Включается под реальный спуфнутый SYN-флуд: `SHIELD_SYNPROXY=1`.
-- **Единый реапер устаревшего** — при каждом install/upgrade сам находит и снимает артефакты прошлых версий (старые таймеры/скрипты/sysctl, выключенный SYNPROXY и т.д.) по курируемому списку.
+- **SYNPROXY (opt-in)** — анти-спуф-SYN через notrack. По умолчанию выключен; включается под реальный спуфнутый SYN-флуд переменной `SHIELD_SYNPROXY=1`.
+- **Авто-очистка устаревшего** — при каждой установке/обновлении снимаются артефакты прошлых версий по курируемому списку.
+- **Переживает ребут** — модуль conntrack форсится при загрузке до применения sysctl, ключевые параметры не теряются.
 
-## Управление: `guard`
+## Управление
 
 После установки доступна команда `guard`:
 
 ```bash
 sudo guard            # снимок состояния + интерактивное меню
-sudo guard --json     # JSON для интеграций (Zabbix / Prometheus / боты)
+sudo guard --json     # JSON для Zabbix / Prometheus / ботов
 sudo watch -n 5 guard # live-режим
 ```
 
-Подкоманды:
-
-| Команда | Назначение |
+| Подкоманда | Действие |
 |---|---|
 | `guard self-test` | самопроверка правил и сервисов |
-| `guard upgrade` | обновление до свежей версии (snapshot + re-exec; раскатка на флот) |
-| `guard rollback` | откат на предыдущий snapshot |
-| `guard sync` | подтяжка блоклистов/нод вручную |
-| `guard check` | проверка целостности/доступности обновления |
-| `guard status` | краткий статус |
+| `guard upgrade`   | обновление до свежей версии (snapshot + перезапуск) |
+| `guard rollback`  | откат на предыдущий snapshot |
+| `guard sync`      | ручная подтяжка блоклистов |
+| `guard check`     | проверка целостности и доступности обновления |
+| `guard status`    | краткий статус |
 
-## Ключевые параметры (env при установке)
+## Параметры (env при установке)
 
-Передаются перед запуском, например `SHIELD_SYNPROXY=1 SHIELD_RATE_SYN=3000/second sudo bash shieldnode.sh`.
+Передаются перед запуском:
+`SHIELD_SYNPROXY=1 SHIELD_RATE_SYN=3000/second sudo bash shieldnode.sh`
 
 | Переменная | Дефолт | Назначение |
 |---|---|---|
-| `SHIELD_SYNPROXY` | `0` | SYNPROXY (opt-in; 1 — включить под спуф-SYN-флуд) |
+| `SHIELD_SYNPROXY` | `0` | SYNPROXY (1 — включить под спуф-SYN-флуд) |
 | `SHIELD_CTGUARD` | `1` | страж conntrack-exhaustion |
 | `SHIELD_CGNAT_SAFE` | `1` | не банить хосты за общим NAT |
 | `SHIELD_CT_CONN_FLOOD` | `15000` | потолок коннектов на один IP |
-| `SHIELD_RATE_SYN` | `2000/second` | лимит новых SYN (burst `3000`) |
+| `SHIELD_RATE_SYN` | `2000/second` | лимит SYN (burst `3000`) |
 | `SHIELD_RATE_UDP` | `10000/second` | лимит UDP (burst `20000`) |
 | `SHIELD_RATE_NEWCONN` | `40000/minute` | лимит новых соединений (burst `60000`) |
 | `SHIELD_SSH_NEWCONN_RATE` | `8/minute` | анти-флуд SSH (burst `20`, ct-лимит `5`) |
-| `SHIELD_AUTOPROMOTE_THRESHOLD` | `800` | порог авто-промоушна IP в блоклист (окно 24ч) |
-| `SHIELD_REMNAWAVE_SYNC` | `auto` | автоподтяжка IP нод Remnawave |
+| `SHIELD_AUTOPROMOTE_THRESHOLD` | `800` | порог авто-промоушна IP (окно 24ч) |
 | `SHIELD_PCAP_TRIGGER_DROPS` | `10000` | порог дропов для снятия pcap |
 | `SHIELD_EVENTS_DB_RETENTION_DAYS` | `90` | хранение БД событий |
 
@@ -80,8 +80,8 @@ sudo watch -n 5 guard # live-режим
 sudo bash shieldnode.sh --uninstall
 ```
 
-Сносит правила, сервисы, таймеры, sysctl-оверрайды и сопутствующие артефакты.
+Снимает правила, сервисы, таймеры, sysctl-оверрайды и сопутствующие артефакты.
 
 ## Версия
 
-Текущая: **v3.30.2**. История изменений — в шапке `shieldnode.sh` и в разделе Releases.
+**v3.30.4** · история изменений — в шапке `shieldnode.sh` и в разделе Releases.

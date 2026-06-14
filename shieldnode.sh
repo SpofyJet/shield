@@ -1,6 +1,29 @@
 #!/bin/bash
 
 # ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.30.4 — revert F10 (CGNAT mass-block risk в auto-promote)
+#
+#  В v3.30.1 я добавил newconn_flood в источники auto-promote, опираясь на устаревший
+#  комментарий. Это было ОШИБКОЙ: newconn_flood_v4 срабатывает per-IP при >50 нов.
+#  конн/мин — busy CGNAT-IP превышает это постоянно и набирает порог 800 событий/24ч
+#  тривиально → авто-промоушн общего CGNAT-IP в локальный блоклист = аутаж ВСЕХ
+#  легит-юзеров за этим NAT. Источники auto-promote намеренно исключали newconn_flood
+#  (P1-1); CGNAT_SAFE защищает live-путь, но не промоушн-по-счётчику-событий. Откат:
+#  источники снова conn_flood/syn_escalate/udp_escalate. newconn-флуд по-прежнему
+#  дропается live по rate-limit — промоушн в блоклист ему и не нужен.
+#
+# ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.30.3 — est-timeout 7200 → 14400 (4ч)
+#
+#  nf_conntrack_tcp_timeout_established поднят 7200 → 14400. 4ч выше любого
+#  наблюдаемого idle живых коннектов (по проду max ~583с, p99≤361с) с большим
+#  запасом, но вдвое короче суток: мёртвые/брошенные established (включая residue
+#  connect-and-hold / connection-флуда) реклеймятся за 4ч вместо 24ч и не раздувают
+#  conntrack-таблицу. Польза от ещё более длинного таймаута упирается в потолок
+#  (защищать нечего выше реального idle), а цена residue растёт линейно. Exhaustion
+#  по-прежнему держат per-IP ct>лимит + conn_flood + ctguard.
+#
+# ==============================================================================
 #  VPN NODE DDoS PROTECTION v3.30.2 — SYNPROXY → opt-in + единый реапер устаревшего
 #
 #  SYNPROXY переведён в OPT-IN (дефолт SHIELD_SYNPROXY=0). На VPN-relay он несёт
@@ -858,7 +881,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.30.2"
+SHIELDNODE_VERSION="3.30.4"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -2342,10 +2365,12 @@ net.netfilter.nf_conntrack_udp_timeout_stream = 600
 # nf_conntrack-зона, НЕ tcp_*-сокеты (их по-прежнему ведёт setup).
 net.netfilter.nf_conntrack_acct = 1
 net.netfilter.nf_conntrack_tcp_loose = 0
-# v3.30.1: 1800 -> 7200 (скоординировано с vpn-node-setup 80-: одно значение, без
-# лексикографического сюрприза). 7200 = ~12x наблюдаемого idle живых коннектов на
-# проде; exhaustion и так держат per-IP ct>лимит + conn_flood + ctguard.
-net.netfilter.nf_conntrack_tcp_timeout_established = 7200
+# v3.30.3: est-timeout = 14400 (4ч). Выше любого наблюдаемого idle живых коннектов
+# (по проду max ~583с, p99≤361с) с большим запасом, но вдвое короче суток → мёртвые/
+# брошенные established (в т.ч. residue connect-and-hold / connection-флуда) реклеймятся
+# за 4ч, а не висят 24ч и не раздувают conntrack. Exhaustion держат per-IP ct>лимит +
+# conn_flood + ctguard, не est-timeout.
+net.netfilter.nf_conntrack_tcp_timeout_established = 14400
 net.netfilter.nf_conntrack_tcp_timeout_close_wait = 30
 net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 30
 net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
@@ -10783,7 +10808,7 @@ NEW_IPS=$(sqlite3 "$DB" "
     SELECT DISTINCT ip FROM events
     WHERE last_seen > strftime('%s','now') - ($PROMOTE_WINDOW_HOURS * 3600)
       AND count >= $PROMOTE_THRESHOLD
-      AND type IN ('conn_flood','syn_escalate','udp_escalate','newconn_flood')
+      AND type IN ('conn_flood','syn_escalate','udp_escalate')
     ORDER BY count DESC;
 " 2>/dev/null || true)
 
