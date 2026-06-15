@@ -1,6 +1,27 @@
 #!/bin/bash
 
 # ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.30.6 — добивка удаления SYNPROXY (мёртвый статус в guard)
+#
+#  v3.30.5 вырезал SYNPROXY, но в дашборде `guard` остался мёртвый status-блок,
+#  печатавший «synproxy active/DEGRADED» и советовавший shieldnode-synproxy.sh on
+#  (удалённый скрипт). В норме недостижим (нет таблицы/маркера — реапер чистит), но
+#  это висячая ссылка на удалённое. Убран. Очистка остатков (реапер/uninstall/rollback)
+#  сохранена. Также обновлён shieldnode-doctor.sh (synproxy убран из CORE-файлов и
+#  проверок — иначе ложное «core отсутствует» на v3.30.x-нодах).
+#
+# ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.30.5 — SYNPROXY полностью удалён из скрипта
+#
+#  По решению владельца SYNPROXY вырезан целиком: модуль shieldnode-synproxy.sh,
+#  install-путь и флаги SHIELD_SYNPROXY/_SSH удалены. На профиле connect-and-hold/PPS
+#  он не помогал, его единственную пользу (анти-спуф-SYN) дублируют tcp_syncookies=1 +
+#  per-IP ct-лимиты, а издержки (seqadj/window, мёртвый TFO на защищённых портах,
+#  обязательный be_liberal=1) не оправданы. Включить флагом больше НЕЛЬЗЯ. Остатки
+#  прошлых установок (table shield_synproxy, synproxy.nft, 99-sysctl, сервис) снимает
+#  legacy-реапер при upgrade и `--uninstall`; be_liberal возвращается в 0.
+#
+# ==============================================================================
 #  VPN NODE DDoS PROTECTION v3.30.4 — revert F10 (CGNAT mass-block risk в auto-promote)
 #
 #  В v3.30.1 я добавил newconn_flood в источники auto-promote, опираясь на устаревший
@@ -881,7 +902,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.30.4"
+SHIELDNODE_VERSION="3.30.6"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -1143,10 +1164,6 @@ SHIELD_GLOBAL_NEWCONN_CEIL="${SHIELD_GLOBAL_NEWCONN_CEIL:-0}"
 # v3.27.0 FIX(#11): 1=RST новым v6-TCP на VPN-портах (быстрый happy-eyeballs fallback), 0=drop (стелс).
 SHIELD_V6_REJECT="${SHIELD_V6_REJECT:-0}"
 SHIELD_AUTOPROMOTE_THRESHOLD="${SHIELD_AUTOPROMOTE_THRESHOLD:-800}"
-# v3.24.0: SYNPROXY (conntrack-exhaustion защита). 1=вкл (дефолт), 0=выкл.
-SHIELD_SYNPROXY="${SHIELD_SYNPROXY:-0}"
-# v3.27.1 FIX(#6): покрывать ли SSH-порт SYNPROXY (анти-спуф-SYN на SSH). 1=да (дефолт), 0=нет.
-SHIELD_SYNPROXY_SSH="${SHIELD_SYNPROXY_SSH:-1}"
 # v3.24.0: conntrack-pressure guard (anti-exhaustion backstop)
 SHIELD_CTGUARD="${SHIELD_CTGUARD:-1}"
 SHIELD_CT_WARN_PCT="${SHIELD_CT_WARN_PCT:-80}"
@@ -1192,8 +1209,6 @@ shield_ensure_numeric SHIELD_AUTOPROMOTE_THRESHOLD 800
 shield_ensure_numeric SHIELD_CGNAT_SAFE 1
 shield_ensure_numeric SHIELD_GLOBAL_NEWCONN_CEIL 0
 shield_ensure_numeric SHIELD_V6_REJECT 0
-shield_ensure_numeric SHIELD_SYNPROXY 0
-shield_ensure_numeric SHIELD_SYNPROXY_SSH 1
 shield_ensure_numeric SHIELD_AUTOPROMOTE_WINDOW_HOURS 24
 shield_ensure_numeric SHIELD_CUSTOM_LOCAL_TTL_DAYS 90
 shield_ensure_numeric SHIELD_EVENTS_DB_RETENTION_DAYS 90
@@ -2585,12 +2600,11 @@ fi
 rm -f /var/lib/shieldnode/mobile_ru_fail_count 2>/dev/null
 rm -f /var/lib/shieldnode/broadband_ru_fail_count 2>/dev/null
 
-# 8) v3.30.2: SYNPROXY стал OPT-IN. Если выключен (SHIELD_SYNPROXY!=1), но на ноде
-#    остались артефакты прошлого включения — единый реапер снимает их здесь.
-#    be_liberal=1 ставил ТОЛЬКО SYNPROXY → возвращаем в kernel-default 0. tcp_loose/
-#    syncookies НЕ трогаем (их держит 90-shieldnode.conf). В ddos_protect нет
-#    ct-state-invalid-drop (только флаговые tcp_invalid) → откат be_liberal безопасен.
-if [ "$SHIELD_SYNPROXY" != "1" ]; then
+# 8) v3.30.5: SYNPROXY вырезан из скрипта целиком. Реапер БЕЗУСЛОВНО снимает остатки
+#    прошлых установок (table shield_synproxy, synproxy.nft, 99-sysctl, сервис,
+#    degraded-маркер), возвращает be_liberal→0 (его ставил только SYNPROXY; tcp_loose/
+#    syncookies держит 90-shieldnode.conf), выгружает nf_synproxy. Идемпотентно.
+if true; then
     _sp_found=0
     nft list table inet shield_synproxy >/dev/null 2>&1 && { _sp_found=1; nft delete table inet shield_synproxy 2>/dev/null || true; }
     for f in /etc/shieldnode/synproxy.nft /etc/sysctl.d/99-shieldnode-synproxy.conf /var/lib/shieldnode/.synproxy-degraded; do
@@ -2605,7 +2619,7 @@ if [ "$SHIELD_SYNPROXY" != "1" ]; then
         LEGACY_FOUND=1
         sysctl -qw net.netfilter.nf_conntrack_tcp_be_liberal=0 2>/dev/null || true
         modprobe -r nf_synproxy 2>/dev/null || true
-        print_ok "SYNPROXY-слой снят реапером (opt-in с v3.30.2; be_liberal→0)"
+        print_ok "SYNPROXY-остатки сняты реапером (SYNPROXY удалён в v3.30.5; be_liberal→0)"
     fi
 fi
 
@@ -3212,15 +3226,6 @@ SHIELD_V6_REJECT=0
 # Heavy-CGNAT нода? Подними обратно (conn_flood ложно срабатывает на CGNAT-пиках).
 SHIELD_AUTOPROMOTE_THRESHOLD=800
 SHIELD_AUTOPROMOTE_WINDOW_HOURS=24
-# v3.30.2: SYNPROXY теперь OPT-IN (дефолт 0). Причина: на VPN-relay он несёт
-# seqadj/window-риски (нужен be_liberal=1), убивает TFO на защищённых портах и
-# даёт per-packet overhead, а уникальную пользу (анти-СПУФ-SYN через notrack) на
-# нодах без conntrack-давления дублируют tcp_syncookies=1 + per-IP ct-лимиты. Против
-# connect-and-hold/PPS он не помогает вовсе. Включить под реальный спуф-SYN-флуд:
-# SHIELD_SYNPROXY=1 (или sudo shieldnode-synproxy.sh on). 0=выкл (дефолт).
-SHIELD_SYNPROXY=0
-# v3.27.1 FIX(#6): SYNPROXY покрывает и SSH-порт (анти-спуф-SYN→conntrack). 0=выключить.
-SHIELD_SYNPROXY_SSH=1
 # v3.27.1 FIX(#1): анти-pulsing — sustained если >= SHIELD_CTG_ATTACK_MIN_TICKS аномалий
 # в скользящем окне из SHIELD_CTG_ANOM_WINDOW тиков (не обязательно подряд).
 SHIELD_CTG_ANOM_WINDOW=4
@@ -4078,353 +4083,11 @@ else
 fi
 
 # ============================================================================
-# v3.23.16: SYNPROXY модуль (opt-in, conntrack-exhaustion защита)
+# SYNPROXY — УДАЛЁН из скрипта (v3.30.5). Модуль shieldnode-synproxy.sh и install-
+# путь вырезаны полностью. На профиле connect-and-hold/PPS он дублировался
+# tcp_syncookies + per-IP ct-лимитами и нёс издержки (seqadj/window, мёртвый TFO).
+# Остатки прошлых установок снимает legacy-реапер (ШАГ 1) + --uninstall.
 # ============================================================================
-# Изолированный модуль (отдельная nft table inet shield_synproxy, отдельный
-# процесс). Управляется флагом SHIELD_SYNPROXY (default 1, v3.24.0). ddos_protect не
-# трогается. Запускаем ПОСЛЕ загрузки основной таблицы — модуль детектит
-# protected_ports_tcp из живого ruleset'а.
-cat > /usr/local/sbin/shieldnode-synproxy.sh <<'SYNPROXY_MODULE_EOF'
-#!/bin/bash
-# shieldnode-synproxy v0.2 — opt-in SYNPROXY (защита от conntrack-exhaustion).
-# SYN перехватывается ДО conntrack (syncookies); запись в conntrack только после
-# завершённого 3-way → SYN-флуд не течёт таблицу. Изолированная table
-# inet shield_synproxy (ddos_protect не трогает, откат = удаление). v3.27.1: SSH ТОЖЕ
-# покрыт по умолчанию (анти-спуф-SYN на SSH-порт; SHIELD_SYNPROXY_SSH=0 чтобы выключить).
-# enable: verify mss/wscale против бэкенда + проверка untracked с авто-откатом
-# (если другой фаервол дропает untracked — иначе оборвало бы клиентов).
-set -euo pipefail
-
-TABLE="inet shield_synproxy"
-NFT_FILE="/etc/shieldnode/synproxy.nft"
-SYSCTL_FILE="/etc/sysctl.d/99-shieldnode-synproxy.conf"
-DDOS_TABLE="inet ddos_protect"
-VERIFY_SECS="${SHIELD_SYNPROXY_VERIFY_SECS:-6}"
-PROBE_SECS="${SHIELD_SYNPROXY_PROBE_SECS:-8}"
-
-log(){ printf '%s\n' "$*" >&2; }
-die(){ log "ERROR: $*"; exit 1; }
-have(){ command -v "$1" >/dev/null 2>&1; }
-
-detect_dev(){
-    local d
-    d=$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
-    [ -n "${d:-}" ] || d=$(ip -o link show up 2>/dev/null | awk -F': ' '$2!="lo"{print $2;exit}')
-    echo "${d:-eth0}"
-}
-
-detect_ports(){
-    local raw
-    raw=$(nft list set $DDOS_TABLE protected_ports_tcp 2>/dev/null \
-          | tr '\n' ' ' | sed -n 's/.*elements = {\([^}]*\)}.*/\1/p' | tr -d ' \t')
-    [ -n "$raw" ] && { echo "$raw"; return; }
-    echo "443"
-}
-# v3.27.1 FIX(#6): SSH-порты для SYNPROXY (спуф-SYN на SSH иначе течёт conntrack —
-# SSH не в protected_ports_tcp, значит не покрыт ни synproxy, ни ctguard-капом).
-# Детектим listener'ы sshd в рантайме (как установщик). Пусто → ничего не добавляем.
-detect_ssh_ports(){
-    ss -tlnpH 2>/dev/null | awk '
-        /users:\(.*"sshd"/ {
-            split($4, a, ":"); port = a[length(a)]
-            if ($4 ~ /^127\./ || $4 ~ /^\[::1\]/) next
-            print port
-        }' | sort -un | tr '\n' ',' | sed 's/,$//'
-}
-detect_mss(){ local m; m=$(cat "/sys/class/net/$(detect_dev)/mtu" 2>/dev/null || echo 1500); echo $((m-40)); }
-detect_wscale(){
-    local rmax space=65535 w=0
-    rmax=$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null | awk '{print $3}')
-    [ -n "${rmax:-}" ] || rmax=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 6291456)
-    while [ "$space" -lt "$rmax" ] && [ "$w" -lt 14 ]; do space=$((space*2)); w=$((w+1)); done
-    echo "$w"
-}
-
-PORTS="${SHIELD_SYNPROXY_PORTS:-$(detect_ports)}"
-# v3.27.1 FIX(#6): по умолчанию покрываем и SSH (спуф-SYN-флуд на SSH иначе течёт
-# conntrack). SYNPROXY прозрачен для легитимных хендшейков; established SSH-сессии не
-# рвутся (accept по ct established выше). Отключить: SHIELD_SYNPROXY_SSH=0.
-if [ "${SHIELD_SYNPROXY_SSH:-1}" = "1" ]; then
-    _sshp="$(detect_ssh_ports || true)"
-    [ -n "${_sshp:-}" ] && PORTS="${PORTS:+$PORTS,}${_sshp}"
-fi
-MSS="${SHIELD_SYNPROXY_MSS:-$(detect_mss)}"
-WSCALE="${SHIELD_SYNPROXY_WSCALE:-$(detect_wscale)}"
-FIRST_PORT="$(echo "$PORTS" | tr ',' '\n' | head -1 | cut -d- -f1)"
-
-synproxy_syn_total(){
-    local s=0 syn rest hdr v
-    [ -r /proc/net/stat/synproxy ] || { echo 0; return; }
-    while read -r hdr syn rest; do
-        [ "$hdr" = "entries" ] && continue
-        v=$(( 16#${syn:-0} )) 2>/dev/null || v=0
-        s=$(( s + v ))
-    done < /proc/net/stat/synproxy
-    echo "$s"
-}
-
-cap_check(){
-    modprobe nf_synproxy 2>/dev/null || true
-    modprobe nf_conntrack 2>/dev/null || true
-    # v3.24.0: на стоковых ядрах nf_synproxy может быть в linux-modules-extra — доустановим
-    if ! lsmod 2>/dev/null | grep -qw nf_synproxy && command -v apt-get >/dev/null 2>&1; then
-        log "nf_synproxy не загружен — пробую linux-modules-extra-$(uname -r) (на XanMod встроен, пропустится)…"
-        DEBIAN_FRONTEND=noninteractive apt-get install -y "linux-modules-extra-$(uname -r)" >/dev/null 2>&1 || true
-        modprobe nf_synproxy 2>/dev/null || true
-    fi
-    nft -c -f - >/dev/null 2>&1 <<'PROBE' || die "ядро/nft без SYNPROXY (нужен CONFIG_NFT_SYNPROXY / kernel >=5.14). Обнови ядро или используй обычную SYN-rate защиту."
-table inet __sp_probe {
-    chain c {
-        type filter hook input priority 0;
-        tcp dport 443 ct state invalid,untracked synproxy mss 1460 wscale 7 timestamp sack-perm
-    }
-}
-PROBE
-}
-
-verify_backend_mss_wscale(){
-    [ "${SHIELD_SYNPROXY_NOVERIFY:-0}" = "1" ] && { log "verify пропущен (NOVERIFY=1)"; return 0; }
-    have tcpdump || { log "tcpdump не найден — проверку mss/wscale пропускаю (авто-детект mss=$MSS wscale=$WSCALE)"; return 0; }
-    local dev cap mss_seen wscale_seen
-    dev=$(detect_dev)
-    log "Проверяю нативный SYN-ACK бэкенда на :$FIRST_PORT (${VERIFY_SECS}s, нужен живой трафик)…"
-    cap=$(timeout "$VERIFY_SECS" tcpdump -ni "$dev" -c1 -v \
-          "tcp src port $FIRST_PORT and tcp[tcpflags]=(tcp-syn|tcp-ack)" 2>/dev/null || true)
-    mss_seen=$(echo "$cap"    | grep -oE 'mss [0-9]+'    | head -1 | awk '{print $2}' || true)
-    wscale_seen=$(echo "$cap" | grep -oE 'wscale [0-9]+' | head -1 | awk '{print $2}' || true)
-    if [ -z "${mss_seen:-}" ]; then
-        log "  (живого SYN-ACK за окно нет — оставляю авто-детект mss=$MSS wscale=$WSCALE)"
-        return 0
-    fi
-    log "  нативный бэкенд: mss=$mss_seen wscale=${wscale_seen:-?}"
-    if [ "$mss_seen" != "$MSS" ]; then
-        log "  ⚠ MSS расходится (synproxy=$MSS, бэкенд=$mss_seen) → выставляю $mss_seen"
-        MSS="$mss_seen"
-    fi
-    if [ -n "${wscale_seen:-}" ] && [ "$wscale_seen" != "$WSCALE" ]; then
-        log "  ⚠ wscale расходится (synproxy=$WSCALE, бэкенд=$wscale_seen) → выставляю $wscale_seen"
-        WSCALE="$wscale_seen"
-    fi
-}
-
-verify_untracked_reaches(){
-    [ "${SHIELD_SYNPROXY_NOVERIFY:-0}" = "1" ] && return 0
-    have tcpdump || { log "tcpdump не найден — проверку доходимости untracked пропускаю"; return 0; }
-    local dev before after syn_in i fails=0
-    dev=$(detect_dev)
-    log "Проверяю что untracked SYN доходит до synproxy (до 3×${PROBE_SECS}s)…"
-    # v3.28.7 FIX: откатываем ТОЛЬКО при ДВУХ подтверждённых окнах "SYN есть, а
-    # synproxy их не считает". Одиночное окно ложно срабатывает: ретрансмиты и
-    # уже-tracked SYN synproxy законно не считает (он видит лишь untracked-new),
-    # хотя слой исправен. Раньше одно такое окно → спонтанный disable+exit 3 при
-    # install (фоновые сканеры) → ложный synproxy_enable_failed/DEGRADED, хотя
-    # вручную позже включалось. Успех на ЛЮБОМ окне = слои уживаются.
-    for i in 1 2 3; do
-        before=$(synproxy_syn_total)
-        syn_in=$(timeout "$PROBE_SECS" tcpdump -ni "$dev" -c1 \
-                 "tcp dst port $FIRST_PORT and tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack = 0" 2>/dev/null | wc -l)
-        after=$(synproxy_syn_total)
-        if [ "${syn_in:-0}" -eq 0 ]; then
-            [ "$i" = "1" ] && { log "  (входящих SYN на :$FIRST_PORT за окно нет — пропускаю; повтори под нагрузкой/nc)"; return 0; }
-            continue
-        fi
-        if [ "$after" -gt "$before" ]; then
-            log "  ✔ untracked SYN доходит (syn_received растёт) — слои уживаются."
-            return 0
-        fi
-        fails=$((fails+1))
-        log "  ⚠ окно $i: входящие SYN есть, а synproxy их не считает (${fails}/2)"
-        [ "$fails" -ge 2 ] && break
-    done
-    if [ "${fails:-0}" -ge 2 ]; then
-        log "  ✖ ВХОДЯЩИЕ SYN ЕСТЬ, но synproxy их не видит (подтверждено ${fails} окнами)."
-        log "    Другой фаервол (UFW/firewalld/кастом) дропает UNTRACKED раньше synproxy."
-        log "    АВТО-ОТКАТ во избежание обрыва клиентов. Разбери конфликт слоёв и включи заново."
-        disable
-        exit 3
-    fi
-    log "  (проверка неоднозначна — synproxy оставлен активным; повтори под нагрузкой: shieldnode-synproxy.sh on)"
-    return 0
-}
-
-write_conf(){
-    local ports_nft="${PORTS//,/, }"
-    # v3.24.2: кэпим анонсируемый клиентам MSS (после verify_backend, который мог
-    # выставить большой backend-MSS). Слишком большой MSS = PMTU-blackhole для
-    # RU-мобайла/PPPoE/DSL. Кэп ТОЛЬКО понижает → всегда безопасно (клиент шлёт
-    # сегменты <= min(свой, анонс)). Поднять: SHIELD_SYNPROXY_MSS_CAP=0 (off).
-    local mss_cap="${SHIELD_SYNPROXY_MSS_CAP:-1400}"
-    if [ "${mss_cap:-0}" -gt 0 ] 2>/dev/null && [ "${MSS:-0}" -gt "$mss_cap" ] 2>/dev/null; then
-        log "  MSS=$MSS > cap $mss_cap → анонсирую $mss_cap (low-path-MTU клиенты; SHIELD_SYNPROXY_MSS_CAP)"
-        MSS="$mss_cap"
-    fi
-    mkdir -p /etc/shieldnode
-    cat > "$NFT_FILE" <<EOF
-#!/usr/sbin/nft -f
-# shieldnode SYNPROXY — изолированная table, НЕ трогает inet ddos_protect.
-# mss/wscale подогнаны под бэкенд (verify на enable), MSS кэпится под low-path-MTU
-# (SHIELD_SYNPROXY_MSS_CAP, default 1400). При жалобах — понизь SHIELD_SYNPROXY_MSS.
-table inet shield_synproxy {
-    set sp_ports {
-        type inet_service
-        flags interval
-        auto-merge
-        elements = { ${ports_nft} }
-    }
-    chain pre_raw {
-        type filter hook prerouting priority -300; policy accept;
-        # v3.28.4: fib daddr type local — notrack ТОЛЬКО для трафика, адресованного
-        # самому хосту. Без этого на форвардящем хосте (Docker/панель/роутер) notrack
-        # цеплял ТРАНЗИТНЫЙ трафик контейнера к удалённой ноде на том же порту (напр.
-        # панель→node:2223) и ломал его conntrack/NAT → нода уходила в offline.
-        fib daddr type local tcp dport @sp_ports tcp flags syn / fin,syn,rst,ack notrack
-    }
-    chain in_synproxy {
-        type filter hook input priority -275; policy accept;
-        tcp dport @sp_ports ct state invalid,untracked synproxy mss ${MSS} wscale ${WSCALE} timestamp sack-perm
-        tcp dport @sp_ports ct state invalid drop
-    }
-}
-EOF
-}
-
-enable(){
-    cap_check
-    nft list table $TABLE >/dev/null 2>&1 && nft delete table $TABLE
-    verify_backend_mss_wscale
-    sysctl -qw net.netfilter.nf_conntrack_tcp_loose=0 2>/dev/null || true
-    sysctl -qw net.ipv4.tcp_syncookies=1 2>/dev/null || true
-    # v3.30.0 КРИТИЧНО: be_liberal=1 для SYNPROXY. SYNPROXY делает seqadj (правит seq
-    # на всю жизнь коннекта); строгий window-tracking conntrack помечает data-пакеты
-    # высоконагруженного туннеля как INVALID → правило `ct state invalid drop` в
-    # in_synproxy их ДРОПАЕТ → клиент подключился, но НИЧЕГО не грузит / таймаут /
-    # «большой пинг» (ретрансмиты). На low-throughput HTTP канонический пример живёт
-    # и без него, на VPN-туннеле — нет. Откат: SHIELD_SYNPROXY_BE_LIBERAL=0.
-    [ "${SHIELD_SYNPROXY_BE_LIBERAL:-1}" = "1" ] && sysctl -qw net.netfilter.nf_conntrack_tcp_be_liberal=1 2>/dev/null || true
-    cat > "$SYSCTL_FILE" <<SCTL
-# shieldnode SYNPROXY requirements
-net.netfilter.nf_conntrack_tcp_loose=0
-net.ipv4.tcp_syncookies=1
-$([ "${SHIELD_SYNPROXY_BE_LIBERAL:-1}" = "1" ] && echo 'net.netfilter.nf_conntrack_tcp_be_liberal=1')
-SCTL
-    write_conf
-    nft -c -f "$NFT_FILE" || die "сгенерированный ruleset не парсится"
-    nft -f "$NFT_FILE" || die "применение ruleset не удалось (nft -f) — нет модуля ядра nf_synproxy? см. dmesg"
-    log "✔ SYNPROXY включён: порты={${PORTS}} mss=${MSS} wscale=${WSCALE}"
-    verify_untracked_reaches
-    log "  conntrack_tcp_loose=0, syncookies=1, be_liberal=$([ "${SHIELD_SYNPROXY_BE_LIBERAL:-1}" = "1" ] && echo 1 || echo 0) (persisted ${SYSCTL_FILE})"
-    # v3.28.7: enable дошёл до конца (verify не откатил) → снимаем degraded-маркер,
-    # как делает install-блок. Раньше ручной `on` оставлял залежавшийся маркер.
-    rm -f /var/lib/shieldnode/.synproxy-degraded 2>/dev/null || true
-}
-
-disable(){
-    nft list table $TABLE >/dev/null 2>&1 && nft delete table $TABLE && log "table $TABLE удалена"
-    rm -f "$NFT_FILE" "$SYSCTL_FILE"
-    # v3.30.2: be_liberal=1 ставил ТОЛЬКО SYNPROXY (под seqadj). Возвращаем в дефолт 0
-    # (строгий window-tracking — корректно без seqadj). tcp_loose/syncookies НЕ трогаем:
-    # их независимо держит 90-shieldnode.conf. В основной ddos_protect нет ct-state-invalid-
-    # drop (только флаговые tcp_invalid) → откат be_liberal не вызывает дропов живого трафика.
-    sysctl -qw net.netfilter.nf_conntrack_tcp_be_liberal=0 2>/dev/null || true
-    log "✔ SYNPROXY выключен (be_liberal→0, table/файлы/persist сняты)."
-}
-
-status(){
-    echo "ports = {${PORTS}}   mss = ${MSS}   wscale = ${WSCALE}"
-    echo "loose = $(sysctl -n net.netfilter.nf_conntrack_tcp_loose 2>/dev/null || echo '?')   be_liberal = $(sysctl -n net.netfilter.nf_conntrack_tcp_be_liberal 2>/dev/null || echo '?')"
-    echo ""
-    if nft list table $TABLE >/dev/null 2>&1; then
-        echo "SYNPROXY: ACTIVE"
-        echo "--- conntrack count ---"
-        conntrack -C 2>/dev/null || cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || true
-        echo "--- synproxy cookie stats ---"
-        cat /proc/net/stat/synproxy 2>/dev/null || echo "(нет статы)"
-    else
-        echo "SYNPROXY: inactive"
-    fi
-}
-
-dryrun(){
-    cap_check && log "✔ ядро/nft поддерживают SYNPROXY"
-    write_conf
-    nft -c -f "$NFT_FILE" && log "✔ ruleset валиден (порты={${PORTS}} mss=${MSS} wscale=${WSCALE})"
-    log "(ничего не применено)"
-}
-
-case "${1:-status}" in
-    on|enable|start)  enable ;;
-    off|disable|stop) disable ;;
-    status)           status ;;
-    dryrun|check)     dryrun ;;
-    *) echo "usage: $0 {on|off|status|dryrun}"; exit 1 ;;
-esac
-SYNPROXY_MODULE_EOF
-chmod 0755 /usr/local/sbin/shieldnode-synproxy.sh
-
-if [ "$SHIELD_SYNPROXY" = "1" ]; then
-    print_status "SHIELD_SYNPROXY=1 → включаю SYNPROXY-слой"
-    # enable применяет слой + verify mss/wscale + проверка untracked (авто-откат)
-    if /usr/local/sbin/shieldnode-synproxy.sh on; then
-        # boot-persistence: грузим зафиксированный synproxy.nft при старте (без verify)
-        cat > /etc/systemd/system/shieldnode-synproxy.service <<'SPUNIT'
-[Unit]
-Description=Shieldnode SYNPROXY ruleset
-After=shieldnode-nftables.service
-Wants=shieldnode-nftables.service
-ConditionPathExists=/etc/shieldnode/synproxy.nft
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-# v3.28.7 FIX: на ядрах где nf_synproxy — загружаемый МОДУЛЬ (стоковые + часть
-# XanMod-сборок) при boot он может быть не подгружен → голый `nft -f` с synproxy-
-# правилом падал и SYNPROXY не вставал после ребута. Грузим модуль ДО применения.
-# v3.28.9 FIX: modprobe ищется через PATH (sh -c), а не хардкодом /sbin/modprobe —
-# на части систем он в /usr/sbin, и хардкод+'-' молча пропускал загрузку → баг
-# возвращался. 'true' в конце = шаг никогда не фейлит старт сервиса.
-ExecStartPre=-/bin/sh -c 'modprobe nf_synproxy 2>/dev/null; modprobe nf_conntrack 2>/dev/null; true'
-ExecStart=/usr/sbin/nft -f /etc/shieldnode/synproxy.nft
-[Install]
-WantedBy=multi-user.target
-SPUNIT
-        systemctl daemon-reload 2>/dev/null || true
-        systemctl enable shieldnode-synproxy.service >/dev/null 2>&1 || true
-        rm -f /var/lib/shieldnode/.synproxy-degraded 2>/dev/null || true   # v3.27.0 FIX(#5): снимаем degraded-маркер
-        print_ok "SYNPROXY активен и переживёт ребут"
-    else
-        # v3.27.0 FIX(#5): fail-loud. Раньше тихо падали на ddos_protect rate-limit —
-        # на стоковом ядре без nf_synproxy (и без интернета для modules-extra) это
-        # СЛАБЕЕ: SYN под per-src лимитом проходит → создаёт SYN_RECV-conntrack →
-        # таблица течёт → conntrack-exhaustion при SYN-флуде. Оператор должен ЗНАТЬ.
-        mkdir -p /var/lib/shieldnode 2>/dev/null || true
-        {
-            echo "degraded_at=$(date -u +%FT%TZ)"
-            echo "reason=synproxy_enable_failed"
-            echo "kernel=$(uname -r)"
-            echo "note=ddos_protect rate-limit активен, но conntrack-exhaustion-защита SYN ослаблена"
-        } > /var/lib/shieldnode/.synproxy-degraded 2>/dev/null || true
-        logger -t shieldnode "ALERT: SYNPROXY запрошен (SHIELD_SYNPROXY=1), но НЕ включился — нода на ослабленной SYN-защите (см. /var/lib/shieldnode/.synproxy-degraded)"
-        print_error "════════════════════════════════════════════════════════════════"
-        print_error "⚠ SYNPROXY НЕ ВКЛЮЧИЛСЯ — нода на ОСЛАБЛЕННОЙ защите от SYN-флуда!"
-        print_error "  ddos_protect rate-limit работает, но conntrack может переполниться"
-        print_error "  при SYN-флуде (SYN под per-src лимитом создаёт conntrack-записи)."
-        print_warn  "  Причина обычно: нет модуля ядра nf_synproxy (стоковое ядро без"
-        print_warn  "  linux-modules-extra) или ядро < 5.14, либо не было интернета."
-        if uname -r | grep -qi xanmod; then
-            print_info  "  Ядро XanMod: nf_synproxy встроен — пакет ставить НЕ надо. Запусти"
-            print_info  "  'sudo shieldnode-synproxy.sh on' и смотри dmesg | grep -i synproxy."
-        else
-            print_info  "  Починить:  sudo apt install linux-modules-extra-$(uname -r) && sudo shieldnode-synproxy.sh on"
-            print_info  "  Либо обнови ядро (XanMod несёт nf_synproxy встроенным)."
-        fi
-        print_info  "  Маркер degraded виден в 'sudo guard'. Скрытно деградировать не будем."
-        print_error "════════════════════════════════════════════════════════════════"
-    fi
-else
-    # v3.30.2: дефолт OFF. Зачистку артефактов прошлого включения делает единый
-    # legacy-реапер выше (ШАГ 1). Здесь только информируем.
-    print_info "SYNPROXY выключен (opt-in). Анти-SYN: tcp_syncookies=1 + per-IP ct-лимиты."
-    print_info "Вернуть при реальном спуф-SYN-флуде: SHIELD_SYNPROXY=1 sudo bash <установщик> (или sudo shieldnode-synproxy.sh on)."
-fi
 
 # ════════════════════════════════════════════════════════════════════
 # v3.24.0: anti-conntrack-exhaustion guard (shieldnode-ctguard)
@@ -4956,8 +4619,6 @@ LOG_TAG="protected-ports"
 FIREWALL_TYPE="$FIREWALL_TYPE"
 # v3.10.2 BUG-7: SSH_PORTS — все sshd-listener порты (для multi-SSH setup'ов)
 SSH_PORTS="$SSH_PORTS"
-# v3.27.1 FIX(#6): включать ли SSH-порты в synproxy sp_ports при ресинке портов
-SHIELD_SYNPROXY_SSH="${SHIELD_SYNPROXY_SSH}"
 
 # Если nft-таблицы нет — выходим
 if ! nft list table inet ddos_protect >/dev/null 2>&1; then
@@ -5235,19 +4896,6 @@ fi
 NFT_ERR=$(nft -f "$TMP" 2>&1)
 if [ $? -eq 0 ]; then
     logger -t "$LOG_TAG" "Updated: TCP={$NEW_TCP} UDP={$NEW_UDP} MGMT={$NEW_MGMT_V4}"
-    # v3.26.1: синхронизируем synproxy sp_ports с новыми TCP-портами (если слой активен).
-    # sp_ports заполнялся один раз при install — без этого synproxy защищал бы старые
-    # порты после смены портов фаервола. Сет не пересоздаём → flags interval+auto-merge
-    # сохраняются (add element в существующий set авто-мёрджит пересечения).
-    # v3.27.1 FIX(#6): добавляем SSH-порты (если SHIELD_SYNPROXY_SSH=1), иначе ресинк
-    # затёр бы SSH-покрытие, добавленное модулем.
-    if [ -n "$NEW_TCP" ] && nft list table inet shield_synproxy >/dev/null 2>&1; then
-        SP_PORTS_SYNC="$NEW_TCP"
-        [ "${SHIELD_SYNPROXY_SSH:-1}" = "1" ] && [ -n "${SSH_PORTS:-}" ] && SP_PORTS_SYNC="${SP_PORTS_SYNC},${SSH_PORTS}"
-        SYN_ERR=$(printf 'flush set inet shield_synproxy sp_ports\nadd element inet shield_synproxy sp_ports { %s }\n' "$(echo "$SP_PORTS_SYNC" | sed 's/,/, /g')" | nft -f - 2>&1) \
-            && logger -t "$LOG_TAG" "synproxy sp_ports синхронизирован: {$SP_PORTS_SYNC}" \
-            || logger -t "$LOG_TAG" "WARN: synproxy sp_ports sync failed: $SYN_ERR"
-    fi
 else
     logger -t "$LOG_TAG" "ERROR: nft failed: $NFT_ERR"
     exit 1
@@ -9149,23 +8797,6 @@ draw_snapshot() {
         [ "$ctg_mode" = "attack" ] && ctg_col="${R}"
         printf "  ${B}ctguard${N}     ${ctg_col}%s${N} ${DIM}phantom-ratio${N} %s%%   ${DIM}phantom-evict${N} %s ${DIM}pkts${N}   ${DIM}cap${N} %s ${DIM}pkts${N}\n" \
             "$ctg_mode" "$ctg_phr" "$(human_num "$ctg_evd")" "$(human_num "$ctg_capd")"
-    fi
-    # ===== SYNPROXY (v3.26.1) =====
-    if nft list table inet shield_synproxy >/dev/null 2>&1; then
-        printf "  ${B}synproxy${N}    ${G}active${N} ${DIM}(SYN перехват до conntrack)${N}\n"
-    elif [ -f /var/lib/shieldnode/.synproxy-degraded ]; then
-        # v3.27.0 FIX(#5): не молчим о деградации
-        printf "  ${B}synproxy${N}    ${R}DEGRADED${N} ${DIM}(не включился — SYN-защита ослаблена; %s)${N}\n" "$(grep -m1 '^reason=' /var/lib/shieldnode/.synproxy-degraded 2>/dev/null | cut -d= -f2)"
-        # v3.28.5: kernel-aware подсказка. Раньше печаталось буквально "$(uname -r)"
-        # (экранированный $) + совет "apt install linux-modules-extra" неверен для XanMod,
-        # где nf_synproxy встроен в ядро и такого пакета не существует.
-        _kr="$(uname -r)"
-        if printf '%s' "$_kr" | grep -qi xanmod; then
-            printf "             ${DIM}fix: на XanMod nf_synproxy встроен — пакет не нужен. Запусти${N}\n"
-            printf "             ${DIM}     shieldnode-synproxy.sh on  и смотри причину (dmesg | grep -i synproxy)${N}\n"
-        else
-            printf "             ${DIM}fix: apt install linux-modules-extra-%s && shieldnode-synproxy.sh on${N}\n" "$_kr"
-        fi
     fi
 
     # ===== v3.27.0 FIX(#10): BRIDGE/WHITELIST DRIFT ADVISORY (read-only, O(1) на IP) =====
