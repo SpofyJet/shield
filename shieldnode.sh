@@ -1,6 +1,18 @@
 #!/bin/bash
 
 # ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.30.7 — реапер добивает synproxy-бинарь + модуль
+#
+#  v3.30.6 реапер снимал table/synproxy.nft/99-sysctl/сервис/degraded-маркер, но НЕ
+#  бинарь /usr/local/sbin/shieldnode-synproxy.sh (его убирал только полный uninstall).
+#  На апгрейженных с synproxy-эпохи нодах бинарь висел: сам по себе инертен (нет
+#  таблицы/сервиса/правил), но это вектор «вернуть synproxy руками» (`... on`). Плюс
+#  т.к. при единственном остатке-бинаре _sp_found оставался 0, не срабатывал
+#  modprobe -r nf_synproxy → модуль висел загруженным до reboot. Фикс: бинарь добавлен
+#  в список реапера → теперь реапер его сносит, _sp_found=1 триггерит выгрузку
+#  nf_synproxy и be_liberal→0. Самочистится при апгрейде, ручной rm/rmmod не нужен.
+#
+# ==============================================================================
 #  VPN NODE DDoS PROTECTION v3.30.6 — добивка удаления SYNPROXY (мёртвый статус в guard)
 #
 #  v3.30.5 вырезал SYNPROXY, но в дашборде `guard` остался мёртвый status-блок,
@@ -902,7 +914,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.30.6"
+SHIELDNODE_VERSION="3.30.7"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -2602,12 +2614,13 @@ rm -f /var/lib/shieldnode/broadband_ru_fail_count 2>/dev/null
 
 # 8) v3.30.5: SYNPROXY вырезан из скрипта целиком. Реапер БЕЗУСЛОВНО снимает остатки
 #    прошлых установок (table shield_synproxy, synproxy.nft, 99-sysctl, сервис,
-#    degraded-маркер), возвращает be_liberal→0 (его ставил только SYNPROXY; tcp_loose/
-#    syncookies держит 90-shieldnode.conf), выгружает nf_synproxy. Идемпотентно.
+#    degraded-маркер, бинарь shieldnode-synproxy.sh — добавлен в v3.30.7), возвращает
+#    be_liberal→0 (его ставил только SYNPROXY; tcp_loose/syncookies держит
+#    90-shieldnode.conf), выгружает nf_synproxy. Идемпотентно.
 if true; then
     _sp_found=0
     nft list table inet shield_synproxy >/dev/null 2>&1 && { _sp_found=1; nft delete table inet shield_synproxy 2>/dev/null || true; }
-    for f in /etc/shieldnode/synproxy.nft /etc/sysctl.d/99-shieldnode-synproxy.conf /var/lib/shieldnode/.synproxy-degraded; do
+    for f in /etc/shieldnode/synproxy.nft /etc/sysctl.d/99-shieldnode-synproxy.conf /var/lib/shieldnode/.synproxy-degraded /usr/local/sbin/shieldnode-synproxy.sh; do
         [ -f "$f" ] && { _sp_found=1; rm -f "$f"; }
     done
     if systemctl list-unit-files shieldnode-synproxy.service 2>/dev/null | grep -q shieldnode-synproxy; then
