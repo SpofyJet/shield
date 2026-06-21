@@ -1,6 +1,20 @@
 #!/bin/bash
 
 # ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.30.8 — ctguard: убран глобальный flood-кап (P1)
+#
+#  Инцидент (P1, прод): после пуша Xray-конфигов реконнект-шторм 2500+ клиентов.
+#  Глобальный агрегатный new-conn flood-кап в ctguard ложно сработал на всплеске
+#  rate новых коннектов -> drop на все protected-порты ДО infra-accept -> рубил
+#  ЛЕГИТНЫЕ входы всех разом, нода не восстанавливалась (ретраи держали rate).
+#  Conntrack был 7-8% -- реальной exhaustion не было, чистый false-positive.
+#  FIX: путь глобального капа по флуду удалён -- флуд больше НЕ триггерит глобальный
+#  drop. Реальный флуд держат per-IP phantom-эвикт + ddos_protect (conn-flood/
+#  newconn/syn rate-limits). AGG_CAP (phantom-based) остаётся opt-in, default 0.
+#  Также: SHIELD_CTG_CSCLI default 1->0 -- phantom-эвикт больше не банит в CrowdSec
+#  автоматически (ложняк бил по shared/CGNAT-IP на 6ч). Включается вручную.
+#
+# ==============================================================================
 #  VPN NODE DDoS PROTECTION v3.30.7 — реапер добивает synproxy-бинарь + модуль
 #
 #  v3.30.6 реапер снимал table/synproxy.nft/99-sysctl/сервис/degraded-маркер, но НЕ
@@ -914,7 +928,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.30.7"
+SHIELDNODE_VERSION="3.30.8"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -4144,7 +4158,7 @@ DISTRIBUTED="${SHIELD_CTG_DISTRIBUTED:-1}"        # v3.27.0 FIX(#2): 2-й про
 ATTACK_MIN_TICKS="${SHIELD_CTG_ATTACK_MIN_TICKS:-2}" # v3.27.0 FIX(#9)/v3.27.1: порог аномалий В ОКНЕ для глоб. капа (PCT>=HIGH капает сразу)
 ANOM_WINDOW="${SHIELD_CTG_ANOM_WINDOW:-4}"        # v3.27.1 FIX(#1 pulsing): размер скользящего окна тиков (≥ATTACK_MIN_TICKS аномалий в окне → sustained)
 CAP_FLOOR="${SHIELD_CTG_CAP_FLOOR:-1000}"         # v3.27.0 FIX(#9): мин. значение глобального TCP-капа new-conn/с (не душить легит reconnect)
-CSCLI="${SHIELD_CTG_CSCLI:-1}"; CSCLI_TTL="${SHIELD_CTG_CSCLI_TTL:-6h}"
+CSCLI="${SHIELD_CTG_CSCLI:-0}"; CSCLI_TTL="${SHIELD_CTG_CSCLI_TTL:-6h}"
 ALPHA_NUM="${SHIELD_CTG_ALPHA_NUM:-5}"           # EWMA alpha = ALPHA_NUM/100
 TAG=shieldnode-ctguard
 RUN=/run/shieldnode; ST=/var/lib/shieldnode
@@ -4445,7 +4459,7 @@ if [ "$DISTRIBUTED" = "1" ] && [ "${FOUND_HOLDER:-0}" -eq 0 ] 2>/dev/null && [ "
     phantom_evict_distributed
 fi
 DO_CAP=0
-[ "$FLOOD" = "1" ] && [ "$SUSTAINED" = "1" ] && DO_CAP=1                          # настоящий new-conn/conntrack флуд (sustained) → кап
+# v3.30.8 (P1): глобальный flood-кап убран — флуд больше не даёт глобальный drop; держат per-IP phantom-эвикт + ddos_protect
 [ "$AGG_CAP" = "1" ] && [ "$PHANTOM_SIG" = "1" ] && [ "$SUSTAINED" = "1" ] && DO_CAP=1  # CDN/мост (opt-in): per-IP эвикт невозможен → кап
 ATTACK=0
 [ "$FLOOD" = "1" ] && [ "$SUSTAINED" = "1" ] && ATTACK=1
