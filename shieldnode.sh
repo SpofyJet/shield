@@ -1,6 +1,16 @@
 #!/bin/bash
 
 # ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.37.2 — FIX BBR stale (live-детект по ядру)
+#
+#  FIX (репорт: "при установке shield писало BBR v1", хотя XanMod = v3):
+#      stack.conf писался vpn-node-setup ДО ребута на XanMod (снапшот v1) и
+#      протухал. Теперь версия BBR детектится по ЖИВОМУ ядру (xanmod → v3,
+#      mainline >= 6.13 → v3), снапшот из stack.conf показывается рядом
+#      только для сравнения. Парный фикс: vpn-node-setup v5.10.2 при
+#      pending-reboot пишет в контракт целевое значение, а не текущее.
+#
+# ==============================================================================
 #  VPN NODE DDoS PROTECTION v3.37.1 — откат unattended-upgrades (конфликт с vpn-node-setup)
 #
 #  REMOVE ШАГ 12.18 (unattended-upgrades) — v3.36.0 ошибочно ВКЛЮЧАЛ его,
@@ -1082,7 +1092,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.37.1"
+SHIELDNODE_VERSION="3.37.2"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -2869,12 +2879,38 @@ if [ -f "$STACK_CONF" ]; then
     STACK_VPN_FLOWTABLE=$(stack_get "vpn-node-setup" "flowtable")
     STACK_VPN_BBR=$(stack_get "vpn-node-setup" "bbr")
 
+    # v3.37.2 (FIX-BBR-STALE): stack.conf — снапшот на момент --optimize.
+    # Если он писался ДО ребута на XanMod, bbr там застрял "v1" — а на живом
+    # ядре уже v3 (репорт). Версию BBR определяем по ТЕКУЩЕМУ ядру, снапшот
+    # показываем только для сравнения.
+    _bbr_live() {
+        local _kr _maj _min
+        _kr=$(uname -r)
+        if echo "$_kr" | grep -qi xanmod; then
+            echo "v3 (XanMod backport, live)"; return
+        fi
+        _maj=$(echo "$_kr" | cut -d. -f1); _min=$(echo "$_kr" | cut -d. -f2)
+        if [ "${_maj:-0}" -gt 6 ] 2>/dev/null || \
+           { [ "${_maj:-0}" -eq 6 ] && [ "${_min:-0}" -ge 13 ]; } 2>/dev/null; then
+            echo "v3 (mainline >= 6.13, live)"; return
+        fi
+        if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+            echo "v1 (mainline < 6.13, live)"; return
+        fi
+        echo "not available (live)"
+    }
+    STACK_VPN_BBR_LIVE=$(_bbr_live)
+
     print_ok "Stack contract найден (vpn-node-setup v${STACK_VPN_VERSION:-?})"
     echo -e "    ├─ MSS clamp:  ${GREEN}${STACK_VPN_MSS:-unknown}${NC}"
     echo -e "    ├─ IPv6:       ${GREEN}${STACK_VPN_IPV6:-unknown}${NC}"
     echo -e "    ├─ Interface:  ${GREEN}${STACK_VPN_IFACE:-unknown}${NC}"
     echo -e "    ├─ Flowtable:  ${GREEN}${STACK_VPN_FLOWTABLE:-unknown}${NC}"
-    echo -e "    └─ BBR:        ${GREEN}${STACK_VPN_BBR:-unknown}${NC}"
+    if [ -n "$STACK_VPN_BBR_LIVE" ] && [ "$STACK_VPN_BBR_LIVE" != "$STACK_VPN_BBR" ]; then
+        echo -e "    └─ BBR:        ${GREEN}${STACK_VPN_BBR_LIVE}${NC} ${CYAN}(снапшот stack.conf: ${STACK_VPN_BBR:-?})${NC}"
+    else
+        echo -e "    └─ BBR:        ${GREEN}${STACK_VPN_BBR_LIVE:-${STACK_VPN_BBR:-unknown}}${NC}"
+    fi
 
     # Проверка консистентности: если контракт говорит что vpn-node-setup
     # владеет MSS clamp — наша forward-цепочка НЕ должна существовать.
@@ -10002,6 +10038,7 @@ if [ "$DISK_USAGE" -ge 80 ]; then
     # 3. v3.23.8: пересжатие .gz архивов старше 14 дней в xz -6 (быстрее чем -9, ratio 95%)
     XZ_RECOMPRESSED=0
     if command -v xz >/dev/null 2>&1; then
+        # shellcheck disable=SC2044  # имена генерируются нами (даты), пробелов нет
         for gz_file in $(find /var/log/shieldnode -name "*.gz" -mtime +14 2>/dev/null); do
             xz_file="${gz_file%.gz}.xz"
             [ -f "$xz_file" ] && continue   # Уже пересжато
@@ -10092,6 +10129,7 @@ if [ "$DISK_USAGE" -ge 80 ]; then
         # Сжимаем директории старше 7 дней в tar.zst (если zstd есть)
         if command -v zstd >/dev/null 2>&1; then
             PCAP_COMPRESSED=0
+            # shellcheck disable=SC2044  # имена архивов генерируются нами, пробелов нет
             for archive_dir in $(find /var/lib/shieldnode/pcap-archive -mindepth 1 -maxdepth 1 -type d -mtime +7 2>/dev/null); do
                 tar_name="${archive_dir}.tar.zst"
                 [ -f "$tar_name" ] && continue
