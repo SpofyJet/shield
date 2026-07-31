@@ -15,6 +15,35 @@
 #      мёртв — закрывает WHITELIST DRIFT без ожидания следующего изменения
 #      файла) → верификация is-failed с выводом journalctl-подсказки.
 #
+#  VPN NODE DDoS PROTECTION v3.37.6 — FIX бесконечный цикл path-watcher'ов (ROOT CAUSE)
+#
+#  FIX BUG-PATH-LOOP (репорт: shieldnode-update@custom.path/.service и
+#      shieldnode-whitelist.path/.service падают с 'unit-start-limit-hit'
+#      через ~4 секунды после КАЖДОГО рестарта, 7 запусков сервиса за 1.5с):
+#      ROOT CAUSE — PathExists= в .path юнитах это LEVEL-триггер, а не edge:
+#      пока watch-файл существует (а он существует всегда), systemd перезапускает
+#      oneshot-сервис СРАЗУ после каждого его завершения — бесконечный цикл
+#      стартов, который пробивает лимит и убивает .path навсегда ("will not
+#      watch the paths anymore until restarted"). Умирало на каждом апгрейде
+#      с момента появления этих юнитов; тачи/reset-failed из v3.37.4-v3.37.5
+#      лишь запускали цикл заново. Чинено четырёхслойно:
+#      (a) PathExists= УБРАН из обоих .path (остаётся edge-триггер PathChanged=;
+#          boot-покрытие не страдает: custom применяется timer'ом OnBootSec=1min,
+#          whitelist — protected-ports-update OnBootSec=30s → start whitelist.service);
+#      (b) TriggerLimitIntervalSec=0 в [Path] — watcher бессмертен: лимит
+#          триггеров .path отключён (systemd 250+; на старших — warning-игнор),
+#          работа ограничена лимитами самого сервиса, которые самовосстанавливаются
+#          после StartLimitIntervalSec;
+#      (c) StartLimitBurst/IntervalSec продублированы в [Service] (systemd 254+
+#          честное место; [Unit]-копии оставлены для совместимости);
+#      (d) flock + hash-guard в обоих updater'ах: серия триггеров схлопывается
+#          в один запуск, повтор без изменения источников = мгновенный no-op
+#          (marker в /var/lib/shieldnode/.applied-*.sha256; если nft set пуст —
+#          применяем всегда).
+#      Плюс: Requires= → Wants= в template shieldnode-update@.service (в v3.37.4
+#      починили только whitelist.service — каскадный failed от nftables.service
+#      при апгрейде оставался).
+#
 #  VPN NODE DDoS PROTECTION v3.37.4 — FIX мёртвые path-watcher'ы
 #
 #  FIX BUG-PATH-DEAD (репорт: shieldnode-update@custom.path, shieldnode-whitelist.path
@@ -1138,7 +1167,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.37.5"
+SHIELDNODE_VERSION="3.37.6"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -5286,6 +5315,27 @@ if ! nft list table inet ddos_protect >/dev/null 2>&1; then
     exit 0
 fi
 
+# v3.37.6 (BUG-PATH-LOOP): сериализация + no-op guard.
+# PathExists в .path был level-триггером и гонял oneshot-сервис бесконечным
+# циклом (7 стартов за 1.5с) → start-limit-hit → watcher мёртв. PathExists
+# убран из юнитов; здесь — вторая линия защиты на случай легитимных burst'ов:
+# flock схлопывает серию одновременных триггеров в последовательные запуски,
+# а hash-guard для custom превращает повторный запуск без изменения файлов
+# в мгновенный no-op (marker пишется после успешного применения, см. конец).
+exec 9>"$STATE_DIR/.update-${NAME}.lock" 2>/dev/null || true
+flock -w 90 9 2>/dev/null || { logger -t "$LOG_TAG" "lock timeout 90s — выхожу (следующий триггер применит)"; exit 0; }
+
+CUR_HASH=""; HASH_MARKER="$STATE_DIR/.applied-${NAME}.sha256"
+if [ "$NAME" = "custom" ]; then
+    CUR_HASH=$( IFS=',' read -ra _LP <<< "$LOCAL_PATHS"; sha256sum "${_LP[@]}" 2>/dev/null | sha256sum | awk '{print $1}' )
+    if [ -n "$CUR_HASH" ] && [ -f "$HASH_MARKER" ] \
+       && [ "$(cat "$HASH_MARKER" 2>/dev/null)" = "$CUR_HASH" ] \
+       && nft list set inet ddos_protect "$NFT_SET" 2>/dev/null | grep -q 'elements'; then
+        # Источники не менялись с последнего успешного применения и set не пуст.
+        exit 0
+    fi
+fi
+
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -5612,6 +5662,10 @@ fi
 
 if [ "$V4_OK" = "1" ]; then
     logger -t "$LOG_TAG" "Updated $NFT_SET: $V4_COUNT IPv4 + $V6_APPLIED IPv6 подсетей (remote=$REMOTE_DOWNLOADED/$REMOTE_TRIED, local=$LOCAL_FOUND)"
+    # v3.37.6: фиксируем hash применённых источников (no-op guard в начале скрипта)
+    if [ "$NAME" = "custom" ] && [ -n "${CUR_HASH:-}" ]; then
+        echo "$CUR_HASH" > "${HASH_MARKER:-$STATE_DIR/.applied-custom.sha256}" 2>/dev/null || true
+    fi
     exit 0
 else
     exit 1
@@ -5850,7 +5904,10 @@ cat > /etc/systemd/system/shieldnode-update@.service <<EOF
 Description=Update shieldnode %i blocklist
 After=network-online.target shieldnode-nftables.service
 Wants=network-online.target
-Requires=shieldnode-nftables.service
+# v3.37.6: Wants вместо Requires — Requires каскадно клал updater в failed,
+# если nftables.service рестартовал в момент апгрейда (v3.37.4 починил это
+# только для whitelist.service, template остался с Requires).
+Wants=shieldnode-nftables.service
 # v3.16.1: при rapid edit файла path-watcher может триггерить service'ы
 # серией. Расширяем лимит запусков чтобы избежать unit-start-limit-hit.
 StartLimitBurst=30
@@ -5858,6 +5915,10 @@ StartLimitIntervalSec=60
 
 [Service]
 Type=oneshot
+# v3.37.6: дублируем лимиты в [Service] — на systemd 254+ это честное место
+# ([Unit]-копии выше оставлены для старших версий).
+StartLimitBurst=30
+StartLimitIntervalSec=60
 ExecStart=$SHIELD_UPDATER_SCRIPT %i
 # v3.18.11 SH-NEW-141: TimeoutStartSec=120s — если updater hangs (slow URL-feed
 # за РКН, hung curl), systemd убьёт его через 2 мин. Раньше FINAL TRIGGER
@@ -5907,9 +5968,18 @@ StartLimitBurst=30
 StartLimitIntervalSec=60
 
 [Path]
+# v3.37.6 (BUG-PATH-LOOP, ROOT CAUSE): PathExists= УБРАН — это level-триггер:
+# пока файл существует, systemd перезапускает oneshot-сервис сразу после каждого
+# завершения → бесконечный цикл стартов → start-limit-hit → .path мёртв навсегда.
+# Оставляем только edge-триггер PathChanged=. Boot-покрытие: custom.timer
+# (OnBootSec=1min) применяет список при загрузке.
 PathChanged=$SHIELD_LISTS_DIR/custom.txt
 PathChanged=$SHIELD_LISTS_DIR/custom-local.txt
-PathExists=$SHIELD_LISTS_DIR/custom.txt
+# v3.37.6: watcher бессмертен — отключаем trigger rate-limit .path юнита
+# (systemd 250+; на старших systemd директива игнорируется с warning, лимиты
+# сервиса выше остаются защитой). Легитимный burst правок файла больше не может
+# убить наблюдателя.
+TriggerLimitIntervalSec=0
 Unit=shieldnode-update@custom.service
 
 [Install]
@@ -6166,6 +6236,22 @@ while ! nft list table $NFT_TABLE >/dev/null 2>&1; do
     sleep 1
 done
 
+# v3.37.6 (BUG-PATH-LOOP): flock + hash-guard. PathExists в .path был
+# level-триггером → бесконечный цикл рестартов oneshot-сервиса → start-limit-hit
+# → мёртвый watcher. PathExists убран из юнита; здесь — вторая линия защиты:
+# серия триггеров схлопывается flock'ом, повтор без изменения источников = no-op.
+WL_STATE_DIR="/var/lib/shieldnode"
+mkdir -p "$WL_STATE_DIR" 2>/dev/null || true
+exec 9>"$WL_STATE_DIR/.whitelist.lock" 2>/dev/null || true
+flock -w 60 9 2>/dev/null || exit 0
+WL_HASH_MARKER="$WL_STATE_DIR/.applied-whitelist.sha256"
+WL_CUR_HASH=$( { cat "$WHITELIST_FILE" 2>/dev/null; cat "$MGMT_FILE" 2>/dev/null; } | sha256sum | awk '{print $1}' )
+if [ -f "$WL_HASH_MARKER" ] && [ "$(cat "$WL_HASH_MARKER" 2>/dev/null)" = "$WL_CUR_HASH" ] \
+   && nft list set $NFT_TABLE $NFT_SET 2>/dev/null | grep -q 'elements'; then
+    # Источники не менялись с последнего успешного применения и set не пуст.
+    exit 0
+fi
+
 # Парсим IPs из обоих источников (без комментариев, пустых строк, валидируем)
 IPS=$( { grep -vE '^[[:space:]]*(#|$)' "$WHITELIST_FILE" 2>/dev/null; \
          cat "$MGMT_FILE" 2>/dev/null; } | \
@@ -6202,6 +6288,9 @@ else
     logger -t "$LOG_TAG" "Whitelist empty — flushed $NFT_SET"
 fi
 
+# v3.37.6: фиксируем hash применённых источников (no-op guard в начале скрипта)
+echo "${WL_CUR_HASH:-}" > "${WL_HASH_MARKER:-/var/lib/shieldnode/.applied-whitelist.sha256}" 2>/dev/null || true
+
 exit 0
 WHITELIST_UPDATER_EOF
 chmod 0750 "$WHITELIST_UPDATER"
@@ -6220,6 +6309,9 @@ StartLimitIntervalSec=60
 
 [Service]
 Type=oneshot
+# v3.37.6: дублируем лимиты в [Service] (systemd 254+ честное место).
+StartLimitBurst=30
+StartLimitIntervalSec=60
 ExecStart=$WHITELIST_UPDATER
 EOF
 
@@ -6231,8 +6323,13 @@ StartLimitBurst=30
 StartLimitIntervalSec=60
 
 [Path]
+# v3.37.6 (BUG-PATH-LOOP, ROOT CAUSE): PathExists= УБРАН — level-триггер,
+# бесконечно перезапускал oneshot-сервис пока файл существует → start-limit-hit
+# → мёртвый watcher (см. changelog в шапке). Boot-покрытие: protected-ports-update
+# (OnBootSec=30s) стартует shieldnode-whitelist.service при загрузке.
 PathChanged=$WHITELIST_LOCAL
-PathExists=$WHITELIST_LOCAL
+# v3.37.6: watcher бессмертен — trigger rate-limit .path отключён (systemd 250+).
+TriggerLimitIntervalSec=0
 Unit=shieldnode-whitelist.service
 
 [Install]
