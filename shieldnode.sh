@@ -1,6 +1,20 @@
 #!/bin/bash
 
 # ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.37.5 — FINAL SELF-HEAL watcher'ов
+#
+#  FIX (репорт sweden2): после `guard upgrade` до v3.37.4 четыре юнита
+#      (shieldnode-update@custom.path/.service, shieldnode-whitelist.path/
+#      .service) оставались в failed — точечные fix-блоки v3.37.4 сидят в
+#      середине install-flow и не гарантируют финальное состояние (гонки с
+#      daemon-reload, github-sync trigger, start-limit counters).
+#  NEW ШАГ 12.19 FINAL SELF-HEAL: в самом конце install (перед HEALTHCHECK)
+#      безусловно: touch watch-файлов → daemon-reload → reset-failed всех 4
+#      юнитов → restart .path watcher'ов → ОДИН прогон .service (применяет
+#      накопившиеся изменения файлов, которые watcher пропустил пока был
+#      мёртв — закрывает WHITELIST DRIFT без ожидания следующего изменения
+#      файла) → верификация is-failed с выводом journalctl-подсказки.
+#
 #  VPN NODE DDoS PROTECTION v3.37.4 — FIX мёртвые path-watcher'ы
 #
 #  FIX BUG-PATH-DEAD (репорт: shieldnode-update@custom.path, shieldnode-whitelist.path
@@ -1124,7 +1138,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.37.4"
+SHIELDNODE_VERSION="3.37.5"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -11863,6 +11877,52 @@ if [ -f /etc/apt/apt.conf.d/51shieldnode-unattended ]; then
     fi
     systemctl disable --now unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
     print_info "unattended-upgrades: конфиг v3.36.0 откачен (фоновые apt отключены — как в vpn-node-setup)"
+fi
+
+# ==============================================================================
+# ШАГ 12.19: FINAL SELF-HEAL path-watcher'ов (v3.37.5)
+# ==============================================================================
+# Гарантия финального состояния: что бы ни случилось в середине install-flow
+# (гонки daemon-reload, github-sync trigger, start-limit counters, Ctrl-C
+# и повторный прогон) — здесь watcher'ы принудительно приводятся в рабочее
+# состояние. Идемпотентно, безопасно при любом повторном запуске.
+
+print_header "ШАГ 12.19: FINAL SELF-HEAL (path watchers)"
+
+# 1. Watch-файлы гарантированно существуют (inotify падает на missing path)
+touch "$SHIELD_LISTS_DIR/custom.txt" "$SHIELD_LISTS_DIR/custom-local.txt" 2>/dev/null
+touch "${WHITELIST_LOCAL:-$SHIELD_LISTS_DIR/whitelist-local.txt}" 2>/dev/null
+
+# 2. Сброс состояния + перезапуск watcher'ов
+systemctl daemon-reload 2>/dev/null || true
+systemctl reset-failed shieldnode-update@custom.path \
+                       shieldnode-update@custom.service \
+                       'shieldnode-update@*.service' \
+                       shieldnode-whitelist.path \
+                       shieldnode-whitelist.service 2>/dev/null || true
+systemctl enable --now shieldnode-update@custom.path >/dev/null 2>&1 || true
+systemctl enable --now shieldnode-whitelist.path >/dev/null 2>&1 || true
+
+# 3. Один принудительный прогон updater'ов: применяет изменения файлов,
+#    накопившиеся пока watcher был мёртв (иначе WHITELIST DRIFT / custom
+#    drift ждали бы следующего изменения файла — до 6ч).
+systemctl start shieldnode-update@custom.service >/dev/null 2>&1 || true
+systemctl start shieldnode-whitelist.service >/dev/null 2>&1 || true
+
+# 4. Верификация: watcher'ы должны быть active (waiting), без failed
+_HEAL_BAD=""
+for _u in shieldnode-update@custom.path shieldnode-whitelist.path; do
+    systemctl is-active --quiet "$_u" 2>/dev/null || _HEAL_BAD="$_HEAL_BAD $_u"
+done
+_HEAL_FAILED=$(systemctl list-units --failed --no-legend --no-pager --plain 2>/dev/null | \
+    awk '{print $1}' | sed 's/^●//' | grep -E '^shieldnode-(update@custom|whitelist)' || true)
+
+if [ -z "$_HEAL_BAD" ] && [ -z "$_HEAL_FAILED" ]; then
+    print_ok "Path watchers: active (custom + whitelist), failed-юнитов нет"
+else
+    [ -n "$_HEAL_BAD" ] && print_warn "Watchers не поднялись:$_HEAL_BAD"
+    [ -n "$_HEAL_FAILED" ] && print_warn "Всё ещё failed: $(echo $_HEAL_FAILED | tr '\n' ' ')"
+    print_info "  Диагностика: journalctl -u shieldnode-update@custom.service -u shieldnode-whitelist.service -n 20 --no-pager"
 fi
 
 # ==============================================================================
