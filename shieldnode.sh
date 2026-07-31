@@ -1,7 +1,23 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.37.3 — FIX v6-comma + endlessh NAMESPACE
+#  VPN NODE DDoS PROTECTION v3.37.4 — FIX мёртвые path-watcher'ы
+#
+#  FIX BUG-PATH-DEAD (репорт: shieldnode-update@custom.path, shieldnode-whitelist.path
+#      и shieldnode-whitelist.service в failed на ВСЕХ нодах):
+#      .path юнит падает при старте если watch-файл не существует (inotify на
+#      missing path), а .path/.service oneshot не имеют авто-восстановления —
+#      один transient fail = watcher мёртв навсегда (whitelist updates и custom
+#      blocklist по файлу переставали применяться до ручного reset-failed).
+#      Чинено трёхслойно:
+#      (a) touch ВСЕХ watch-файлов ДО enable path-юнитов (whitelist-local.txt
+#          раньше создавался только через guard-меню — на нодах без ручного
+#          whitelist его не было вовсе);
+#      (b) updater толерантен: missing file = пустой whitelist (exit 0, не 1),
+#          + wait-loop до 15с на nft table (ранний boot / рестарт nftables);
+#      (c) Requires= → Wants= (нет каскадного failed от nftables.service).
+#
+#  v3.37.3 — FIX v6-comma + endlessh NAMESPACE
 #
 #  FIX BUG-V6-COMMA (репорт: nft parse-check unexpected comma, ssh_newconn_v6):
 #      комментарий в unquoted heredoc содержал "$SHIELD_V6_RULES," — переменная
@@ -1108,7 +1124,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.37.3"
+SHIELDNODE_VERSION="3.37.4"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -6045,6 +6061,11 @@ done
 # StartLimit hit'ов. Сбрасываем перед перезапуском.
 systemctl reset-failed shieldnode-update@custom.path 2>/dev/null
 systemctl reset-failed 'shieldnode-update@*.service' 2>/dev/null
+# v3.37.4 (BUG-PATH-DEAD): .path юнит ПАДАЕТ при старте если watch-файл
+# не существует (inotify на missing path), а .path не имеет Restart= —
+# один transient fail = watcher мёртв навсегда (видно в systemctl --failed).
+# Гарантируем существование ВСЕХ watch-файлов ДО enable.
+touch "$SHIELD_LISTS_DIR/custom.txt" "$SHIELD_LISTS_DIR/custom-local.txt" 2>/dev/null
 systemctl daemon-reload
 systemctl enable --now shieldnode-update@custom.path >/dev/null 2>&1
 
@@ -6115,7 +6136,21 @@ NFT_TABLE="inet ddos_protect"
 NFT_SET="manual_whitelist_v4"
 LOG_TAG="shieldnode-whitelist"
 
-[ -r "$WHITELIST_FILE" ] || { logger -t "$LOG_TAG" "File missing: $WHITELIST_FILE"; exit 1; }
+# v3.37.4 (BUG-PATH-DEAD): missing file — НЕ ошибка (пустой whitelist легален),
+# exit 1 клал service в failed навсегда (oneshot без auto-restart).
+[ -r "$WHITELIST_FILE" ] || { logger -t "$LOG_TAG" "File missing: $WHITELIST_FILE — трактую как пустой whitelist"; : > /dev/null; }
+
+# v3.37.4: ждём nft table (ранний boot / гонка с shieldnode-nftables.service).
+# Раньше nft -f падал на missing table → service failed → StartLimit → мёртв.
+NFT_WAIT=0
+while ! nft list table $NFT_TABLE >/dev/null 2>&1; do
+    NFT_WAIT=$((NFT_WAIT+1))
+    if [ "$NFT_WAIT" -ge 15 ]; then
+        logger -t "$LOG_TAG" "WARN: table $NFT_TABLE не появилась за 15с — пропуск (retrigger при след. изменении файла)"
+        exit 0
+    fi
+    sleep 1
+done
 
 # Парсим IPs из обоих источников (без комментариев, пустых строк, валидируем)
 IPS=$( { grep -vE '^[[:space:]]*(#|$)' "$WHITELIST_FILE" 2>/dev/null; \
@@ -6162,7 +6197,10 @@ cat > /etc/systemd/system/shieldnode-whitelist.service <<EOF
 [Unit]
 Description=Update shieldnode whitelist (manual_whitelist_v4) from local file
 After=shieldnode-nftables.service
-Requires=shieldnode-nftables.service
+# v3.37.4: Wants вместо Requires — Requires каскадно клал whitelist.service
+# в failed если nftables.service в этот момент не active (table-wait теперь
+# внутри updater'а).
+Wants=shieldnode-nftables.service
 StartLimitBurst=30
 StartLimitIntervalSec=60
 
@@ -6188,6 +6226,29 @@ WantedBy=multi-user.target
 EOF
 
 # 5. Запуск + первая инициализация (с reset-failed для idempotency)
+# v3.37.4 (BUG-PATH-DEAD): whitelist-local.txt создавался только через guard
+# Whitelist-меню — на нодах без ручного whitelist файла НЕТ → .path падал на
+# inotify (missing path), updater exit 1, оба юнита в failed навсегда.
+touch "$WHITELIST_LOCAL" 2>/dev/null
+# v3.37.4 (self-heal drift): сидим TRUSTED_IPS из shieldnode.conf в
+# whitelist-local.txt — на нодах со старых версий trusted IP жил только в conf
+# и в файл никогда не попадал → audit "WHITELIST DRIFT". Апгрейд зашивает сам.
+if [ -r "$SHIELD_CONF_FILE" ]; then
+    _TI_SEED=$(grep -E '^TRUSTED_IPS=' "$SHIELD_CONF_FILE" 2>/dev/null | head -1 | sed -E 's/^TRUSTED_IPS="?([^"]*)"?.*/\1/')
+    if [ -n "$_TI_SEED" ]; then
+        _SEEDED=0
+        OLDIFS=$IFS; IFS=', '
+        for _ip in $_TI_SEED; do
+            echo "$_ip" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || continue
+            if ! grep -qxF "$_ip" "$WHITELIST_LOCAL" 2>/dev/null; then
+                echo "$_ip" >> "$WHITELIST_LOCAL"
+                _SEEDED=$((_SEEDED+1))
+            fi
+        done
+        IFS=$OLDIFS
+        [ "$_SEEDED" -gt 0 ] && print_ok "Self-heal: $_SEEDED TRUSTED_IPS из conf добавлены в whitelist-local.txt (drift закрыт)"
+    fi
+fi
 systemctl daemon-reload
 systemctl reset-failed shieldnode-whitelist.path 2>/dev/null
 systemctl reset-failed shieldnode-whitelist.service 2>/dev/null
