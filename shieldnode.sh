@@ -15,6 +15,17 @@
 #      мёртв — закрывает WHITELIST DRIFT без ожидания следующего изменения
 #      файла) → верификация is-failed с выводом journalctl-подсказки.
 #
+#  VPN NODE DDoS PROTECTION v3.37.7 — FIX вечный WHITELIST DRIFT после upgrade
+#
+#  FIX BUG-MARKER-STALE (репорт: после апгрейда до v3.37.6 watchers живы,
+#      failed=0, но audit всё ещё показывает WHITELIST DRIFT 213.165.55.166):
+#      ШАГ 12.19 делал "принудительный прогон" updater'ов, но hash-guard
+#      v3.37.6 превращал его в no-op, если marker от раннего apply совпадал
+#      с файлами — при том что середина установки могла флашить nft ПОСЛЕ
+#      того apply (bouncer pre-inst hook, recovery-рестарты nftables).
+#      Теперь ШАГ 12.19 сносит .applied-*.sha256 перед принудительным
+#      прогоном: финальный apply всегда полный → upgrade сходится сам.
+#
 #  VPN NODE DDoS PROTECTION v3.37.6 — FIX бесконечный цикл path-watcher'ов (ROOT CAUSE)
 #
 #  FIX BUG-PATH-LOOP (репорт: shieldnode-update@custom.path/.service и
@@ -1167,7 +1178,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.37.6"
+SHIELDNODE_VERSION="3.37.7"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -12003,6 +12014,12 @@ systemctl enable --now shieldnode-whitelist.path >/dev/null 2>&1 || true
 # 3. Один принудительный прогон updater'ов: применяет изменения файлов,
 #    накопившиеся пока watcher был мёртв (иначе WHITELIST DRIFT / custom
 #    drift ждали бы следующего изменения файла — до 6ч).
+# v3.37.7: перед прогоном сносим hash-marker'ы — финальный apply обязан быть
+# ПОЛНЫМ, а не no-op: середина установки могла флашить nft (bouncer pre-inst,
+# recovery-рестарты) ПОСЛЕ первого применения whitelist/custom, и marker от
+# него блокировал бы повторное применение → вечный WHITELIST DRIFT.
+rm -f "$SHIELD_STATE_DIR/.applied-custom.sha256" \
+      "$SHIELD_STATE_DIR/.applied-whitelist.sha256" 2>/dev/null || true
 systemctl start shieldnode-update@custom.service >/dev/null 2>&1 || true
 systemctl start shieldnode-whitelist.service >/dev/null 2>&1 || true
 
