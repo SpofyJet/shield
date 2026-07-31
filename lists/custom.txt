@@ -75,3 +75,46 @@
 190.145.240.13
 190.210.218.98
 194.44.70.31
+# === Дельта 2026-07-31: анализ 48k атакующих с 3 нод (events.db + journal, 30 дней) ===
+# Все записи верифицированы через WHOIS/ASN (ipinfo). RU residential ISP исключены
+# сознательно (могут быть обычные пользователи — их разгребает crowdsec динамически).
+# НЕ включены: Cloudflare WARP, ProtonVPN exits, Telegram/FB/MS preview — за ними юзеры.
+#
+# --- Research-сканеры (новые диапазоны, не покрытые текущим custom.txt) ---
+31.14.32.0/24          # Modat B.V. (vrrp.modat.io) — AS201401 NewVM, новый диапазон Modat
+91.231.89.0/24         # ONYPHE (probe.onyphe.net) — AS213412, 91 атакующий IP из подсети
+91.196.152.0/24        # ONYPHE — AS213412, 84 IP
+91.230.168.0/24        # ONYPHE — AS213412, 61 IP
+195.184.76.0/24        # ONYPHE — AS213412, 113 IP
+69.5.169.0/24          # Infrawatch monitoring — AS25369, 84 IP
+65.49.1.0/24           # Shadowserver (nonprofit) — опционально, 85 IP
+#
+# --- Госсканеры РФ (подтверждены: noc.gov.ru / НИИСИ РАН) ---
+212.192.158.0/24       # ФГУП ГРЧЦ — AS61280, 16 IP, abuse as@noc.gov.ru
+85.142.100.0/24        # НИИСИ РАН (Курчатовский институт) в Selectel — 8 IP, score 30k
+#
+# --- Hostile hosting /24 (подсеть арендована под сканирование) ---
+94.26.88.0/24          # MEVSPACE/Razinet (PL) — 5 IP, score 62.8k
+109.205.211.0/24       # MEVSPACE (PL) — 11 IP, score 28.2k
+194.180.48.0/24        # MEVSPACE/Neterra (PL) — 7 IP, score 4.3k
+130.12.180.0/24        # Omegatech/Virtualine (DE) — 6 IP, score 28.5k
+213.209.159.0/24       # Feo Prest (DE) — 5 IP, score 7.2k
+104.166.159.0/24       # Zenlayer (NL) — 7 IP, score 7.1k
+94.154.43.0/24         # Storm Industries (TR) — 42 IP, score 6.3k
+151.243.11.0/24        # abuseradar hosting (DE) — 12 IP, score 6k
+176.65.148.0/24        # Pfcloud UG (NL) — 20 IP, score 5.7k
+176.65.149.0/24        # Pfcloud UG (NL) — 15 IP, score 5.5k
+72.56.50.0/24          # AkhaliNet (NL) — 12 IP, score 5.3k
+51.83.10.0/24          # OVH VPS-ферма (FR) — 8 IP, score 4.8k
+77.90.185.0/24         # btcloud.ro / Limited Network (LT) — 9 IP, score 4.4k
+101.36.97.0/24         # UCloud HK (GB) — 5 IP, score 4.4k
+176.120.22.0/24        # Proton66 (RU, SPb хостинг — известный сканерный хостер) — 6 IP, score 17.9k
+#
+# --- Одиночные IP (только hosting-ASN, верифицированы) ---
+213.156.208.189        # Kraft-S (RU, Samara server network) — score 41.2k
+108.174.78.126         # Servercore (KZ) — score 25.4k
+46.254.20.68           # IHC.RU hosting (RU) — score 9.8k
+71.18.105.225          # Bytedance (GB) — score 9.2k
+199.103.25.2           # Bytedance (US) — score 8.6k
+79.127.141.31          # Datapacket/Datacamp (DE) — score 5.4k
+94.154.35.204          # Omegatech (NL) — score 13.1k
