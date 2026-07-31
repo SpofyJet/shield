@@ -1,6 +1,22 @@
 #!/bin/bash
 
 # ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.37.3 — FIX v6-comma + endlessh NAMESPACE
+#
+#  FIX BUG-V6-COMMA (репорт: nft parse-check unexpected comma, ssh_newconn_v6):
+#      комментарий в unquoted heredoc содержал "$SHIELD_V6_RULES," — переменная
+#      РАЗВОРАЧИВАЛАСЬ внутрь комментария (дублируя весь v6-блок правил), а
+#      литеральная запятая-пунктуация попадала в конец последнего правила →
+#      весь ruleset не применялся (на свежей ноде защита не вставала вовсе).
+#      Триггер: только при публичном IPv6. Экранировано (\$). Добавлен аудит
+#      всех комментариев с $VAR в unquoted heredoc'ах — других таких нет.
+#  FIX BUG-ENDLESSH-NAMESPACE (репорт: status=226/NAMESPACE): пакетный юнит
+#      Debian (PrivateDevices/ProtectHome/ProtectSystem = mount namespaces)
+#      падает на части VPS-ядер. Теперь shieldnode пишет СВОЙ юнит без
+#      namespace-опций (User=nobody + seccomp-харденинг) + reset-failed для
+#      нод, застрявших в "Start request repeated too quickly".
+#
+# ==============================================================================
 #  VPN NODE DDoS PROTECTION v3.37.2 — FIX BBR stale (live-детект по ядру)
 #
 #  FIX (репорт: "при установке shield писало BBR v1", хотя XanMod = v3):
@@ -1092,7 +1108,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.37.2"
+SHIELDNODE_VERSION="3.37.3"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -4212,9 +4228,12 @@ $SHIELD_LOG_TCP_INVALID
         tcp dport { $SSH_PORTS_NFT } ct state new add @ssh_connlimit_v4 { ip saddr ct count over $SHIELD_SSH_CT_LIMIT } counter name ssh_conn_flood_v4 drop
         tcp dport { $SSH_PORTS_NFT } ct state new add @ssh_newconn_rate_v4 { ip saddr limit rate over $SHIELD_SSH_NEWCONN_RATE burst $SHIELD_SSH_NEWCONN_BURST packets } counter name ssh_newconn_flood_v4 drop
         # Прошёл все blocklist'ы и оба лимита — пропускаем дальше к sshd.
-        # v3.30.1 FIX(F1): гейт ipv4 — иначе bare-accept матчил и v6-SSH ДО $SHIELD_V6_RULES,
+        # v3.30.1 FIX(F1): гейт ipv4 — иначе bare-accept матчил и v6-SSH ДО \$SHIELD_V6_RULES,
         # делая v6 ssh_connlimit/ssh_newconn мёртвыми. Теперь v6-SSH проваливается в свои
         # лимиты ниже (chain policy=accept → v6-SSH работает, но уже rate-limited).
+        # ВНИМАНИЕ (v3.37.3 BUG-V6-COMMA): имя переменной в комментарии heredoc'а
+        # ОБЯЗАТЕЛЬНО с бэкслешем (\$) — heredoc unquoted, без экрана переменная
+        # РАЗВОРАЧИВАЛАСЬ прямо в комментарий + хвостовая запятая ломала весь ruleset.
         meta nfproto ipv4 tcp dport { $SSH_PORTS_NFT } accept
 
         # === INFRASTRUCTURE BYPASS (v3.23.15 P0-2: перемещён сюда, ПОСЛЕ SSH) ===
@@ -11217,9 +11236,40 @@ ENDLESSH_EOF
         # Порт из переменной (подменяем дефолт 8022 из шаблона выше)
         sed -i "s/^Port .*/Port $SHIELD_TARPIT_PORT/" /etc/endlessh/config
 
+        # v3.37.3 (BUG-ENDLESSH-NAMESPACE, репорт: status=226/NAMESPACE):
+        # пакетный юнит Debian/Ubuntu содержит агрессивный sandbox
+        # (PrivateDevices/ProtectHome/ProtectSystem — это mount namespaces),
+        # который на части VPS-ядер падает при старте с 226/NAMESPACE.
+        # Пишем СВОЙ минимальный юнит БЕЗ namespace-опций (NoNewPrivileges и
+        # RestrictAddressFamilies — seccomp-based, namespaces не используют,
+        # безопасны на любых ядрах). /etc/systemd/system/*.service имеет
+        # приоритет над пакетным /lib/systemd/system/.
+        cat > /etc/systemd/system/endlessh.service <<'ENDLESSH_UNIT_EOF'
+[Unit]
+Description=Endlessh SSH Tarpit (shieldnode)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/endlessh -f /etc/endlessh/config
+Restart=always
+RestartSec=5
+# Порты >1024 — root не нужен. nobody есть в любом Debian/Ubuntu.
+User=nobody
+# seccomp-based харденинг (НЕ namespace — работает на всех VPS-ядрах):
+NoNewPrivileges=true
+RestrictAddressFamilies=AF_INET AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
+ENDLESSH_UNIT_EOF
+
         # endlessh НЕ должен быть на том же порту что SSH — ещё раз проверка
         # после всех валидаций (paranoia, но дёшево)
         if [ "$SHIELD_TARPIT_PORT" != "$SSH_PORT" ]; then
+            systemctl daemon-reload 2>/dev/null || true
+            # reset-failed: нода могла быть в "Start request repeated too quickly"
+            systemctl reset-failed endlessh.service >/dev/null 2>&1 || true
             systemctl enable --now endlessh.service >/dev/null 2>&1
             if systemctl is-active --quiet endlessh.service 2>/dev/null; then
                 print_ok "endlessh активен на порту $SHIELD_TARPIT_PORT (~1MB RAM, tarpit для сканеров)"
