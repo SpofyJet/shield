@@ -1057,3 +1057,39 @@
 23.162.56.0/24     # GLOBALTELEHOST (AS62563)
 79.124.49.0/24     # Tamatiya EOOD (AS50360)
 185.75.180.0/24
+146.88.240.0/24    # Arbor Networks Atlas (AS20052) n=4
+146.88.241.0/24    # Arbor Networks Atlas (AS20052) n=6
+195.230.103.0/24   # SecurityTrails/RecordedFuture (AS211607) n=6
+193.3.53.0/24      # SecurityTrails/RecordedFuture (AS211607) n=5
+91.224.92.0/24     # n=7
+141.98.9.0/24      # n=6
+185.169.4.0/24     # n=6
+45.135.193.0/24    # Pfcloud (AS51396) n=8
+45.135.194.0/24    # Pfcloud (AS51396) n=8
+45.194.92.0/24     # VPSVAULT.HOST (AS215925) n=7
+45.153.34.0/24     # TechTies Inc (AS197170) n=8
+185.241.208.0/24   # 1337 Services GmbH (AS210558) n=7
+193.26.115.0/24    # 1337 Services GmbH (AS210558) n=8
+64.89.161.0/24     # Ghosty Networks (AS205759) n=8
+95.214.53.0/24     # MEVSPACE (AS201814) n=7
+172.94.9.0/24      # Limited Network (AS213790) n=6
+178.16.55.0/24     # Omegatech (AS202412) n=6
+169.197.143.0/24   # GTHost (AS63023) n=6
+79.124.60.0/24     # Tamatiya EOOD (AS50360) n=8
+79.124.62.0/24     # DM AUTO EOOD (AS207812) n=6
+118.26.105.0/24    # UCLOUD HK (AS135377) n=6
+5.61.209.0/24      # Amarutu Technology (AS206264) n=8 — ВСЕ ноды
+217.60.195.0/24    # SWISSNET LLC (AS209373) n=8 — ВСЕ ноды
+178.20.210.0/24    # Shereverov M.A. (AS210006) n=8 — ВСЕ ноды
+64.89.162.0/24     # PIO-Hosting GmbH (AS198584) n=8 — ВСЕ ноды
+185.2.80.0/24      # WorldStream (AS49981) n=8 — ВСЕ ноды
+85.239.151.0/24    # Interserver (AS19318) n=8 — ВСЕ ноды
+80.94.92.0/24      # UNMANAGED LTD (AS47890) n=7
+92.118.39.0/24     # UNMANAGED LTD (AS47890) n=8 — ВСЕ ноды
+45.142.154.0/24    # HDTIDC LIMITED HK (AS136038) n=7
+160.119.71.0/24    # Alsycon B.V. (AS49870) n=7
+31.77.227.0/24     # BANATSYNC SRL (AS198364) n=6
+207.180.192.0/24   # Contabo (AS51167) n=6
+92.204.138.0/24    # GoDaddy hosting (AS398101) n=6
+193.24.211.0/24    # Data Campus Limited (AS215929) n=6
+185.200.116.0/24   # M247 (AS9009) n=5
