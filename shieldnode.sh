@@ -23,6 +23,51 @@
 # ==============================================================================
 #  VPN NODE DDoS PROTECTION v4.0.0-hotfix — REMOVE TARPIT + hot path fixes
 #
+#  FIX DOCKER-NAT-WIPE (репорт 2026-09-01: «после upgrade VPN-порты мертвы»):
+#      `ufw reload`/`ufw --force enable` на Ubuntu 24.04 применяет правила
+#      через iptables-restore с flush таблиц ip nat/ip filter → цепочки
+#      docker (DOCKER/DOCKER-USER/MASQUERADE) смываются, DNAT/MASQUERADE
+#      контейнеров умирают до ручного restart docker (moby#4737, firewalld#863 —
+#      известный конфликт docker↔ufw). Волна 1 (лечение): детект по маркерной
+#      chain DOCKER (не по наличию таблицы — частичный flush оставляет её с
+#      пустыми base-chains), автопочинка restart docker + verify во всех
+#      точках (install post-bouncer, smoke, final-healthcheck, guard-меню).
+#      Волна 2 (ПРЕДОТВРАЩЕНИЕ — flush не происходит вовсе):
+#      • ШАГ 2 forward-policy: `ufw reload` заменён на live `iptables -P
+#        FORWARD ACCEPT` (точечно, ничего не сбрасывает) + persist в
+#        /etc/default/ufw; reload — только fallback через safe-обёртку.
+#      • Избыточные `ufw reload` УБРАНЫ после ufw allow/delete (ШАГ 12.5 и
+#        guard TRUSTED_IPS add/del/re-apply): правила применяются live при
+#        активном ufw, reload был не нужен и только сносил docker-таблицы.
+#      • Пакет crowdsec-firewall-bouncer-nftables на apt-mark hold: его
+#        postinst делает flush ruleset на части дистрибутивов — теперь
+#        unattended-upgrade/apt-daily не может обновить его вне shieldnode
+#        upgrade (где есть полный набор восстановлений). Unhold в uninstall.
+#      • Постоянный watchdog в aggregator (тик 1 мин): chain ip nat/DOCKER
+#        пропала при активном docker → restart docker + verify + notify.
+#        Гейты: docker age ≥120с (не мешаем его старту), rate-limit
+#        restart ≤1/10мин, backend nft, daemon.json без "iptables":false.
+#      • Финальный sweep (полная проверка оставшегося): 17 embedded-скриптов
+#        извлечены и прогнаны bash -n (unquoted-heredoc'и — через
+#        материализацию), runtime smoke-тесты guard/aggregator/updaters/
+#        boot-repair на стабах — все rc=0. Найдено и исправлено:
+#        - /etc/modprobe.d/shieldnode-conntrack.conf не удалялся в uninstall
+#          (hashsize-override жил бы после удаления shieldnode);
+#        - uninstall/TRUSTED_IPS: ufw delete мог снести docker ip nat без
+#          восстановления;
+#        - хелперы shield_docker_nat_* были определены НИЖЕ блока
+#          --uninstall → вызовы из uninstall молча не срабатывали
+#          (command not found внутри if); блок перенесён выше UNINSTALL MODE.
+#      • Точная severity по факту урона (репорт «нода продолжила работать,
+#        люди сидят»): снос ip nat ломает только bridge-контейнеры (DNAT
+#        publish-портов + MASQUERADE egress). Типовой remnanode/Xray в
+#        network_mode: host ходит через стек хоста и НЕ затрагивается —
+#        поэтому SMOKE_FAIL/crit теперь только при наличии
+#        bridge-контейнеров (shield_docker_bridge_containers_exist), иначе
+#        WARN. Формулировки «VPN-порты мертвы» заменены точными.
+#      Неудача починки в smoke/final → SMOKE_FAIL=1 (маркер
+#      .install-in-progress остаётся → boot-repair, exit 2) — только когда
+#      есть bridge-контейнеры.
 #  REMOVE TARPIT (ШАГ 12.12 выпилен целиком): фича была мёртва с рождения —
 #      оба `nft add rule inet ddos_protect input ...` шли в НЕсуществующий
 #      chain (template создаёт только prerouting/overflow), stderr глушился,
@@ -1744,6 +1789,68 @@ SHIELD_REMNAWAVE_INTERVAL="${SHIELD_REMNAWAVE_INTERVAL:-5min}"
 #   MAXMIND_LICENSE_KEY (deprecated v3.15.0).
 # Эти переменные больше нигде не читаются. uninstall очищает legacy unit'ы.
 
+# v4.0.0-hotfix (репорт 2026-09-01, docker-nat-wipe): ufw reload/enable на
+# Ubuntu 24.04 применяет правила через iptables-restore с flush таблиц
+# ip nat/ip filter → цепочки docker (DOCKER/DOCKER-USER/MASQUERADE) смываются,
+# VPN-порты контейнеров мертвы до restart docker. При этом сама table ip nat
+# может ОСТАТЬСЯ (с пустыми base-chains) — проверка «таблица существует»
+# (ПРОПУСК-7) такой частичный flush НЕ ловила. Маркер здоровья = chain DOCKER
+# в ip nat (docker строит её на старте демона всегда, когда iptables=true).
+# Гейты: docker active + backend iptables-nft + в daemon.json НЕ "iptables": false
+# (там docker не управляет таблицами штатно — не WARN'им и не рестартуем зря).
+shield_docker_iptables_disabled(){
+    grep -q '"iptables"[[:space:]]*:[[:space:]]*false' /etc/docker/daemon.json 2>/dev/null
+}
+
+shield_docker_bridge_containers_exist(){
+    # Есть ли контейнеры НЕ на host-сети. Только им нужны docker ip nat/ip
+    # filter (DNAT publish-портов, MASQUERADE egress). Host-network контейнеры
+    # (типовой remnanode/Xray) клиентский трафик через docker NAT не гоняют —
+    # для них снос ip nat косметичен (репорт 2026-09-01: «нода продолжила
+    # работать, люди сидят» — именно поэтому).
+    command -v docker >/dev/null 2>&1 || return 1
+    # grep -v '^$': пустые строки (в т.ч. при нуле контейнеров) — не «bridge»
+    docker ps --format '{{.HostConfig.NetworkMode}}' 2>/dev/null | grep -v '^$' | grep -vqx 'host'
+}
+
+shield_docker_nat_broken(){
+    systemctl is-active --quiet docker 2>/dev/null || return 1
+    iptables --version 2>/dev/null | grep -q nf_tables || return 1
+    shield_docker_iptables_disabled && return 1
+    nft list chain ip nat DOCKER >/dev/null 2>&1 && return 1
+    return 0
+}
+
+shield_docker_nat_recover(){
+    # $1 = контекст (для лога). Возврат: 0 = здоровы/починили, 1 = не починили.
+    local ctx="${1:-unknown}"
+    logger -t shieldnode "WARN: docker active, но chain ip nat/DOCKER отсутствует ($ctx) — restart docker для пересоздания его таблиц"
+    print_warn "Docker: цепочки ip nat/DOCKER снесены ($ctx) — перезапускаю docker (пересоздаст ip nat/ip filter; краткий даунтайм контейнеров)"
+    systemctl restart docker 2>/dev/null || true
+    sleep 2
+    if nft list chain ip nat DOCKER >/dev/null 2>&1; then
+        print_ok "Docker: ip nat восстановлен после restart docker"
+        logger -t shieldnode "docker restarted — ip nat/DOCKER восстановлен ($ctx)"
+        return 0
+    fi
+    if shield_docker_bridge_containers_exist; then
+        print_error "Docker: ip nat НЕ появился после restart — DNAT/MASQUERADE bridge-контейнеров НЕ работает (их publish-порты и egress мертвы). Проверь: journalctl -u docker -n 30"
+    else
+        print_warn "Docker: ip nat НЕ появился после restart, но все контейнеры на host-сети — клиентский трафик (remnanode/Xray) НЕ затронут; bridge-сеть контейнеров недоступна. Проверь: journalctl -u docker -n 30"
+    fi
+    logger -t shieldnode "ERROR: ip nat/DOCKER отсутствует и после restart docker ($ctx)"
+    return 1
+}
+
+shield_ufw_reload_safe(){
+    # $1 = контекст. Каждый `ufw reload` на nft-backend'е может снести
+    # docker-цепочки (см. выше) → после reload проверяем и лечим.
+    ufw reload >/dev/null 2>&1 || true
+    if shield_docker_nat_broken; then
+        shield_docker_nat_recover "${1:-ufw reload}" || true
+    fi
+}
+
 # ==============================================================================
 # UNINSTALL MODE
 # ==============================================================================
@@ -1858,6 +1965,9 @@ if [ "${1:-}" = "--uninstall" ]; then
             rmdir "/etc/systemd/system/${_watched}.d" 2>/dev/null || true
         fi
     done
+    # v4.0.0-hotfix: снимаем hold с bouncer'а (ставился install'ом против
+    # внеочередного flush'а от postinst при unattended-upgrade)
+    apt-mark unhold crowdsec-firewall-bouncer-nftables >/dev/null 2>&1 || true
     # v3.12.0: убираем templated unit-файлы (если timer'ы создавались из шаблона)
     rm -f /etc/systemd/system/shieldnode-update@.service
     rm -f /etc/systemd/system/shieldnode-update@.timer
@@ -2032,6 +2142,11 @@ if [ "${1:-}" = "--uninstall" ]; then
             REMOVED_SYSCTL=1
         fi
     done
+    # v4.0.0-hotfix (финальный sweep): /etc/modprobe.d/shieldnode-conntrack.conf
+    # (nf_conntrack hashsize=max/4, применяется на boot) создавался install'ом,
+    # но в uninstall не удалялся — после удаления shieldnode он продолжал бы
+    # менять hashsize при каждой загрузке. Сирота закрыт.
+    rm -f /etc/modprobe.d/shieldnode-conntrack.conf
     if [ "$REMOVED_SYSCTL" = "1" ]; then
         # v3.18.9: sysctl --system НЕ сбрасывает значения которые писал ТОЛЬКО
         # удалённый файл — они "залипают" в памяти ядра до ребута. Явно сбрасываем
@@ -2207,6 +2322,12 @@ EOF
             ufw delete allow from "$_tip" >/dev/null 2>&1 || true
         done
         print_ok "UFW allow-правила для TRUSTED_IPS удалены"
+        # v4.0.0-hotfix (финальный sweep): ufw delete при активном ufw делает
+        # внутренний re-apply → может снести docker ip nat/ip filter. Нода
+        # после uninstall может продолжать работать с docker — лечим сразу.
+        if shield_docker_nat_broken; then
+            shield_docker_nat_recover "uninstall/TRUSTED_IPS" || true
+        fi
     fi
 
     # v4.0.0-hotfix (D8): DEFAULT_FORWARD_POLICY откат. Если docker активен —
@@ -2349,6 +2470,7 @@ shield_docker_present(){
     return 1
 }
 
+
 # v3.29.0: на Docker-хостах UFW-дефолт DEFAULT_FORWARD_POLICY="DROP" ломает egress
 # контейнеров (бот/панель/remnanode на bridge-сети). Хуже: shieldnode сам дёргает
 # `ufw reload` при раскатке TRUSTED_IPS → каждый reload заново применяет DROP →
@@ -2376,11 +2498,20 @@ shield_fix_ufw_forward_for_docker(){
     fi
     print_ok "Docker обнаружен → DEFAULT_FORWARD_POLICY=ACCEPT (egress контейнеров переживёт ufw reload/ребут; форвард фильтрует DOCKER-USER). Откат: SHIELD_UFW_FORWARD_ACCEPT=0"
     # применить немедленно, если ufw активен (иначе подхватится при следующем enable).
-    # v3.29.1: БЕЗ `systemctl restart docker` — reload с policy=ACCEPT уже чинит egress
-    # (MASQUERADE в nat-таблице reload не трогает, forward с ACCEPT пропускает). Рестарт
-    # docker бесполезно бил бы по remnanode/панели (моргание VPN/сервиса) на каждом апгрейде.
+    # v3.29.1: БЕЗ `systemctl restart docker` на каждом апгрейде (моргание VPN).
+    # v4.0.0-hotfix (репорт 2026-09-01): допущение «reload не трогает nat» было
+    # НЕВЕРНЫМ — ufw reload применяет правила через iptables-restore с flush
+    # таблиц ip nat/ip filter → цепочки docker смываются. Поэтому применяем
+    # БЕЗ reload вообще: live `iptables -P FORWARD ACCEPT` (точечная смена
+    # policy, ничего не сбрасывает) + persist в /etc/default/ufw выше.
+    # reload — только fallback если live-apply недоступен, и тогда через
+    # safe-обёртку (проверка chain ip nat/DOCKER + починка при сносе).
     if command -v ufw >/dev/null 2>&1 && LANG=C LC_ALL=C ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw reload >/dev/null 2>&1 || true
+        if iptables -P FORWARD ACCEPT 2>/dev/null; then
+            print_info "FORWARD policy=ACCEPT применён live (без ufw reload — docker-таблицы не тронуты)"
+        else
+            shield_ufw_reload_safe "ШАГ 2 forward-policy"
+        fi
     fi
 }
 
@@ -7792,6 +7923,14 @@ fi  # /SHIELDNODE_CROWDSEC_MANAGED guard for ШАГ 9
 
 print_header "ШАГ 10: NFTABLES BOUNCER"
 
+# v4.0.0-hotfix (репорт 2026-09-01): пакет bouncer'а ставим на apt-mark hold —
+# его postinst на части дистрибутивов делает flush ruleset → случайный
+# apt-daily/unattended-upgrade в 3 ночи сносил бы docker ip nat и наши
+# таблицы вне всякого upgrade-окна. Обновление bouncer'а теперь происходит
+# только внутри shieldnode upgrade (здесь, с unhold ниже + полным набором
+# восстановлений после). Снять вручную: apt-mark unhold crowdsec-firewall-bouncer-nftables
+apt-mark unhold crowdsec-firewall-bouncer-nftables >/dev/null 2>&1 || true
+
 if dpkg -l crowdsec-firewall-bouncer-nftables &>/dev/null; then
     print_info "Bouncer уже установлен"
 else
@@ -7988,27 +8127,26 @@ if ! nft list table inet ddos_protect >/dev/null 2>&1; then
     fi
 fi
 
-# v4.0.0-hotfix (находка T4-3, ПРОПУСК-7): flush ruleset от bouncer pre-inst/
-# postinst сносит не только ddos_protect/UFW/bouncer-таблицы (их мы выше
-# восстановили), но и docker'овские iptables-nft таблицы (ip nat / ip filter).
-# Docker пересоздаёт их ТОЛЬКО на (re)start'е демона → без restart docker
-# DNAT/MASQUERADE мертвы, VPN-порты контейнеров недоступны до ручного вмешательства.
-# Гейт на iptables-backend=nf_tables: на iptables-legacy хостах table ip nat
-# в nft не существует штатно — не дёргаем docker зря (restart = даунтайм VPN).
-if systemctl is-active --quiet docker 2>/dev/null && \
-   iptables --version 2>/dev/null | grep -q nf_tables && \
-   ! nft list table ip nat 2>/dev/null | grep -q .; then
-    logger -t shieldnode "WARN: docker active, но table ip nat отсутствует (flush ruleset?) — restart docker для пересоздания его таблиц"
-    print_warn "Docker активен, но table ip nat отсутствует (ruleset был flushed) — перезапускаю docker (пересоздаст ip nat/ip filter; краткий даунтайм контейнеров)"
-    systemctl restart docker 2>/dev/null || true
-    sleep 2
-    if nft list table ip nat >/dev/null 2>&1; then
-        print_ok "Docker: table ip nat восстановлена после restart docker"
-        logger -t shieldnode "docker restarted — table ip nat восстановлена"
-    else
-        print_error "Docker: table ip nat НЕ появилась после restart — VPN-порты контейнеров мертвы. Проверь: journalctl -u docker -n 30"
-        logger -t shieldnode "ERROR: table ip nat отсутствует и после restart docker"
-    fi
+# v4.0.0-hotfix (находка T4-3, ПРОПУСК-7; усилено по репорту 2026-09-01):
+# flush со стороны (bouncer pre-inst/postinst, ufw reload/enable) сносит не
+# только ddos_protect/UFW/bouncer-таблицы (их мы выше восстановили), но и
+# docker'овские iptables-nft цепочки (ip nat / ip filter). Docker пересоздаёт
+# их ТОЛЬКО на (re)start'е демона → без restart docker DNAT/MASQUERADE мертвы,
+# VPN-порты контейнеров недоступны до ручного вмешательства.
+# Детект по chain DOCKER (не по наличию таблицы): ufw reload оставляет
+# table ip nat с пустыми base-chains — старая проверка это пропускала.
+# Гейты (в хелпере): docker active + iptables-backend=nf_tables +
+# daemon.json без "iptables": false — не дёргаем docker зря.
+if shield_docker_nat_broken; then
+    shield_docker_nat_recover "install/post-bouncer" || true
+fi
+
+# v4.0.0-hotfix (репорт 2026-09-01): после того как ВСЕ восстановления
+# отработали — возвращаем hold (см. unhold перед установкой выше): пакет не
+# обновляется вне shieldnode upgrade → его postinst не сможет снести
+# правила в случайный момент. Hold переживает reboot (dpkg selections).
+if dpkg -l crowdsec-firewall-bouncer-nftables 2>/dev/null | grep -qE "^ii"; then
+    apt-mark hold crowdsec-firewall-bouncer-nftables >/dev/null 2>&1 || true
 fi
 
 # ============================================================================
@@ -8583,6 +8721,61 @@ _agg_limit() {
 }
 AGG_CT_LIMIT=$(_agg_limit SHIELD_CT_CONN_FLOOD 15000)
 AGG_NEWCONN_RATE=$(_agg_limit SHIELD_RATE_NEWCONN "40000/minute")
+
+# v4.0.0-hotfix (репорт 2026-09-01): постоянный watchdog за docker ip nat.
+# Стоит ДО проверки events.db: самовосстановление VPN-портов важнее парсинга
+# журнала (если events.db удалён/повреждён, watchdog всё равно работает).
+# Вне upgrade-окна цепочки docker (ip nat/ip filter) может смыть любой
+# внешний актор: ручной `ufw reload` оператора, postinst при apt-апдейте
+# bouncer'а, и т.п. → VPN-порты контейнеров мертвы до ручного restart docker.
+# Тик раз в минуту: если маркерная chain ip nat/DOCKER пропала при активном
+# docker — restart docker + verify + notify. Гейты: backend iptables-nft,
+# daemon.json без "iptables": false, docker активен ≥120с (не мешаем его
+# собственному старту), restart не чаще раза в 10 минут (rate-limit от
+# флапа; повторный снос починится следующим окном).
+if systemctl is-active --quiet docker 2>/dev/null \
+   && iptables --version 2>/dev/null | grep -q nf_tables \
+   && ! grep -q '"iptables"[[:space:]]*:[[:space:]]*false' /etc/docker/daemon.json 2>/dev/null \
+   && ! nft list chain ip nat DOCKER >/dev/null 2>&1; then
+    DOCKER_ACTIVE_US=$(systemctl show docker -p ActiveEnterTimestampMonotonic --value 2>/dev/null || echo 0)
+    UPTIME_S=$(cut -d' ' -f1 /proc/uptime 2>/dev/null || echo 0)
+    # sanitize: нечисловые значения (сбой systemctl show / proc) → 0, иначе
+    # arithmetic error спамил бы в journal каждый тик
+    [[ "${DOCKER_ACTIVE_US:-0}" =~ ^[0-9]+$ ]] || DOCKER_ACTIVE_US=0
+    [[ "${UPTIME_S:-0}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || UPTIME_S=0
+    DOCKER_AGE_S=$(( ${UPTIME_S%.*} - DOCKER_ACTIVE_US / 1000000 ))
+    if [ "$DOCKER_AGE_S" -ge 120 ]; then
+        NAT_STAMP=/var/lib/shieldnode/.docker-nat-recover.last
+        NOW_S=$(date +%s); LAST_S=$(cat "$NAT_STAMP" 2>/dev/null || echo 0)
+        [[ "${LAST_S:-0}" =~ ^[0-9]+$ ]] || LAST_S=0
+        if [ $(( NOW_S - LAST_S )) -ge 600 ]; then
+            echo "$NOW_S" > "$NAT_STAMP" 2>/dev/null || true
+            logger -t "$LOG_TAG" "WARN: docker active, но chain ip nat/DOCKER отсутствует (внешний flush: ufw reload / bouncer postinst?) — restart docker"
+            systemctl restart docker 2>/dev/null || true
+            sleep 2
+            if nft list chain ip nat DOCKER >/dev/null 2>&1; then
+                logger -t "$LOG_TAG" "docker ip nat восстановлен после restart (watchdog)"
+                /usr/local/sbin/shieldnode-notify.sh warn "docker-nat-wipe" \
+                    "Docker ip nat/DOCKER был снесён внешним актором (ufw reload? apt upgrade bouncer?) — watchdog восстановил restart'ом docker. Был краткий даунтайм контейнеров." \
+                    2>/dev/null || true
+            else
+                logger -t "$LOG_TAG" "ERROR: docker ip nat НЕ восстановлен после restart (watchdog)"
+                # Severity по факту урона: bridge-контейнеры есть → мертвы их
+                # publish-порты/egress (crit). Все на host-сети (типовой
+                # remnanode) — клиентский VPN-трафик не затронут (warn).
+                if docker ps --format '{{.HostConfig.NetworkMode}}' 2>/dev/null | grep -v '^$' | grep -vqx 'host'; then
+                    /usr/local/sbin/shieldnode-notify.sh crit "docker-nat-dead" \
+                        "DNAT/MASQUERADE bridge-контейнеров МЕРТВ: docker ip nat отсутствует и не восстановился после restart. Смотри: journalctl -u docker -n 50" \
+                        2>/dev/null || true
+                else
+                    /usr/local/sbin/shieldnode-notify.sh warn "docker-nat-dead-hostnet" \
+                        "docker ip nat не восстановился после restart, но все контейнеры на host-сети — клиентский трафик не затронут. Разберись: journalctl -u docker -n 50" \
+                        2>/dev/null || true
+                fi
+            fi
+        fi
+    fi
+fi
 
 # Если БД нет — выходим
 [ -r "$DB" ] || { logger -t "$LOG_TAG" "DB not found: $DB"; exit 0; }
@@ -9926,6 +10119,33 @@ else
     W=''; B=''; N=''; DIM=''
 fi
 
+# v4.0.0-hotfix (репорт 2026-09-01, docker-nat-wipe): `ufw reload` из меню
+# (TRUSTED_IPS add/del) применяет правила через iptables-restore с flush
+# таблиц ip nat/ip filter → сносит цепочки docker, VPN-порты контейнеров
+# мертвы до restart docker. Проверяем маркер chain ip nat/DOCKER и лечим.
+# Гейты: docker active + backend nft + в daemon.json НЕ "iptables": false.
+_guard_docker_nat_recover() {
+    systemctl is-active --quiet docker 2>/dev/null || return 0
+    iptables --version 2>/dev/null | grep -q nf_tables || return 0
+    grep -q '"iptables"[[:space:]]*:[[:space:]]*false' /etc/docker/daemon.json 2>/dev/null && return 0
+    nft list chain ip nat DOCKER >/dev/null 2>&1 && return 0
+    echo -e "  ${Y}⚠ ufw reload смыл docker ip nat — перезапускаю docker (краткий даунтайм контейнеров)${N}"
+    logger -t shieldnode "WARN: guard: ufw reload смыл docker ip nat — restart docker"
+    systemctl restart docker 2>/dev/null || true
+    sleep 2
+    if nft list chain ip nat DOCKER >/dev/null 2>&1; then
+        echo -e "  ${G}✓${N} Docker ip nat восстановлен"
+        logger -t shieldnode "guard: docker restarted — ip nat восстановлен"
+    else
+        if docker ps --format '{{.HostConfig.NetworkMode}}' 2>/dev/null | grep -v '^$' | grep -vqx 'host'; then
+            echo -e "  ${R}✗ Docker ip nat НЕ восстановлен — мертвы publish-порты/egress bridge-контейнеров! Смотри: journalctl -u docker -n 30${N}"
+        else
+            echo -e "  ${Y}⚠ Docker ip nat НЕ восстановлен, но все контейнеры на host-сети — клиенты не затронуты. journalctl -u docker -n 30${N}"
+        fi
+        logger -t shieldnode "ERROR: guard: ip nat/DOCKER отсутствует и после restart docker"
+    fi
+}
+
 CS_DB="/var/lib/crowdsec/data/crowdsec.db"
 
 # v4.0.0 (G6 UX-audit): лимиты для UI-текстов читаем из limits.conf, а не
@@ -10781,7 +11001,9 @@ show_settings_menu() {
                             echo -e "    ${G}✓${N} shieldnode whitelist (nft synced)"
                             if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
                                 ufw allow from "$NEW_IP" comment "Trusted (TRUSTED_IPS)" >/dev/null 2>&1 || true
-                                ufw reload >/dev/null 2>&1 || true
+                                # v4.0.0-hotfix: ufw reload УБРАН — allow/delete применяются
+                                # live, а reload с flush таблиц сносил docker ip nat.
+                                _guard_docker_nat_recover
                                 echo -e "    ${G}✓${N} UFW allow"
                             fi
                             if command -v cscli >/dev/null 2>&1; then
@@ -10842,7 +11064,9 @@ show_settings_menu() {
                                     [ -z "$rule_num" ] && break
                                     yes | ufw delete "$rule_num" >/dev/null 2>&1 || break
                                 done
-                                ufw reload >/dev/null 2>&1 || true
+                                # v4.0.0-hotfix: ufw reload УБРАН (flush docker ip nat);
+                                # delete применяется live. Проверка на случай сноса — ниже.
+                                _guard_docker_nat_recover
                                 echo -e "    ${G}✓${N} UFW rule removed"
                             fi
                             # CrowdSec
@@ -10900,7 +11124,9 @@ show_settings_menu() {
                                 fi
                                 echo -e "    ${G}✓${N} $ip"
                             done
-                            command -v ufw >/dev/null 2>&1 && ufw reload >/dev/null 2>&1 || true
+                            # v4.0.0-hotfix: ufw reload УБРАН (flush docker ip nat);
+                            # allow/delete применяются live. Проверка на случай сноса:
+                            _guard_docker_nat_recover
                             # v3.37.0 (BUG-WL-DRIFT): sync file → nft после re-apply
                             systemctl start shieldnode-whitelist.service >/dev/null 2>&1 || \
                                 /usr/local/sbin/shieldnode-whitelist-updater.sh >/dev/null 2>&1 || true
@@ -11217,9 +11443,13 @@ if [ -n "${TRUSTED_IPS:-}" ]; then
         [ -z "$ip" ] && continue
         apply_trusted_ip "$ip"
     done
-    # UFW reload один раз в конце (а не на каждый IP)
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw reload >/dev/null 2>&1 || true
+    # v4.0.0-hotfix (репорт 2026-09-01): `ufw reload` УБРАН — ufw allow/delete
+    # применяются live при активном ufw, отдельный reload избыточен, а его
+    # iptables-restore с flush таблиц сносил docker ip nat/ip filter. Вместо
+    # reload — разовая проверка маркера chain DOCKER (на случай если внутренний
+    # re-apply ufw всё же смыл цепочки) + починка при сносе.
+    if shield_docker_nat_broken; then
+        shield_docker_nat_recover "ШАГ 12.5 TRUSTED_IPS" || true
     fi
     # v3.23.1: postoverflow whitelist одним файлом (parser-level)
     generate_trusted_postoverflow
@@ -12769,26 +12999,24 @@ if ! nft list table inet ddos_protect >/dev/null 2>&1; then
     sleep 2
 fi
 
-# v4.0.0-hotfix (находка T4-3, ПРОПУСК-7): если ruleset флашили в процессе
-# установки (bouncer pre-inst/postinst, ufw disable/enable выше), то свои
-# таблицы (ddos_protect/UFW/bouncer) мы восстановили, а docker'овские
-# iptables-nft таблицы (ip nat / ip filter) никто не пересоздал — docker
-# делает это только на (re)start'е. Без restart docker DNAT/MASQUERADE мертвы
-# → VPN-порты контейнеров недоступны. Гейт iptables-backend=nf_tables чтобы
-# не рестартовать docker зря на iptables-legacy хостах (даунтайм VPN).
-if systemctl is-active --quiet docker 2>/dev/null && \
-   iptables --version 2>/dev/null | grep -q nf_tables && \
-   ! nft list table ip nat 2>/dev/null | grep -q .; then
-    logger -t shieldnode "WARN: docker active, но table ip nat отсутствует (flush ruleset в процессе install?) — restart docker"
-    print_warn "Docker активен, но table ip nat отсутствует (ruleset был flushed) — перезапускаю docker (пересоздаст ip nat/ip filter; краткий даунтайм контейнеров)"
-    systemctl restart docker 2>/dev/null || true
-    sleep 2
-    if nft list table ip nat >/dev/null 2>&1; then
-        print_ok "Docker: table ip nat восстановлена после restart docker"
-        logger -t shieldnode "docker restarted — table ip nat восстановлена"
-    else
-        print_error "Docker: table ip nat НЕ появилась после restart — VPN-порты контейнеров мертвы. Проверь: journalctl -u docker -n 30"
-        logger -t shieldnode "ERROR: table ip nat отсутствует и после restart docker"
+# v4.0.0-hotfix (находка T4-3, ПРОПУСК-7; усилено по репорту 2026-09-01):
+# если правила docker флашили в процессе установки (bouncer pre-inst/postinst,
+# ufw reload/enable выше), свои таблицы (ddos_protect/UFW/bouncer) мы
+# восстановили, а docker'овские цепочки (ip nat / ip filter) никто не
+# пересоздал — docker делает это только на (re)start'е. Детект по chain
+# DOCKER (таблица может остаться пустой — старый чек по таблице это
+# пропускал). Не починили → SMOKE_FAIL: VPN-порты мертвы, это failed-install
+# (маркер .install-in-progress останется → boot-repair, exit 2).
+if shield_docker_nat_broken; then
+    if ! shield_docker_nat_recover "smoke"; then
+        # Фейлим smoke только если есть bridge-контейнеры (им нужен docker NAT).
+        # Типовая нода: remnanode network_mode: host — клиентский трафик через
+        # docker NAT не идёт, отсутствие ip nat для неё косметично → WARN.
+        if shield_docker_bridge_containers_exist; then
+            SMOKE_FAIL=1
+        else
+            print_info "smoke: ip nat не восстановлен, но bridge-контейнеров нет (все host-network) — не фейлим"
+        fi
     fi
 fi
 
@@ -13113,18 +13341,24 @@ if shield_docker_present; then
     else
         print_info "Docker есть; FORWARD policy не определил (iptables-legacy?) — проверь egress контейнера вручную"
     fi
-    # v4.0.0-hotfix (находка T4-3, ПРОПУСК-7): docker active, но его таблица
-    # ip nat (iptables-nft) отсутствует — значит ruleset флашили ПОСЛЕ старта
-    # docker (bouncer pre-inst/postinst и т.п.) и docker свои цепочки не
-    # пересоздал → DNAT/MASQUERADE мертвы, VPN-порты контейнеров недоступны.
-    # Раньше здесь было только нейтральное info — теперь явный WARN.
-    # Гейт iptables-backend=nf_tables: на legacy-хостах table ip nat в nft
-    # не существует штатно (не WARN'им).
-    if systemctl is-active --quiet docker 2>/dev/null && \
-       iptables --version 2>/dev/null | grep -q nf_tables && \
-       ! nft list table ip nat 2>/dev/null | grep -q .; then
-        print_warn "Docker active, но table ip nat отсутствует (ruleset был flushed после старта docker?) — DNAT/MASQUERADE контейнеров НЕ работает, VPN-порты мертвы"
-        print_info "Фикс: sudo systemctl restart docker (пересоздаст ip nat/ip filter; кратковременный даунтайм контейнеров)"
+    # v4.0.0-hotfix (находка T4-3, ПРОПУСК-7; усилено по репорту 2026-09-01):
+    # docker active, но его цепочки ip nat/DOCKER снесены ПОСЛЕ старта docker
+    # (bouncer pre-inst/postinst, ufw reload и т.п.) → DNAT/MASQUERADE мертвы,
+    # VPN-порты контейнеров недоступны. РЕПОРТ 2026-09-01: здесь был только
+    # WARN без автопочинки — upgrade заканчивался с мёртвыми VPN-портами и
+    # требовал ручного restart docker. Теперь лечим сразу; неудача =
+    # SMOKE_FAIL (маркер .install-in-progress останется → boot-repair, exit 2).
+    # Детект по chain DOCKER — частичный flush (ufw reload) оставляет пустую
+    # table ip nat, старый чек по наличию таблицы это пропускал.
+    if shield_docker_nat_broken; then
+        if ! shield_docker_nat_recover "final-healthcheck"; then
+            # Как в smoke: SMOKE_FAIL только при наличии bridge-контейнеров.
+            if shield_docker_bridge_containers_exist; then
+                SMOKE_FAIL=1
+            else
+                print_info "healthcheck: ip nat не восстановлен, но bridge-контейнеров нет (все host-network) — не фейлим"
+            fi
+        fi
     fi
 fi
 
