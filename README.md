@@ -1,52 +1,79 @@
-# shield — защита VPN-ноды от сканеров и DDoS (shieldnode)
+# 🛡️ shieldnode
 
-**v3.37.7** · Debian 12/13 · Ubuntu 24.04+
+Комплексная DDoS-защита VPN-нод **Remnawave / Xray** (Ubuntu 24.04+, XanMod).
+Один скрипт: nftables-фильтрация на prerouting, CrowdSec + firewall-bouncer,
+динамические blocklist-фиды, автовосстановление после инцидентов и TUI-панель `guard`.
 
-nftables + CrowdSec: отсекает сканеров, брутфорс и флуд до того, как они
-дойдут до Xray. Управление — через интерактивный `guard`.
+![version](https://img.shields.io/badge/version-v4.0.0-blue)
+![platform](https://img.shields.io/badge/platform-Ubuntu%2024.04%2B-orange)
+![shell](https://img.shields.io/badge/lang-bash-lightgrey)
 
-## Быстрый старт
+## Установка — одна команда
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SpofyJet/shield/main/shieldnode.sh -o shieldnode.sh
-sudo bash shieldnode.sh
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/SpofyJet/shield/main/shieldnode.sh)
 ```
 
-После установки:
+Пиннинг на конкретный релиз:
 
 ```bash
-sudo guard          # дашборд: угрозы, дропы, whitelist, сервисы
-sudo guard --json   # то же в JSON (для мониторинга)
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/SpofyJet/shield/v4.0.0/shieldnode.sh)
+```
+
+Зеркало для РФ-нод (DPI может резать raw.githubusercontent.com):
+
+```bash
+SHIELD_FEED_MIRROR=https://your.mirror/ sudo bash <(curl -fsSL https://raw.githubusercontent.com/SpofyJet/shield/main/shieldnode.sh)
 ```
 
 ## Что внутри
 
-| Компонент | Роль |
+- **nftables** `inet ddos_protect`: prerouting priority **-150** (раньше docker dstnat),
+  атомарная загрузка `nft -f`, named counters, динамические set'ы с timeout
+- **Rate-limit**: syn/udp/icmp-метры, drop `ct state invalid`, connlimit
+- **CrowdSec + firewall-bouncer** (priority -200): поведенческие сценарии поверх сетевых метров
+- **Blocklist-фиды**: Spamhaus DROP/EDROP, Firehol, Tor exit, анти-сканер листы;
+  авто-зеркало для РФ (`SHIELD_FEED_MIRROR`)
+- **Whitelist** с timer-реапплаем (OnBootSec=45s) и hash-guard v2
+- **Conntrack**: tier-aware тюнинг `nf_conntrack_max`/hashsize по RAM ноды
+- **Живучесть**: boot-repair юнит, snapshot + атомарный rollback, notify-алерты,
+  watchdog за CrowdSec/bouncer/портами
+- **guard** — TUI-панель: `[1]` Баны CrowdSec `[2]` Whitelist `[3]` Разбанить всех
+  `[s]` Настройки `[r]` Обновить `[0]` Выход
+- **Self-upgrade** с проверкой `bash -n` + маркера версии скачанного
+
+## Управление
+
+| Команда | Действие |
 |---|---|
-| **nftables ddos_protect** | rate-limits (syn/udp/newconn), conn-flood per-IP, dynamic sets с timeout |
-| **CrowdSec + bouncer** | сценарии комьюнити + собственные (VPN-специфика), решения о банах |
-| **Блоклисты** | Spamhaus DROP, FireHOL L1, scanner/threat/tor/custom — обновление по таймерам |
-| **Whitelist single-writer** | один писатель `manual_whitelist_v4` (file ∪ mgmt) — нет race |
-| **Tarpit (endlessh)** | SSH-сканеры висят бесконечно |
-| **Auto-promote** | повторные нарушители → постоянный бан в custom blocklist |
-| **Rollback (node-rollback)** | snapshot перед изменениями, восстановление в 1 команду |
-| **API (unix-socket)** | `guard --json` по HTTP, socket-activated (0 в idle) |
-| **Metrics / notify** | node_exporter textfile + Telegram-уведомления (отключаемые) |
-| **Fleet-sync** | авто-whitelist нод Remnawave-флота |
-| **chrony NTS** | шифрованное время (анти-подделка NTP) |
-| **earlyoom** | OOM не тронет xray/sshd/crowdsec |
+| `shieldnode --status` | сводка защиты (также `--json`) |
+| `guard` | интерактивная TUI-панель |
+| `guard --once` | одноразовый снапшот дашборда |
+| `shieldnode --help` | полный список команд |
+| `shieldnode uninstall` | полное удаление (откат всех артефактов) |
 
-## Управление trusted IP
+## Требования
 
-`sudo guard` → **Trusted IPs** — полный whitelist в 1 действие
-(nft + UFW + CrowdSec decision + postoverflow). Изменения применяются
-мгновенно (явный sync, не path-watcher).
+- Ubuntu 24.04+ (x86_64), root
+- Ядро XanMod — рекомендуется (ставится [vpn-node-setup](https://github.com/SpofyJet/node))
+- Remnawave panel + remnanode/Xray в Docker
 
-## Удаление
+## Changelog v4.0.0
 
-```bash
-sudo bash shieldnode.sh --uninstall
-```
+Полный аудит (39 находок) + S-оптимизации. Ключевое:
 
-Changelog — в шапке `shieldnode.sh` (newest-first).
-Парный проект: [SpofyJet/node](https://github.com/SpofyJet/node) — оптимизация ноды.
+- tarpit/endlessh **удалён полностью** (не чинился — вырезан)
+- drop `ct state invalid` перенесён **после** whitelist-accept'ов
+- priority -150 безусловно; атомарная запись `ddos-protect.conf` (tmp + `nft -c` + mv)
+- whitelist.timer + hash-guard v2, строгая валидация CIDR (отклонение /0–/7)
+- uninstall закрывает 100% артефактов (юниты, sysctl, ufw, notify, rollback)
+- boot-repair + маркер `.install-in-progress`, SMOKE_FAIL → exit 2
+- guard: переработанное меню, чистый дашборд, защита от busy-loop не-TTY
+- docker: daemon.json log-opts 50m×3, восстановление `ip nat`, healthcheck
+- logrotate 10-мин тик; staleness-алерты фидов; snapshot → atomic rollback
+
+Полная история изменений — в шапке скрипта `shieldnode.sh`.
+
+---
+
+*Деплой этого релиза: [`deploy-github.sh`](https://github.com/SpofyJet/shield) · classic PAT, одна команда.*

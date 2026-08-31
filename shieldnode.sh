@@ -1,6 +1,152 @@
 #!/bin/bash
 
 # ==============================================================================
+#  VPN NODE DDoS PROTECTION v4.0.0 — MAJOR: pcap-стек удалён полностью
+#
+#  REMOVE PCAP (весь стек): хостеры не принимают pcap-файлы, а ring+archiver
+#      за сутки DDoS забивали диск до 100% (инцидент 2026-08-30: 72G+23G
+#      архивов на двух нодах → отказ записи, restart-loop сервисов).
+#      Удалены: rolling SYN-dump (shieldnode-pcap.service), attack-archiver
+#      (shieldnode-pcap-archiver.timer/.service, trigger >10k drops/min,
+#      retention 30d, tar.zst >7d), /var/log/pcap, pcap-archive, метрика
+#      pcap_attacks_total, guard-check, conf-vars SHIELD_PCAP_TRIGGER_DROPS/
+#      SHIELD_PCAP_RETENTION_DAYS, tcpdump из managed-deps.
+#  REAPER (двухфазный): pre-check перед check_disk_space — stop writer'ов и
+#      rm ring/archive (освобождает диск ДО FATAL-проверки, чинит upgrade на
+#      нодах с 100% /var); ШАГ 1.5 — дочистка юнитов/drop-in/скрипта/state/
+#      logrotate. Идемпотентно, на свежей установке no-op.
+#  DEPS: tcpdump и zstd убраны из ensure_latest (zstd использовался только
+#      pcap-сжатием; xz-utils остаётся для gz→xz events-логов). Установленный
+#      tcpdump не сносится (ручная утилита): apt purge tcpdump — по желанию.
+#  AUDIT: мёртвых функций не найдено (58 определений, у всех есть вызовы).
+#
+# ==============================================================================
+#  VPN NODE DDoS PROTECTION v4.0.0-hotfix — REMOVE TARPIT + hot path fixes
+#
+#  REMOVE TARPIT (ШАГ 12.12 выпилен целиком): фича была мёртва с рождения —
+#      оба `nft add rule inet ddos_protect input ...` шли в НЕсуществующий
+#      chain (template создаёт только prerouting/overflow), stderr глушился,
+#      set tarpit_caught никогда не наполнялся, summary при этом лживо
+#      показывал "Tarpit: ON". Удалены: установка/юнит/конфиг endlessh,
+#      set tarpit_caught, ключи SHIELD_TARPIT* из limits.conf-шаблона,
+#      summary-строка. Реапер (ШАГ 1.5 п.10) снимает артефакты с нод, где
+#      tarpit уже стоял (юнит+drop-in'ы, наш конфиг, осиротевший set,
+#      ключи limits.conf). Пакет endlessh НЕ purge'ится (как tcpdump):
+#      apt purge endlessh — по желанию оператора.
+#  FIX nft: `ct state invalid counter ... drop` в prerouting (после
+#      established/whitelist) — раньше invalid-пакеты (ACK-flood, out-of-window)
+#      проходили весь prerouting в policy accept, минуя ВСЕ лимиты.
+#  FIX nft: prerouting priority унифицирован на -150 всегда (убрано условие
+#      по PANEL_TYPE) — исключает коллизию с docker/iptables-nft nat dstnat
+#      (-100) на standalone-нодах (equal-priority порядок хрупок).
+#  FIX sysctl: nf_conntrack_acct=0 (зомби-ручка ctguard; per-flow accounting
+#      больше никем не читается, а стоит CPU на каждом пакете). Tier-aware
+#      nf_conntrack_max по RAM (131072/262144/524288/1048576) + hashsize=max/4
+#      через /etc/modprobe.d/shieldnode-conntrack.conf и runtime-sysfs.
+#      Координация: зона nf_conntrack_* в 90-shieldnode.conf принадлежит
+#      shieldnode; vpn-node-setup владеет tcp_*-сокетами.
+#  НЕ ПРИМЕНЁН (аудит O3, слияние пар «meter+log»+«drop» в одно правило):
+#      meter/limit — match-statement: при превышении rate правило перестаёт
+#      матчить ЦЕЛИКОМ (man nft(8)) → counter+drop в том же правиле тоже
+#      отключился бы (заблокированный IP дропался бы лишь 1/мин, остальное
+#      проходило дальше по chain). Два правила (rate-limited log без verdict
+#      + unconditional drop) — единственная корректная структура для
+#      «лог редкий, дроп всегда». TODO-комментарий оставлен в template.
+#  REMOVE connwatch_v4: отдельный ct-count dynset только ради near-threshold
+#      лога [shield:conn_flood] стоил ~25% dynset-операций hot path.
+#      Log-атрибуция near-threshold удалена осознанно; drop-counter
+#      connlimit_v4 (реальные дропы) остаётся.
+#  FIX nft conf write: ddos-protect.conf пишется атомарно (tmp-файл в том же
+#      каталоге → nft -c parse-check → mv). Раньше обрыв записи (диск/сигнал)
+#      оставлял обрезанный конфиг до следующего ExecStartPre.
+#  UNINSTALL (аудит-правки): удаление осиротевших юнитов/скриптов старых
+#      стеков (endlessh, OnFailure drop-in'ы), секреты и снапшоты
+#      node-rollback с remnawave.env (rm /var/lib/node-rollback), откат
+#      logrotate-правок до rm /var/lib/shieldnode, сброс sysctl-правок
+#      (rp_filter=2 осознанно оставлен), шапка uninstall.
+#  ROLLBACK (D2/D4/D5/D6/D8/D10/D12): unmask nftables + маркер timesyncd;
+#      crowdsec yamls + profiles.yaml, ufw delete allow, FORWARD_POLICY
+#      orig/restore, bouncer backup-цикл; .prom textfile-метрики, apt-daily
+#      gate, .shieldnode-bak (chrony/earlyoom). Снапшот node-rollback
+#      создаётся ДО модификаций (в начале install-flow, fresh → skip),
+#      в ШАГ 12.14 остаётся только команда + ротация keep-N. guard rollback:
+#      атомарный restore /etc/shieldnode и /etc/nftables.d (df-проверка →
+#      staging → mv-swap; ошибка до swap — ничего не тронуто); nft restore —
+#      только table inet ddos_protect из ruleset-снапшота (awk по балансу
+#      скобок), полный ruleset больше не воскрешает v3.x-стеки; реальный
+#      nft fail → exit 1; downgrade-warn при rollback на v3.x (pcap-стек)
+#      с confirm, bypass --force/GUARD_FORCE=1.
+#  SELF-UPGRADE (D9): pipe-reexec sanity скачанного дополнен bash -n +
+#      маркером SHIELDNODE_VERSION= (как у guard upgrade), при провале —
+#      fallback с WARN; подметание /tmp/shieldnode.*.sh старше суток в
+#      ШАГ 1; пиннинг источника — через SHIELD_REPO_URL.
+#  MISC (D7/D11/D14): реапер — legacy cron cscli-hub-upgrade на CS>=1.7.2,
+#      rsyslog 49-shieldnode-kern-dedup.conf, .peak-mobile_ru/broadband_ru,
+#      мёртвые ключи SHIELD_PCAP_*/SHIELD_CTG_* из limits.conf. Aggregator:
+#      неудачный flock → пропуск тика (exit 0) вместо работы без lock;
+#      cursor в той же транзакции BEGIN…COMMIT, при failed COMMIT sqlite
+#      откатывает и cursor (лог через logger). SHIELD_FEED_MIRROR —
+#      зеркало-префикс для raw.githubusercontent.com (РФ-ноды) в
+#      генерируемых updater'ах и seed'ах; healthcheck ШАГ 13 предупреждает
+#      при scanner_blocklist_v4 < 100 с подсказкой про mirror.
+#  FIX DOCKER-RECOVERY (находка T4-3): recovery от flush ruleset (bouncer
+#      pre-inst/postinst) восстанавливал ddos_protect/UFW/bouncer, но НЕ
+#      docker-таблицы iptables-nft (ip nat/ip filter) — docker пересоздаёт
+#      их только на (re)start'е → DNAT/MASQUERADE контейнеров мёртвы,
+#      VPN-порты недоступны до ручного restart docker. Теперь обе
+#      recovery-ветки (после install bouncer'а + ШАГ 13 рядом с UFW
+#      disable/enable и restart bouncer) проверяют: docker.service active
+#      + iptables-backend=nf_tables + `nft list table ip nat` падает/пусто
+#      → logger/print_warn + `systemctl restart docker` + verify таблицы.
+#      Гейт nf_tables не даёт ложный restart на iptables-legacy хостах.
+#      HEALTHCHECK (ШАГ 13): явный WARN «docker активен, но ip nat
+#      отсутствует» с подсказкой (раньше только нейтральное info).
+#  OPTIMIZATION (O6): shieldnode-metrics.timer слит в aggregator —
+#      shieldnode-metrics.sh вызывается в конце тика shieldnode-aggregator
+#      (метрики запаздывают на длительность тика ≤1 мин — приемлемо), минус
+#      один timer + service-прогон в минуту. shieldnode-metrics.service
+#      ОСТАВЛЕН (ручной запуск/совместимость). Таймер больше не создаётся;
+#      с существующих нод снимается реапером (ШАГ 1.5 п.12, идемпотентно)
+#      и страховкой в ШАГ 12.11. Aggregator unit: ReadWritePaths +=
+#      /var/lib/node_exporter/textfile_collector (иначе ProtectSystem=strict
+#      молча ломал бы запись .prom из aggregator'а).
+#  UX (G2-аудит, hotfix-доработки):
+#    - H2/H4: limits.conf source'ится ДО mirror-блоков — SHIELD_FEED_MIRROR
+#      из limits.conf теперь реально действует (применяется при install/
+#      upgrade; раньше подсказка «см. limits.conf» в healthcheck была
+#      тупиком). Шаблон limits.conf обновлён (ключ раскомментируемый).
+#      guard upgrade: финальный REPO_URL (с учётом mirror) выпекается в
+#      guard через placeholder __SHIELD_REPO_URL__ + sed (guard — отдельный
+#      скрипт без env установщика), env-override SHIELD_FEED_MIRROR работает
+#      и в рантайме guard; FATAL download failed — с подсказкой про mirror.
+#    - U-M1: uninstall-confirm читает /dev/tty; без терминала (pipe-режим) —
+#      явный отказ с how-to (скачать файл и запустить локально), а не
+#      молчаливая «Отмена» по EOF stdin.
+#    - U-M2: notify event-key service-failed → service-failed-%i (per-service
+#      rate-limit: падение bouncer'а больше не глушит алерт о crowdsec).
+#    - U-M3: stale/mincheck-алерты blocklist — только при переходе через
+#      fail-порог и далее раз в сутки (marker-файл с датой per feed,
+#      сбрасывается при успешном apply); раньше notify на каждом тике.
+#    - U-M4: шапка ddos-protect.conf актуализирована (Generated by
+#      shieldnode.sh v4.0.0; лимиты — переменными из limits.conf; верный
+#      timer shieldnode-update@scanner.timer; верный uninstall).
+#    - U-M5: дашборд guard: «Дропы с перезагрузки nftables» (с timestamp)
+#      вместо нейтрального «Дропы пакетов».
+#    - U-M6: контролируемые FATAL-exit'ы install (disk space, apt-lock,
+#      firewall check, nft modules/parse/load, verify_no_placeholders)
+#      снимают .install-in-progress — boot-repair больше не пугает ложным
+#      «reboot посреди install» после штатного отказа.
+#    - U-M7: guard sync/check — убран слепой sleep 2; oneshot синхронен,
+#      проверяем exit code + is-failed, при fail журнал + exit !=0.
+#    - U-L1/U-L2/U-L3/U-L5/U-L6/U-L7: «подозрительно мал» вместо «пуст»;
+#      убрано зашитое «484KB» из pipe-reexec сообщения; self-test нумерация
+#      1..10 (было 1..9,11); guard: export LC_ALL=C (printf %'d без
+#      locale-мусора), RU-унификация отказов whitelist («Отклонено:»);
+#      rollback — один объединённый confirm (downgrade-warn + общий),
+#      при отмене подсказка «(bypass: --force)»; preinstall Remnawave —
+#      retry x2 на невалидный URL/токен + fallback на ручной ввод IP.
+
+# ==============================================================================
 #  VPN NODE DDoS PROTECTION v3.37.5 — FINAL SELF-HEAL watcher'ов
 #
 #  FIX (репорт sweden2): после `guard upgrade` до v3.37.4 четыре юнита
@@ -144,7 +290,7 @@
 #      zram (не заменяет). Отключить: SHIELD_EARLYOOM=0.
 #  NEW ШАГ 12.17 chrony + NTS: шифрованное время (Network Time Security).
 #      Подделка NTP-ответов сдвигает timestamps → ломает корреляцию атак
-#      (events.db, pcap, CrowdSec decisions). chrony ~3MB RAM. Отключить:
+#      (events.db, CrowdSec decisions). chrony ~3MB RAM. Отключить:
 #      SHIELD_CHRONY=0. Ключи NTS от Cloudflare/Netnod (публичные, no-auth).
 #  NEW ШАГ 12.18 unattended-upgrades (security-only): автопатчи безопасности.
 #      Отключить: SHIELD_UNATTENDED=0. (ОТМЕНЕНО в v3.37.1 — конфликт с vpn-node-setup)
@@ -216,12 +362,12 @@
 #  NEW NOTIFY (ШАГ 12.10): Telegram Bot API + generic webhook. Sender
 #      /usr/local/sbin/shieldnode-notify.sh (rate-limit per event-key, тихий
 #      exit если не настроен). Конфиг /etc/shieldnode/notify.conf (0600).
-#      Подключено: pcap-archiver ATTACK DETECTED (crit), systemd OnFailure
-#      drop-in'ы для crowdsec/bouncer/nftables/pcap.
+#      Подключено: systemd OnFailure drop-in'ы для
+#      crowdsec/bouncer/nftables + smoke-test FAIL (inline).
 #  NEW METRICS (ШАГ 12.11): node_exporter textfile collector
 #      (/var/lib/node_exporter/textfile_collector/shieldnode.prom, каждую минуту).
 #      set sizes, drop counters, crowdsec bans, service_up, conntrack fill,
-#      events.db size, pcap attacks. Работает и без node_exporter.
+#      events.db size. Работает и без node_exporter.
 
 # ==============================================================================
 #  VPN NODE DDoS PROTECTION v3.37.0 — whitelist race fix + ctguard removed
@@ -691,7 +837,7 @@
 #
 #  v3.26.5 (dependency auto-upgrade):
 #    - install/upgrade держит управляемые apt-зависимости на последней версии репо
-#      (nftables, conntrack, iproute2, tcpdump, sqlite3, jq, curl, zstd, xz-utils,
+#      (nftables, conntrack, iproute2, sqlite3, jq, curl, xz-utils,
 #      crowdsec + firewall-bouncer). Апгрейд только если репо-версия строго новее
 #      (downgrade исключён --only-upgrade). Foreign-CrowdSec не трогаем (подсказка).
 #      Knob SHIELD_UPGRADE_DEPS=0 замораживает версии.
@@ -1047,7 +1193,6 @@
 #    - Adaptive ct count threshold: раз в неделю замерять p99 conn/IP среди
 #      легитимных, устанавливать лимит = max(15000, p99*5).
 #    - JSON API для shieldnode-archive metrics (для Grafana/Prometheus).
-#    - Encrypt-at-rest для /var/lib/shieldnode/pcap-archive/ (privacy).
 #
 #  Из v3.23.0/v3.23.1 (сохранены):
 #    - TRUSTED_IPS через postoverflow whitelist (parser-level)
@@ -1177,8 +1322,12 @@ cscli_collection_installed() {
 # Можно переопределить через env (для тестинга на форке).
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
 
+# v4.0.0-hotfix (D14a + H2/H4): блок подстановки SHIELD_FEED_MIRROR перенесён
+# НИЖЕ (сразу после source limits.conf, перед pipe-reexec) — теперь mirror
+# можно задавать и в /etc/shieldnode/limits.conf, а не только через env.
+
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.37.7"
+SHIELDNODE_VERSION="4.0.0"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -1250,6 +1399,40 @@ verify_no_placeholders() {
 
 if [ -f "$SHIELD_CONF_FILE" ]; then
     shield_safe_source "$SHIELD_CONF_FILE"
+fi
+
+# v4.0.0-hotfix (H2/H4): limits.conf source'ится РАНЬШЕ mirror-блоков —
+# SHIELD_FEED_MIRROR из limits.conf теперь действует при install/upgrade
+# (раньше limits.conf грузился после переписывания feed-URL → подсказка
+# "см. limits.conf" в healthcheck была тупиком). На fresh install файла ещё
+# нет → guard [ -f ]. Дефолты SHIELD_* ниже заданы через ${VAR:-default} —
+# значения из limits.conf сохраняются (та же семантика, что у позднего
+# source; приоритет conf → limits не изменился).
+# Load operator overrides if present
+SHIELD_LIMITS_FILE="/etc/shieldnode/limits.conf"
+if [ -f "$SHIELD_LIMITS_FILE" ]; then
+    # shellcheck source=/dev/null
+    if shield_safe_source "$SHIELD_LIMITS_FILE" 2>/dev/null; then
+        :
+    else
+        echo "WARN: limits.conf failed safe-source check, using defaults" >&2
+    fi
+fi
+
+# v4.0.0-hotfix (D14a): SHIELD_FEED_MIRROR — зеркало-префикс вместо
+# raw.githubusercontent.com (на РФ-нодах raw.githubusercontent.com может быть
+# недоступен). Если задан (env ИЛИ limits.conf) — префикс
+# `https://raw.githubusercontent.com/` заменяется на $SHIELD_FEED_MIRROR в
+# SHIELD_REPO_URL (seed-скачивания) и в DEFAULT_REMOTE_BLOCKLISTS
+# (→ генерируемые shieldnode-defaults.sh и update-blocklist.sh).
+# Пример: SHIELD_FEED_MIRROR="https://ghproxy.example.com/".
+if [ -n "${SHIELD_FEED_MIRROR:-}" ]; then
+    SHIELD_FEED_MIRROR="${SHIELD_FEED_MIRROR%/}/"
+    case "$SHIELD_REPO_URL" in
+        https://raw.githubusercontent.com/*)
+            SHIELD_REPO_URL="${SHIELD_FEED_MIRROR}${SHIELD_REPO_URL#https://raw.githubusercontent.com/}"
+            ;;
+    esac
 fi
 
 # v3.18.11 SH-NEW-10: строгая валидация IPv4/CIDR.
@@ -1372,21 +1555,30 @@ esac
 # РЕШЕНИЕ: в pipe-режиме скачиваем полную копию во временный файл и exec'аем её.
 # После exec stdin больше не pipe → дедлок невозможен в принципе, даже если
 # apt-операции идут минуты. Guard SHIELD_REEXEC=1 защищает от петли.
+#
+# ПИННИНГ: источник — $SHIELD_REPO_URL (default: github main). Для пиннинга на
+# конкретный коммит/релиз или свой mirror задай SHIELD_REPO_URL до запуска:
+#   SHIELD_REPO_URL=https://raw.githubusercontent.com/ORG/REPO/<tag-or-sha> curl ... | bash
+# v4.0.0-hotfix (D9): sanity скачанного расширен до уровня `guard upgrade`:
+# bash -n (синтаксис) + маркер SHIELDNODE_VERSION= (не HTML/обрезок).
+# При провале — fallback на pipe с WARN (существующая ветка ниже).
 if [ "$SHIELD_PIPE_MODE" = "1" ] && [ "${SHIELD_REEXEC:-0}" != "1" ] && [ "${1:-}" != "--uninstall" ]; then
     _SHIELD_SELF="$(mktemp /tmp/shieldnode.XXXXXX.sh 2>/dev/null)"
     if [ -n "$_SHIELD_SELF" ] && \
        command -v curl >/dev/null 2>&1 && \
        curl -fsSL --max-time 60 --retry 3 "$SHIELD_REPO_URL/shieldnode.sh" -o "$_SHIELD_SELF" 2>/dev/null && \
-       [ -s "$_SHIELD_SELF" ] && head -1 "$_SHIELD_SELF" | grep -q '^#!'; then
+       [ -s "$_SHIELD_SELF" ] && head -1 "$_SHIELD_SELF" | grep -q '^#!' && \
+       bash -n "$_SHIELD_SELF" 2>/dev/null && \
+       grep -q 'SHIELDNODE_VERSION=' "$_SHIELD_SELF"; then
         chmod 0755 "$_SHIELD_SELF" 2>/dev/null
-        echo "ℹ Pipe-режим: перезапускаюсь из $_SHIELD_SELF (защита от curl-обрыва на 484KB)" >&2
+        echo "ℹ Pipe-режим: перезапускаюсь из $_SHIELD_SELF (защита от обрыва curl на середине скрипта)" >&2
         export SHIELD_REEXEC=1
         # shellcheck disable=SC2093
         exec bash "$_SHIELD_SELF" "$@"
         # exec не вернётся; если вдруг вернулся — продолжаем на pipe (best-effort)
     else
         [ -n "$_SHIELD_SELF" ] && rm -f "$_SHIELD_SELF" 2>/dev/null
-        echo "⚠ Не смог перекачать копию для re-exec — продолжаю на pipe (возможен обрыв на больших паузах)" >&2
+        echo "⚠ Не смог перекачать копию для re-exec (download/sanity check failed) — продолжаю на pipe (возможен обрыв на больших паузах)" >&2
     fi
 fi
 
@@ -1423,6 +1615,17 @@ DEFAULT_REMOTE_BLOCKLISTS=(
     "custom="
     # v3.20.0: mobile_ru + broadband_ru URLs УБРАНЫ
 )
+
+# v4.0.0-hotfix (D14a): подстановка зеркала фидов. Переписанные значения
+# попадут в генерируемый /usr/local/sbin/shieldnode-defaults.sh (который
+# source'ит update-blocklist.sh) и в seed-скачивания (через SHIELD_REPO_URL).
+if [ -n "${SHIELD_FEED_MIRROR:-}" ]; then
+    for _feed_i in "${!DEFAULT_REMOTE_BLOCKLISTS[@]}"; do
+        DEFAULT_REMOTE_BLOCKLISTS[$_feed_i]="${DEFAULT_REMOTE_BLOCKLISTS[$_feed_i]//https:\/\/raw.githubusercontent.com\//$SHIELD_FEED_MIRROR}"
+    done
+    print_info "SHIELD_FEED_MIRROR активен — feed URL'ы переписаны на mirror: ${SHIELD_FEED_MIRROR%/}"
+    unset _feed_i
+fi
 
 
 DEFAULT_SCANNER_UPDATE_INTERVAL="6h"
@@ -1470,21 +1673,12 @@ SHIELD_AUTOPROMOTE_THRESHOLD="${SHIELD_AUTOPROMOTE_THRESHOLD:-800}"
 SHIELD_AUTOPROMOTE_WINDOW_HOURS="${SHIELD_AUTOPROMOTE_WINDOW_HOURS:-24}"
 SHIELD_CUSTOM_LOCAL_TTL_DAYS="${SHIELD_CUSTOM_LOCAL_TTL_DAYS:-90}"
 SHIELD_EVENTS_DB_RETENTION_DAYS="${SHIELD_EVENTS_DB_RETENTION_DAYS:-90}"
-SHIELD_PCAP_TRIGGER_DROPS="${SHIELD_PCAP_TRIGGER_DROPS:-10000}"
-SHIELD_PCAP_RETENTION_DAYS="${SHIELD_PCAP_RETENTION_DAYS:-30}"
 SHIELD_AGG_JOURNAL_LINES="${SHIELD_AGG_JOURNAL_LINES:-50000}"  # v3.27.0 FIX(#14): 200k→50k per-tick (анти-OOM/CPU агрегатора под лог-штормом; nft-дропы идут независимо)
 SHIELD_AGG_MAX_UNIQUE_IPS="${SHIELD_AGG_MAX_UNIQUE_IPS:-50000}"
 
 # Load operator overrides if present
-SHIELD_LIMITS_FILE="/etc/shieldnode/limits.conf"
-if [ -f "$SHIELD_LIMITS_FILE" ]; then
-    # shellcheck source=/dev/null
-    if shield_safe_source "$SHIELD_LIMITS_FILE" 2>/dev/null; then
-        :
-    else
-        echo "WARN: limits.conf failed safe-source check, using defaults" >&2
-    fi
-fi
+# (v4.0.0-hotfix H2/H4: source limits.conf перенесён ВЫШЕ — сразу после
+# shieldnode.conf, до mirror-блоков. SHIELD_LIMITS_FILE уже определён там.)
 
 # v3.23.13 SR-FIX-7: validate SHIELD_* numeric vars before use in nft heredoc.
 # Defense-in-depth: если оператор поставил в limits.conf не-число (например,
@@ -1510,15 +1704,11 @@ shield_ensure_numeric SHIELD_V6_REJECT 0
 shield_ensure_numeric SHIELD_AUTOPROMOTE_WINDOW_HOURS 24
 shield_ensure_numeric SHIELD_CUSTOM_LOCAL_TTL_DAYS 90
 shield_ensure_numeric SHIELD_EVENTS_DB_RETENTION_DAYS 90
-shield_ensure_numeric SHIELD_PCAP_TRIGGER_DROPS 10000
-shield_ensure_numeric SHIELD_PCAP_RETENTION_DAYS 30
 shield_ensure_numeric SHIELD_AGG_JOURNAL_LINES 50000
 shield_ensure_numeric SHIELD_AGG_MAX_UNIQUE_IPS 50000
 
-# Pre-compute derived values to avoid $((...)) inside heredoc (some bash
-# versions on certain platforms had issues with arithmetic expansion inside
-# unquoted heredoc when var contains unexpected chars).
-SHIELD_CT_CONN_FLOOD_MINUS_1=$((SHIELD_CT_CONN_FLOOD - 1))
+# (v4.0.0-hotfix: derived SHIELD_CT_CONN_FLOOD_MINUS_1 удалён — единственный
+# потребитель, connwatch_v4 near-threshold log-rule, выпилен как O4.)
 
 # v3.13.0: mobile-RU whitelist defaults
 # v3.14.1: эти переменные тоже подхватятся из shieldnode.conf если оператор
@@ -1566,17 +1756,45 @@ if [ "${1:-}" = "--uninstall" ]; then
 
     print_header "UNINSTALL: vpn-node-ddos-protect"
 
+    # v4.0.0-hotfix (LOW-38): шапка переписана под актуальный скоуп.
     print_warn "Это удалит:"
-    echo "  - nft table inet ddos_protect (rate-limit + scanner-blocklist)"
-    echo "  - /etc/nftables.d/ddos-protect.conf"
-    echo "  - scanner-blocklist updater + timer"
+    echo "  - nft tables: inet ddos_protect, inet shield_ctguard, inet shield_synproxy"
+    echo "  - /etc/nftables.d/ddos-protect.conf + include в /etc/nftables.conf"
+    echo "  - все shieldnode-юниты: updaters (scanner/threat/tor/custom), whitelist,"
+    echo "    aggregator, metrics, notify@, api.socket/api@, crowdsec-hub-update,"
+    echo "    github-sync, version-check, logrotate, cleanup, boot-repair, auto-promote,"
+    echo "    remnawave-sync, protected-ports-update (+drop-in'ы OnFailure)"
+    echo "  - скрипты в /usr/local/sbin + /usr/local/bin/guard + node-rollback"
+    echo "  - /etc/shieldnode (conf, lists, limits.conf, notify.conf, remnawave.env, маркеры)"
+    echo "  - /var/lib/shieldnode (events.db, state, backups) и /var/lib/node-rollback (снапшоты)"
+    echo "  - /var/log/shieldnode + logrotate/rsyslog/journald патчи (с откатом)"
+    echo "  - sysctl 90-shieldnode.conf + сброс залипших ключей на defaults"
+    echo "  - CrowdSec: наши scenarios/parsers/acquis.d/postoverflow + bouncer config restore"
+    echo "  - UFW: наши allow-правила TRUSTED_IPS + DEFAULT_FORWARD_POLICY (если Docker нет)"
+    echo "  - chrony/earlyoom: восстановление оригинальных конфигов из .shieldnode-bak"
+    echo "  - unmask nftables.service, re-enable systemd-timesyncd (если мы его disable'или)"
     echo ""
-    echo "  НЕ удалит:"
-    echo "  - сам CrowdSec и bouncer (apt purge crowdsec вручную)"
+    echo "  НЕ удалит (пакеты остаются, purge по желанию):"
+    echo "  - сам CrowdSec и bouncer пакеты: apt purge crowdsec crowdsec-firewall-bouncer"
+    echo "  - endlessh / tcpdump пакеты: apt purge endlessh tcpdump"
+    echo "  - chrony / earlyoom пакеты: apt purge chrony earlyoom"
     echo "  - sshd-конфиг (PasswordAuthentication)"
     echo "  - бэкапы в /root/vpn-ddos-backup-*"
     echo ""
-    read -r -p "Продолжить? [y/N] " ANSWER
+    # v4.0.0-hotfix (U-M1): читаем ответ с /dev/tty — в pipe-режиме
+    # (curl | bash) stdin занят телом скрипта, и read молча получал EOF →
+    # выглядело как мгновенная «Отмена» без показа вопроса. Нет tty →
+    # честный отказ с how-to вместо молчаливой отмены.
+    ANSWER=""
+    if [ -e /dev/tty ] && { : </dev/tty; } 2>/dev/null; then
+        read -r -p "Продолжить? [y/N] " ANSWER </dev/tty || ANSWER=""
+    else
+        echo "pipe-режим: нет интерактивного терминала — uninstall из пайпа невозможен."
+        echo "Для uninstall скачайте файл и запустите локально:"
+        echo "  curl -fsSL $SHIELD_REPO_URL/shieldnode.sh -o /tmp/shieldnode.sh"
+        echo "  sudo bash /tmp/shieldnode.sh --uninstall"
+        exit 1
+    fi
     case "$ANSWER" in
         y|Y|yes|YES) ;;
         *) echo "Отмена."; exit 0 ;;
@@ -1602,13 +1820,43 @@ if [ "${1:-}" = "--uninstall" ]; then
                 shieldnode-logrotate.timer shieldnode-logrotate.service \
                 shieldnode-cleanup.timer shieldnode-cleanup.service \
                 shieldnode-whitelist.path shieldnode-whitelist.service \
+                shieldnode-whitelist.timer \
                 shieldnode-remnawave-sync.timer shieldnode-remnawave-sync.service \
                 shieldnode-pcap.service \
                 shieldnode-pcap-archiver.timer shieldnode-pcap-archiver.service \
                 shieldnode-auto-promote.timer shieldnode-auto-promote.service \
-                shieldnode-synproxy.service; do
+                shieldnode-boot-repair.service \
+                shieldnode-synproxy.service \
+                shieldnode-metrics.timer shieldnode-metrics.service \
+                shieldnode-notify@.service \
+                shieldnode-api.socket shieldnode-api@.service \
+                shieldnode-crowdsec-hub-update.timer shieldnode-crowdsec-hub-update.service \
+                endlessh.service; do
         systemctl disable --now "$unit" 2>/dev/null || true
         rm -f "/etc/systemd/system/$unit"
+        # v4.0.0-hotfix (находка 8): сносим и drop-in dirs (OnFailure/override).
+        rm -rf "/etc/systemd/system/${unit}.d"
+    done
+    # v4.0.0-hotfix (находка 8): endlessh-юнит — пакетный мог быть перезаписан
+    # нашим tarpit-стеком (≤v3.x). Reaper (ШАГ 1.5 п.10) уже снимает его при
+    # upgrade, но uninstall обязан чистить и сам (на случай если reaper не
+    # отрабатывал — например unit остался от ручной установки поверх). Пакетный
+    # unit без reinstall не восстановить — только предупреждаем.
+    if [ -f /etc/systemd/system/endlessh.service ] || [ -d /etc/systemd/system/endlessh.service.d ]; then
+        systemctl stop endlessh.service 2>/dev/null || true
+        systemctl disable endlessh.service 2>/dev/null || true
+        rm -f /etc/systemd/system/endlessh.service
+        rm -rf /etc/systemd/system/endlessh.service.d
+        print_info "endlessh.service (перезаписанный нашим tarpit-стеком) удалён; пакетный unit восстановить можно только переустановкой: apt install --reinstall endlessh"
+    fi
+    # v4.0.0-hotfix (находка 8): OnFailure drop-in'ы которые мы ставили на
+    # чужие сервисы (crowdsec/bouncer/nftables) — убираем, иначе после удаления
+    # shieldnode-notify@.service они останутся битыми ссылками.
+    for _watched in crowdsec.service crowdsec-firewall-bouncer.service shieldnode-nftables.service; do
+        if [ -f "/etc/systemd/system/${_watched}.d/shieldnode-onfailure.conf" ]; then
+            rm -f "/etc/systemd/system/${_watched}.d/shieldnode-onfailure.conf"
+            rmdir "/etc/systemd/system/${_watched}.d" 2>/dev/null || true
+        fi
     done
     # v3.12.0: убираем templated unit-файлы (если timer'ы создавались из шаблона)
     rm -f /etc/systemd/system/shieldnode-update@.service
@@ -1618,6 +1866,26 @@ if [ "${1:-}" = "--uninstall" ]; then
     rm -f /etc/systemd/system/cs-ssh-whitelist.service
     systemctl daemon-reload
     print_ok "Systemd units удалены"
+
+    # v4.0.0-hotfix (D2): снимаем mask с nftables.service — мы его ставили в
+    # ШАГ 3 (защита UFW от flush ruleset). После uninstall наш shieldnode-
+    # nftables.service удалён, поэтому mask смысла больше не имеет.
+    systemctl unmask nftables.service >/dev/null 2>&1 || true
+
+    # v4.0.0-hotfix (D2): re-enable systemd-timesyncd ТОЛЬКО если мы его
+    # disable'или в ШАГ 12.17 (маркер). Если chrony установлен и активен —
+    # не включаем timesyncd (два NTP-демона конфликтуют).
+    if [ -f /var/lib/shieldnode/.timesyncd-disabled-by-shieldnode ]; then
+        if command -v chronyd >/dev/null 2>&1 && \
+           systemctl is-active --quiet chrony.service 2>/dev/null; then
+            print_info "chrony активен — systemd-timesyncd не включаем (мы его disable'или, но chrony синхронизирует время)"
+        else
+            systemctl enable --now systemd-timesyncd.service >/dev/null 2>&1 && \
+                print_ok "systemd-timesyncd re-enabled (мы его disable'или в ШАГ 12.17)" || \
+                print_info "systemd-timesyncd re-enable не удался (возможно пакет снесён)"
+        fi
+        rm -f /var/lib/shieldnode/.timesyncd-disabled-by-shieldnode
+    fi
 
     # Scripts
     rm -f /usr/local/sbin/cs-ssh-key-whitelist.sh
@@ -1637,6 +1905,13 @@ if [ "${1:-}" = "--uninstall" ]; then
     nft delete table inet shield_ctguard 2>/dev/null || true  # v3.24.0
     rm -f /usr/local/sbin/shieldnode-defaults.sh
     rm -f /usr/local/sbin/shieldnode-cleanup.sh  # v3.20.3
+    rm -f /usr/local/sbin/shieldnode-boot-repair.sh  # audit C3
+    # v4.0.0-hotfix (находка 8): скрипты юнитов, которые раньше не чистились.
+    rm -f /usr/local/sbin/shieldnode-metrics.sh \
+          /usr/local/sbin/shieldnode-notify.sh \
+          /usr/local/sbin/shieldnode-api-handler.sh \
+          /usr/local/sbin/shieldnode-crowdsec-hub-update.sh \
+          /usr/local/sbin/node-rollback
     # v3.30.1 FIX(F4): pcap/auto-promote — раньше НЕ удалялись → tcpdump продолжал
     # писать /var/log/pcap после uninstall, таймеры висели.
     rm -f /usr/local/sbin/shieldnode-pcap-archiver.sh /usr/local/sbin/shieldnode-auto-promote.sh
@@ -1648,24 +1923,63 @@ if [ "${1:-}" = "--uninstall" ]; then
     rm -f /usr/local/bin/guard
     print_ok "Скрипты удалены (включая команду guard)"
 
+    # v4.0.0-hotfix (находка 10): читаем TRUSTED_IPS ДО удаления conf — нужен
+    # для отката UFW allow-правил (ниже, в D8-блоке).
+    UNINSTALL_TRUSTED_IPS=$(grep -E '^TRUSTED_IPS=' /etc/shieldnode/shieldnode.conf 2>/dev/null | head -1 | sed -E 's/^TRUSTED_IPS="?([^"]*)"?.*/\1/')
+    # v4.0.0-hotfix (D8): исходный DEFAULT_FORWARD_POLICY (сохранён install'ом в
+    # shield_fix_ufw_forward_for_docker) — читаем ДО rm -rf /var/lib/shieldnode.
+    UNINSTALL_UFW_FWD_ORIG=""
+    if [ -f /var/lib/shieldnode/ufw-forward-policy.orig ]; then
+        UNINSTALL_UFW_FWD_ORIG=$(head -1 /var/lib/shieldnode/ufw-forward-policy.orig 2>/dev/null | tr -d '[:space:]')
+    fi
+
     # v3.11: BLOCK_TOR marker
     rm -f /etc/shieldnode/block_tor
     # v3.12.0: lists и опциональный config
     rm -rf /etc/shieldnode/lists
     rm -f /etc/shieldnode/shieldnode.conf
-    rmdir /etc/shieldnode 2>/dev/null || true
+    # v4.0.0-hotfix (находка 10): секреты и маркеры — иначе rmdir /etc/shieldnode
+    # ниже молча не срабатывал (каталог непуст) и notify.conf (токены TG/webhook,
+    # 0600) + remnawave.env + limits.conf + .crowdsec_managed оставались на диске.
+    rm -f /etc/shieldnode/notify.conf \
+          /etc/shieldnode/limits.conf \
+          /etc/shieldnode/.crowdsec_managed \
+          /etc/shieldnode/remnawave.env \
+          /etc/shieldnode/synproxy.nft \
+          /etc/shieldnode/stack.conf
+    rmdir /etc/shieldnode 2>/dev/null || \
+        print_info "/etc/shieldnode не пуст после чистки — остаток: $(ls -A /etc/shieldnode 2>/dev/null | tr '\n' ' ')"
+
+    # v4.0.0-hotfix (LOW-39): откат logrotate-marker'а из /etc/logrotate.d/rsyslog
+    # ДО rm -rf /var/lib/shieldnode — резервная копия rsyslog.original.* живёт в
+    # /var/lib/shieldnode/backup/ и была бы уничтожена раньше отката. Также
+    # заменён `sed {N;d;}` (сносил следующую строку вслепую) на точечное awk-
+    # удаление: maxsize 100M удаляется ТОЛЬКО если он наш (сразу после маркера).
+    if [ -f /etc/logrotate.d/rsyslog ] && grep -qE '^\s*# shieldnode-aggressive-marker\s*$' /etc/logrotate.d/rsyslog 2>/dev/null; then
+        awk '
+            /^[[:space:]]*# shieldnode-aggressive-marker[[:space:]]*$/ { getline nxt; if (nxt ~ /^[[:space:]]*maxsize 100M[[:space:]]*$/) { next } else { print nxt; next } }
+            { print }
+        ' /etc/logrotate.d/rsyslog > /etc/logrotate.d/rsyslog.shieldnode-tmp 2>/dev/null && \
+            mv /etc/logrotate.d/rsyslog.shieldnode-tmp /etc/logrotate.d/rsyslog 2>/dev/null || \
+            rm -f /etc/logrotate.d/rsyslog.shieldnode-tmp
+    fi
 
     # БД истории событий (v2.9), включая ASN cache (v3.12.0) и fail counters
     rm -rf /var/lib/shieldnode
+
+    # v4.0.0-hotfix (находка 10): снапшоты node-rollback содержат remnawave.env
+    # и прочие конфиги с секретами — удаляем целиком.
+    if [ -d /var/lib/node-rollback ]; then
+        rm -rf /var/lib/node-rollback
+        print_warn "Снапшоты node-rollback (/var/lib/node-rollback) удалены — содержали remnawave.env и конфиги с секретами"
+    fi
 
     # v3.5: human-readable логи + logrotate
     rm -rf /var/log/shieldnode
     rm -f /etc/logrotate.d/shieldnode
     rm -f /etc/logrotate.d/shieldnode-syslog-aggressive  # v3.20.3 legacy
-    # v3.23.13 SR-FIX-8: убираем наш patch (маркер + maxsize 100M) из rsyslog conf
-    if [ -f /etc/logrotate.d/rsyslog ]; then
-        sed -i -E '/^\s*# shieldnode-aggressive-marker\s*$/{N;d;}' /etc/logrotate.d/rsyslog 2>/dev/null || true
-    fi
+    # v4.0.0-hotfix (LOW-39): откат маркера из /etc/logrotate.d/rsyslog ПЕРЕНЕСЁН
+    # выше — до rm -rf /var/lib/shieldnode (backup живёт в /var/lib/shieldnode/backup).
     # Cleanup нашего state файла
     rm -f /var/lib/shieldnode/logrotate-hourly.state /var/lib/shieldnode/logrotate.state /var/lib/shieldnode/logrotate-syslog.state 2>/dev/null
     print_ok "Логи и logrotate-конфиг удалены"
@@ -1734,14 +2048,54 @@ if [ "${1:-}" = "--uninstall" ]; then
         # (на случай если оператор включал вручную)
         sysctl -w net.ipv4.conf.all.log_martians=0 >/dev/null 2>&1 || true
         sysctl -w net.ipv4.conf.default.log_martians=0 >/dev/null 2>&1 || true
+        # v4.0.0-hotfix (находка 28): ПОЛНЫЙ список ключей 90-shieldnode.conf.
+        # Раньше сбрасывался только поднабор — syncookies/redirects/conntrack
+        # timeouts/acct/tcp_loose "залипали" на значениях shieldnode до ребута.
+        # ВАЖНО про rp_filter: shieldnode ставил =2 (loose) — это КОРРЕКТНО для
+        # VPN-форвардера (asymmetric routing). Сбрасывать в =1 (strict) на
+        # uninstall СЛОМАЛО бы VPN. Поэтому rp_filter НЕ трогаем принудительно:
+        # если стоит vpn-node-setup — sysctl --system вернёт его значение (=2),
+        # если standalone — оставляем =2 (безопасно для VPN). См. коммент ниже.
+        # Значения = kernel defaults (Linux).
+        sysctl -w net.ipv4.tcp_syncookies=1 >/dev/null 2>&1 || true
+        sysctl -w net.ipv4.conf.all.accept_source_route=1 >/dev/null 2>&1 || true   # kernel default = 1
+        sysctl -w net.ipv4.conf.default.accept_source_route=1 >/dev/null 2>&1 || true
+        sysctl -w net.ipv4.conf.all.accept_redirects=1 >/dev/null 2>&1 || true
+        sysctl -w net.ipv4.conf.default.accept_redirects=1 >/dev/null 2>&1 || true
+        sysctl -w net.ipv4.conf.all.send_redirects=1 >/dev/null 2>&1 || true
+        sysctl -w net.ipv4.conf.default.send_redirects=1 >/dev/null 2>&1 || true
+        sysctl -w net.ipv4.icmp_echo_ignore_broadcasts=0 >/dev/null 2>&1 || true
+        sysctl -w net.ipv4.tcp_rfc1337=0 >/dev/null 2>&1 || true
+        # conntrack-зона (v4.0.0-hotfix владение shieldnode): возврат к kernel defaults.
+        sysctl -w net.netfilter.nf_conntrack_acct=0 >/dev/null 2>&1 || true            # default 0
+        sysctl -w net.netfilter.nf_conntrack_tcp_loose=1 >/dev/null 2>&1 || true        # default 1
+        sysctl -w net.netfilter.nf_conntrack_tcp_timeout_established=432000 >/dev/null 2>&1 || true
+        sysctl -w net.netfilter.nf_conntrack_tcp_timeout_close_wait=60 >/dev/null 2>&1 || true
+        sysctl -w net.netfilter.nf_conntrack_tcp_timeout_fin_wait=120 >/dev/null 2>&1 || true
+        sysctl -w net.netfilter.nf_conntrack_tcp_timeout_time_wait=120 >/dev/null 2>&1 || true
+        sysctl -w net.netfilter.nf_conntrack_tcp_timeout_last_ack=30 >/dev/null 2>&1 || true
+        # nf_conntrack_max/hashsize — tier-aware, восстановить точный дефолт
+        # нельзя (зависит от ядра/RAM); sysctl --system ниже подхватит значения
+        # vpn-node-setup если он есть, иначе останется tier — безопасно.
         # Остальные ключи (rp_filter, syncookies, accept_redirects, send_redirects,
         # accept_source_route, icmp_echo_ignore_broadcasts, tcp_rfc1337) обычно
         # дублируются vpn-node-setup.sh с теми же значениями — sysctl --system
         # их применит из 80-vpn-node-tuning.conf. Если setup не установлен —
-        # оператор вернёт defaults вручную или ребутом.
+        # мы уже сбросили их явно выше.
         sysctl --system >/dev/null 2>&1 || true
-        print_ok "Sysctl hardening удалён (UDP-timeout/synack/martians сброшены на defaults)"
+        print_ok "Sysctl hardening удалён (все ключи 90-shieldnode.conf сброшены на kernel defaults)"
     fi
+
+    # v4.0.0-hotfix (находка 28): восстановление бэкапов chrony/earlyoom которые
+    # мы перезаписали в ШАГ 12.16/12.17 (backup'ы .shieldnode-bak создаются при
+    # install — см. ШАГ 12.16/12.17 ниже).
+    for _cfg in /etc/chrony/chrony.conf /etc/default/earlyoom; do
+        if [ -f "${_cfg}.shieldnode-bak" ]; then
+            cp -a "${_cfg}.shieldnode-bak" "$_cfg" 2>/dev/null && \
+                print_ok "Восстановлен ${_cfg} из .shieldnode-bak" || \
+                print_warn "Не смог восстановить ${_cfg} из .shieldnode-bak"
+        fi
+    done
 
     # CrowdSec parser
     rm -f /etc/crowdsec/postoverflows/s01-whitelist/ssh-key-whitelist.yaml
@@ -1791,15 +2145,87 @@ if [ "${1:-}" = "--uninstall" ]; then
 
     # v3.10.3: восстанавливаем оригинальный bouncer config если есть бэкап
     # v3.18.11 SH-NEW-149: ищем последний backup автоматически.
-    # Раньше использовался $BACKUP_DIR который undefined в --uninstall блоке
-    # (создаётся в начале install run, не uninstall) → restore никогда не работал.
-    LAST_BACKUP=$(ls -1dt /root/vpn-ddos-backup-* 2>/dev/null | head -1)
-    if [ -n "$LAST_BACKUP" ] && [ -f "$LAST_BACKUP/crowdsec-firewall-bouncer.yaml.before" ]; then
-        cp -a "$LAST_BACKUP/crowdsec-firewall-bouncer.yaml.before" \
-              /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
+    # v4.0.0-hotfix (D8): перебираем backup'ы от свежего к старому до первого,
+    # где реально лежит crowdsec-firewall-bouncer.yaml.before (раньше брали
+    # ТОЛЬКО самый свежий каталог — если в нём файла не было, restore молча
+    # пропускался). Не нашли ни в одном → warn про cscli bouncers re-register.
+    BOUNCER_CFG=/etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
+    BOUNCER_RESTORED=0
+    while IFS= read -r _bdir; do
+        if [ -f "$_bdir/crowdsec-firewall-bouncer.yaml.before" ]; then
+            cp -a "$_bdir/crowdsec-firewall-bouncer.yaml.before" "$BOUNCER_CFG" && BOUNCER_RESTORED=1
+            break
+        fi
+    done <<EOF
+$(ls -1dt /root/vpn-ddos-backup-* 2>/dev/null)
+EOF
+    if [ "$BOUNCER_RESTORED" = "1" ]; then
         systemctl restart crowdsec-firewall-bouncer 2>/dev/null || true
-        print_ok "Bouncer config восстановлен из бэкапа: $LAST_BACKUP"
+        print_ok "Bouncer config восстановлен из бэкапа: $_bdir"
+    elif [ -f "$BOUNCER_CFG" ]; then
+        print_warn "Backup bouncer.yaml не найден — в конфиге остался наш API key. Перерегистрируй bouncer: cscli bouncers add ... && пропиши новый ключ в $BOUNCER_CFG"
     fi
+
+    # v4.0.0-hotfix (D8): наши CrowdSec-файлы из ШАГ 12.9 + skip-unattended маркер.
+    rm -f /etc/crowdsec/scenarios/shieldnode-conn-flood.yaml
+    rm -f /etc/crowdsec/parsers/s01-parse/shieldnode-events.yaml
+    rm -f /etc/crowdsec/acquis.d/shieldnode.yaml
+    rm -f /etc/crowdsec/.shieldnode-skip-unattended
+    systemctl reload crowdsec 2>/dev/null || true
+
+    # v4.0.0-hotfix (D8): profiles.yaml — мы патчили ban duration 24h→4h (ШАГ 8).
+    # Восстанавливаем из backup'а, иначе обратный sed (только если там всё ещё
+    # наше 4h — операторский custom не трогаем). foreign CrowdSec — пропускаем.
+    PROFILES_FILE=/etc/crowdsec/profiles.yaml
+    if [ -f "$PROFILES_FILE" ]; then
+        PROFILES_RESTORED=0
+        while IFS= read -r _pdir; do
+            if [ -f "$_pdir/profiles.yaml.before" ]; then
+                cp -a "$_pdir/profiles.yaml.before" "$PROFILES_FILE" && PROFILES_RESTORED=1
+                print_ok "profiles.yaml восстановлен из бэкапа: $_pdir"
+                break
+            fi
+        done <<EOF
+$(ls -1dt /root/vpn-ddos-backup-* 2>/dev/null)
+EOF
+        if [ "$PROFILES_RESTORED" != "1" ]; then
+            if grep -qE "^[[:space:]]*duration:[[:space:]]*4h[[:space:]]*$" "$PROFILES_FILE" 2>/dev/null; then
+                sed -i 's/^\([[:space:]]*\)duration:[[:space:]]*4h[[:space:]]*$/\1duration: 24h/' "$PROFILES_FILE" 2>/dev/null && \
+                    print_info "profiles.yaml: backup не найден — обратный sed 4h→24h (проверь ban duration вручную)" || \
+                    print_warn "profiles.yaml: не смог откатить ban duration — проверь вручную"
+            fi
+        fi
+        systemctl reload crowdsec 2>/dev/null || true
+    fi
+
+    # v4.0.0-hotfix (D8): откат UFW allow-правил для TRUSTED_IPS (ШАГ 12.5).
+    if command -v ufw >/dev/null 2>&1 && [ -n "$UNINSTALL_TRUSTED_IPS" ]; then
+        IFS=',' read -ra _TR_ARR <<< "$UNINSTALL_TRUSTED_IPS"
+        for _tip in "${_TR_ARR[@]}"; do
+            _tip=$(echo "$_tip" | tr -d ' ')
+            [ -z "$_tip" ] && continue
+            ufw delete allow from "$_tip" >/dev/null 2>&1 || true
+        done
+        print_ok "UFW allow-правила для TRUSTED_IPS удалены"
+    fi
+
+    # v4.0.0-hotfix (D8): DEFAULT_FORWARD_POLICY откат. Если docker активен —
+    # НЕ трогаем (DROP сломает egress контейнеров) и предупреждаем.
+    if [ -n "$UNINSTALL_UFW_FWD_ORIG" ] && [ -f /etc/default/ufw ]; then
+        if command -v docker >/dev/null 2>&1 && \
+           { docker info >/dev/null 2>&1 || systemctl is-active --quiet docker 2>/dev/null || [ -S /var/run/docker.sock ]; }; then
+            print_warn "Docker активен — DEFAULT_FORWARD_POLICY оставлен ACCEPT (откат в $UNINSTALL_UFW_FWD_ORIG сломал бы egress контейнеров)"
+        else
+            if grep -qE '^DEFAULT_FORWARD_POLICY=' /etc/default/ufw; then
+                sed -i "s/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY=\"$UNINSTALL_UFW_FWD_ORIG\"/" /etc/default/ufw
+                print_ok "DEFAULT_FORWARD_POLICY восстановлен: $UNINSTALL_UFW_FWD_ORIG"
+            fi
+        fi
+    fi
+
+    # v4.0.0-hotfix (D12): metrics textfile collector output.
+    rm -f /var/lib/node_exporter/textfile_collector/shieldnode.prom \
+          /var/lib/node_exporter/textfile_collector/.shieldnode.prom.* 2>/dev/null || true
 
     print_header "UNINSTALL ЗАВЕРШЁН"
     echo "Бэкапы остались в /root/vpn-ddos-backup-*"
@@ -1829,6 +2255,56 @@ if mkdir -p "$INSTALL_LOG_DIR" 2>/dev/null && touch "$INSTALL_LOG" 2>/dev/null; 
     # Перенаправляем stdout И stderr в tee (видим на экране + пишем в лог).
     # Это ставится ДО первого print_* — все шаги установки попадут в файл.
     exec > >(tee -a "$INSTALL_LOG") 2>&1
+fi
+
+# ==============================================================================
+# v4.0.0-hotfix (D4): PRE-INSTALL SNAPSHOT для node-rollback
+# ==============================================================================
+# Снапшот ТЕКУЩЕГО состояния создаётся ЗДЕСЬ — в начале install-flow, после
+# определения install vs upgrade и ДО любых модификаций (до ШАГ 1).
+# Раньше снапшот создавался в ШАГ 12.14 — ПОСЛЕ того как install уже переписал
+# конфиги/юниты/ruleset, т.е. "откат" возвращал свежеустановленное состояние,
+# а не предыдущее рабочее (rollback был бессмысленным).
+#
+# Fresh-install → skip: снапшотим только если уже есть /etc/shieldnode
+# (предыдущая установка shieldnode) или /etc/nftables.d/ddos-protect.conf
+# (конфиг от прежнего vpn-node-setup стека). SHIELD_ROLLBACK читается из
+# limits.conf — он уже загружен выше (блок tunable limits).
+# Команда node-rollback и ротация keep-N — в ШАГ 12.14.
+
+if [ "${SHIELD_ROLLBACK:-1}" = "1" ] && \
+   { [ -d /etc/shieldnode ] || [ -f /etc/nftables.d/ddos-protect.conf ]; }; then
+    ROLLBACK_DIR=/var/lib/node-rollback
+    mkdir -p "$ROLLBACK_DIR"
+    chmod 0700 "$ROLLBACK_DIR"
+
+    # Имя: YYYYMMDD-HHMMSS-pre-v<version>
+    SNAP_TS=$(date +%Y%m%d-%H%M%S)
+    SNAP_NAME="${SNAP_TS}-pre-v${SHIELDNODE_VERSION}"
+    SNAP_FILE="$ROLLBACK_DIR/${SNAP_NAME}.tar.gz"
+
+    SNAP_STAGE=$(mktemp -d /tmp/shield-snap.XXXXXX)
+    # Файловые конфиги
+    mkdir -p "$SNAP_STAGE/etc"
+    [ -d /etc/shieldnode ] && cp -a /etc/shieldnode "$SNAP_STAGE/etc/" 2>/dev/null
+    [ -d /etc/nftables.d ] && cp -a /etc/nftables.d "$SNAP_STAGE/etc/" 2>/dev/null
+    [ -d /etc/sysctl.d ] && cp -a /etc/sysctl.d "$SNAP_STAGE/etc/" 2>/dev/null
+    mkdir -p "$SNAP_STAGE/etc/systemd/system"
+    for unit in /etc/systemd/system/shieldnode-* /etc/systemd/system/vpn-*; do
+        [ -f "$unit" ] && cp -a "$unit" "$SNAP_STAGE/etc/systemd/system/" 2>/dev/null
+    done
+    # Kernel nft state (для точного восстановления)
+    nft list ruleset > "$SNAP_STAGE/nft-ruleset.nft" 2>/dev/null || true
+
+    tar -czf "$SNAP_FILE" -C "$SNAP_STAGE" . 2>/dev/null
+    rm -rf "$SNAP_STAGE"
+
+    if [ -f "$SNAP_FILE" ]; then
+        SNAP_SIZE=$(du -h "$SNAP_FILE" | cut -f1)
+        print_ok "Pre-install snapshot: $SNAP_NAME ($SNAP_SIZE) → sudo node-rollback $SNAP_NAME"
+    fi
+else
+    print_info "Pre-install snapshot пропущен (fresh install или SHIELD_ROLLBACK=0)"
 fi
 
 # ==============================================================================
@@ -1887,6 +2363,12 @@ shield_fix_ufw_forward_for_docker(){
     local cur
     cur=$(grep -oE '^DEFAULT_FORWARD_POLICY="?(ACCEPT|DROP)"?' /etc/default/ufw 2>/dev/null | grep -oE 'ACCEPT|DROP' | head -1)
     [ "$cur" = "ACCEPT" ] && { print_ok "Docker есть, DEFAULT_FORWARD_POLICY уже ACCEPT — egress контейнеров защищён"; return 0; }
+    # v4.0.0-hotfix (D8): сохраняем исходное значение для uninstall-отката
+    # (uninstall читает его ДО rm -rf /var/lib/shieldnode).
+    if [ -n "$cur" ] && [ ! -f /var/lib/shieldnode/ufw-forward-policy.orig ]; then
+        mkdir -p /var/lib/shieldnode 2>/dev/null
+        echo "$cur" > /var/lib/shieldnode/ufw-forward-policy.orig 2>/dev/null || true
+    fi
     if grep -qE '^DEFAULT_FORWARD_POLICY=' /etc/default/ufw; then
         sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
     else
@@ -2002,18 +2484,49 @@ if [ -z "${PREINSTALL_SKIP:-}" ]; then
     read -t 300 -r WL_CHOICE < /dev/tty || WL_CHOICE=""
     case "${WL_CHOICE:-3}" in
         1)
-            printf '  URL панели Remnawave (https://panel.example.com): ' > /dev/tty
-            read -t 300 -r RW_URL_IN < /dev/tty || RW_URL_IN=""
-            printf '  API-токен (Remnawave Settings → API Tokens; ввод скрыт): ' > /dev/tty
-            read -t 300 -rs RW_TOK_IN < /dev/tty || RW_TOK_IN=""
-            printf '\n' > /dev/tty
-            RW_URL_IN="$(printf '%s' "$RW_URL_IN" | tr -d '[:space:]')"
-            if printf '%s' "$RW_URL_IN" | grep -qiE '^https?://[^/]' && [ -n "$RW_TOK_IN" ]; then
+            # v4.0.0-hotfix (U-L7): до 2 попыток ввода URL/токена — раньше
+            # одна опечатка = молчаливый полный пропуск fleet-sync. После
+            # второй неудачи — fallback на ручной ввод IP (как вариант 2).
+            RW_OK=0
+            for _rw_try in 1 2; do
+                printf '  URL панели Remnawave (https://panel.example.com): ' > /dev/tty
+                read -t 300 -r RW_URL_IN < /dev/tty || RW_URL_IN=""
+                printf '  API-токен (Remnawave Settings → API Tokens; ввод скрыт): ' > /dev/tty
+                read -t 300 -rs RW_TOK_IN < /dev/tty || RW_TOK_IN=""
+                printf '\n' > /dev/tty
+                RW_URL_IN="$(printf '%s' "$RW_URL_IN" | tr -d '[:space:]')"
+                if printf '%s' "$RW_URL_IN" | grep -qiE '^https?://[^/]' && [ -n "$RW_TOK_IN" ]; then
+                    RW_OK=1
+                    break
+                fi
+                [ "$_rw_try" -lt 2 ] && printf '  ⚠ URL должен быть http(s)://… и токен не пустым — попробуй ещё раз.\n' > /dev/tty
+            done
+            unset _rw_try
+            if [ "$RW_OK" = "1" ]; then
                 REMNAWAVE_URL="$RW_URL_IN"; REMNAWAVE_TOKEN="$RW_TOK_IN"
                 export REMNAWAVE_URL REMNAWAVE_TOKEN
                 print_ok "Remnawave fleet-sync будет включён — IP нод панели подтянутся в whitelist автоматически"
             else
-                print_warn "URL должен быть http(s)://… и токен не пустым — пропускаю токен. Включить позже: env REMNAWAVE_URL/REMNAWAVE_TOKEN при reinstall, либо sudo guard."
+                print_warn "URL/токен невалидны после 2 попыток — fleet-sync пропущен."
+                printf '  Fallback: введи IP нод/бриджей вручную через запятую (1.2.3.4,5.6.7.8), Enter = пропустить: ' > /dev/tty
+                read -t 300 -r BRIDGE_INPUT < /dev/tty || BRIDGE_INPUT=""
+                BRIDGE_IPS=$(echo "$BRIDGE_INPUT" | tr -d ' ')
+                if [ -n "$BRIDGE_IPS" ]; then
+                    VALID_IPS=""
+                    IFS=',' read -ra IP_ARR <<< "$BRIDGE_IPS"
+                    for ip in "${IP_ARR[@]}"; do
+                        # v3.18.11 SH-NEW-10: строгая валидация (отклоняет 0.0.0.0/0 etc)
+                        if validate_ipv4_or_cidr "$ip"; then
+                            VALID_IPS="${VALID_IPS:+$VALID_IPS,}$ip"
+                        else
+                            print_warn "Пропускаю невалидный IP: $ip (запрещены 0.0.0.0/x, multicast, prefix<8)"
+                        fi
+                    done
+                    BRIDGE_IPS="$VALID_IPS"
+                    [ -n "$BRIDGE_IPS" ] && print_ok "Bridge/node IPs будут добавлены в whitelist: $BRIDGE_IPS"
+                fi
+                [ -z "$BRIDGE_IPS" ] && \
+                    print_info "Включить позже: env REMNAWAVE_URL/REMNAWAVE_TOKEN при reinstall, либо sudo guard → settings."
             fi
             ;;
         2)
@@ -2243,6 +2756,89 @@ if [[ $EUID -ne 0 ]]; then
 fi
 print_ok "Запущен от root"
 
+# v4.0.0-hotfix (D9): подметаем старые re-exec копии pipe-режима
+# (/tmp/shieldnode.XXXXXX.sh от прошлых запусков, старше суток). Текущая копия
+# свежая → -mtime +1 её не трогает.
+find /tmp -maxdepth 1 -name 'shieldnode.*.sh' -mtime +1 -delete 2>/dev/null || true
+
+# audit C3 (T2-08, находки 16/17): marker незавершённого install.
+# Создаём в самом начале install-flow, снимаем ТОЛЬКО в самом конце
+# успешного install (перед финальным summary). Если нода ушла в reboot
+# посреди установки — marker остаётся, и при загрузке
+# shieldnode-boot-repair.service (ниже) починит dpkg и попытается
+# поднять защиту. Marker boot-repair НЕ снимает — его снимает только
+# успешный полный прогон установщика.
+INSTALL_MARKER="/var/lib/shieldnode/.install-in-progress"
+mkdir -p /var/lib/shieldnode
+date -u +%FT%TZ > "$INSTALL_MARKER" 2>/dev/null || true
+
+# v4.0.0-hotfix (U-M6): контролируемые FATAL-exit'ы установщика (disk space,
+# apt-lock, firewall check, nft parse-fail, placeholder-check и т.п.) снимают
+# marker перед выходом — иначе после обычной перезагрузки boot-repair ложно
+# пугал «reboot посреди install» и гонял dpkg-repair без причины. Marker
+# остаётся только при НЕконтролируемом прерывании (reboot, kill -9, паника).
+shield_install_fatal_exit() {
+    rm -f "$INSTALL_MARKER" 2>/dev/null || true
+    exit "${1:-1}"
+}
+
+cat > /usr/local/sbin/shieldnode-boot-repair.sh <<'BOOT_REPAIR_EOF'
+#!/bin/bash
+# shieldnode-boot-repair — recovery после reboot посреди install (audit C3).
+# Запускается oneshot'ом при загрузке если marker существует.
+# Чинит dpkg (half-configured пакеты) и пытается поднять ядерную защиту.
+# Marker НЕ снимаем: это делает только успешный полный install — оператор
+# должен перезапустить shieldnode заново (notify WARN ниже).
+set -o pipefail
+export LANG=C LC_ALL=C
+TAG="shieldnode-boot-repair"
+MARKER="/var/lib/shieldnode/.install-in-progress"
+
+[ -f "$MARKER" ] || exit 0
+
+logger -t "$TAG" "WARN: обнаружен незавершённый install (marker $MARKER) — запускаю repair"
+
+# dpkg repair (bounded, без stdin — на живой консоли не висим)
+DEBIAN_FRONTEND=noninteractive timeout 300 dpkg --configure -a </dev/null >/dev/null 2>&1 || \
+    logger -t "$TAG" "WARN: dpkg --configure -a завершился с ошибкой (timeout 300 или поломка пакетов)"
+DEBIAN_FRONTEND=noninteractive timeout 300 apt-get -f install -y </dev/null >/dev/null 2>&1 || \
+    logger -t "$TAG" "WARN: apt-get -f install завершился с ошибкой"
+
+# Поднимаем ядерную защиту если конфиг валиден (best-effort)
+if systemctl start shieldnode-nftables.service 2>/dev/null; then
+    logger -t "$TAG" "shieldnode-nftables поднят — защита активна (last-known-good конфиг)"
+else
+    logger -t "$TAG" "WARN: shieldnode-nftables не поднялся — защита НЕ активна"
+fi
+
+# Marker намеренно оставляем + WARN в notify: install надо перезапустить.
+/usr/local/sbin/shieldnode-notify.sh warn "install-incomplete" \
+    "Незавершённый install shieldnode (reboot во время установки): dpkg починен, защита поднята best-effort. ЗАПУСТИТЕ shieldnode заново для полного завершения." \
+    2>/dev/null || true
+logger -t "$TAG" "repair завершён; marker оставлен — требуется повторный запуск установщика"
+exit 0
+BOOT_REPAIR_EOF
+chmod 0755 /usr/local/sbin/shieldnode-boot-repair.sh
+
+cat > /etc/systemd/system/shieldnode-boot-repair.service <<'BOOT_REPAIR_UNIT_EOF'
+[Unit]
+Description=shieldnode boot repair (interrupted install recovery)
+# Срабатывает только если marker незавершённого install существует.
+ConditionPathExists=/var/lib/shieldnode/.install-in-progress
+After=local-fs.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/shieldnode-boot-repair.sh
+
+[Install]
+WantedBy=multi-user.target
+BOOT_REPAIR_UNIT_EOF
+systemctl daemon-reload 2>/dev/null || true
+systemctl enable shieldnode-boot-repair.service >/dev/null 2>&1 || true
+print_ok "Boot-repair: marker $INSTALL_MARKER + shieldnode-boot-repair.service (recovery при reboot посреди install)"
+
 # v3.18.8: проверка свободного места ДО любых установок и записей.
 # Без этого на full disk: apt падает посреди dpkg, sqlite events.db не создаётся
 # (но 2>/dev/null глушит ошибку), aggregator уходит в restart-loop, защита
@@ -2256,17 +2852,8 @@ check_disk_space() {
         # df -BM выдаёт колонку Available с суффиксом 'M'
         avail=$(df -BM "$mp" 2>/dev/null | awk 'NR==2 {gsub("M","",$4); print $4+0}')
         if [ -z "$avail" ] || [ "$avail" -lt "$need_mb" ]; then
-            # v3.23.17: частая причина переполнения /var — старый pcap-ring в /var/log/pcap
-            # (strftime-имена + -W не удалял файлы). Чистим legacy и пере-меряем.
-            if [ "$mp" = "/var" ]; then
-                find /var/log/pcap -maxdepth 1 -type f -name 'syn-*.pcap' -delete 2>/dev/null || true
-                avail=$(df -BM "$mp" 2>/dev/null | awk 'NR==2 {gsub("M","",$4); print $4+0}')
-            fi
-        fi
-        if [ -z "$avail" ] || [ "$avail" -lt "$need_mb" ]; then
             print_error "FATAL: $mp имеет ${avail:-0} MB свободно, нужно >= ${need_mb} MB"
-            print_info "Очисти: sudo find /var/log/pcap -name 'syn-*.pcap' -delete   # частая причина (старый pcap-ring)"
-            print_info "       sudo du -sh /var/log/pcap /var/lib/shieldnode/* 2>/dev/null | sort -h"
+            print_info "Очисти: sudo du -sh /var/log/* /var/lib/shieldnode/* 2>/dev/null | sort -h | tail"
             print_info "       sudo journalctl --vacuum-size=100M"
             print_info "       sudo apt-get clean && sudo apt-get autoremove -y"
             return 1
@@ -2275,7 +2862,17 @@ check_disk_space() {
     print_ok "Disk space: /var=$(df -BM /var 2>/dev/null | awk 'NR==2{print $4}'), /etc=$(df -BM /etc 2>/dev/null | awk 'NR==2{print $4}'), /tmp=$(df -BM /tmp 2>/dev/null | awk 'NR==2{print $4}')"
     return 0
 }
-check_disk_space || exit 1
+# v4.0.0 REAPER (фаза 1, до disk-check): pcap-стек удалён — освобождаем диск от
+# legacy ring/archive ДО FATAL-проверки места (инцидент: 72G+23G на нодах →
+# upgrade упирался бы в "no space left"). Сначала stop writer'ов, потом rm.
+# Полная дочистка (юниты, скрипт, state, logrotate) — в ШАГ 1.5 (фаза 2).
+if [ -d /var/log/pcap ] || [ -d /var/lib/shieldnode/pcap-archive ]; then
+    systemctl disable --now shieldnode-pcap-archiver.timer shieldnode-pcap.service >/dev/null 2>&1 || true
+    rm -rf /var/log/pcap /var/lib/shieldnode/pcap-archive
+    print_info "v4.0.0: legacy pcap ring/archive удалены до disk-check (feature removed)"
+fi
+
+check_disk_space || shield_install_fatal_exit 1
 
 # v2.8: ждём пока apt освободится (unattended-upgrades на свежих VPS)
 wait_for_apt_lock() {
@@ -2384,13 +2981,13 @@ ensure_latest_apt(){   # $1=пакет, $2=опц. сервис для рест�
 }
 
 # Проверяем apt lock перед любыми установками
-wait_for_apt_lock || exit 1
+wait_for_apt_lock || shield_install_fatal_exit 1
 
 if ! command -v nft >/dev/null 2>&1; then
     print_status "Устанавливаю nftables..."
     if ! DEBIAN_FRONTEND=noninteractive apt-get install -y nftables; then
         print_error "Не удалось установить nftables"
-        exit 1
+        shield_install_fatal_exit 1
     fi
     # v3.18.8 UFW-FIX: пакет nftables кладёт /etc/nftables.conf с `flush ruleset`.
     # Если nftables.service запустится (ребут / unattended-upgrades / другой пакет
@@ -2445,14 +3042,14 @@ fi
 
 # v3.26.5: подтягиваем уже установленные управляемые зависимости до последней версии репо
 # (security-патчи дистрибутива). Только установленные пакеты; gated SHIELD_UPGRADE_DEPS.
-for _dep in nftables conntrack iproute2 tcpdump sqlite3 jq curl zstd xz-utils psmisc; do
+for _dep in nftables conntrack iproute2 sqlite3 jq curl xz-utils psmisc; do
     ensure_latest_apt "$_dep"
 done
 
 if ! nft list ruleset >/dev/null 2>&1; then
     print_error "nft list ruleset не работает — нет ядерных модулей nftables"
     print_error "Это бывает на OpenVZ/LXC. На KVM не должно встречаться."
-    exit 1
+    shield_install_fatal_exit 1
 fi
 print_ok "nftables ядерные модули работают"
 
@@ -2670,11 +3267,12 @@ net.netfilter.nf_conntrack_udp_timeout_stream = 600
 # nf_conntrack_tcp_timeout_established=432000). На атаке копятся десятки тысяч
 # мёртвых записей (наблюдалось 72000 при 2270 живых сокетах) → давление на
 # conntrack и память. Срезаем idle-таймауты: брошенные дохнут за ~30 мин,
-# живые сессии с трафиком/keepalive сбрасывают таймер и переживают. acct=1
-# оставлен для диагностики (per-flow байты в conntrack); ctguard v3.26 отделяет
-# фантом-холдеров по ЖИВЫМ сокетам (ss vs conntrack), не по байтам. Это
-# nf_conntrack-зона, НЕ tcp_*-сокеты (их по-прежнему ведёт setup).
-net.netfilter.nf_conntrack_acct = 1
+# живые сессии с трафиком/keepalive сбрасывают таймер и переживают.
+# v4.0.0-hotfix (находка 25): acct=0 — per-flow accounting читал только ctguard
+# (удалён в v3.37.0); зомби-ключ стоил CPU на каждом пакете. Если нужна
+# диагностика per-flow байт — временно `sysctl -w ...acct=1`.
+# Это nf_conntrack-зона, НЕ tcp_*-сокеты (их по-прежнему ведёт setup).
+net.netfilter.nf_conntrack_acct = 0
 net.netfilter.nf_conntrack_tcp_loose = 0
 # v3.30.3: est-timeout = 14400 (4ч). Выше любого наблюдаемого idle живых коннектов
 # (по проду max ~583с, p99≤361с) с большим запасом, но вдвое короче суток → мёртвые/
@@ -2686,7 +3284,51 @@ net.netfilter.nf_conntrack_tcp_timeout_close_wait = 30
 net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 30
 net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
 net.netfilter.nf_conntrack_tcp_timeout_last_ack = 30
+# NB: net.netfilter.nf_conntrack_max дописывается ПОСЛЕ этого heredoc
+# (tier-aware по RAM — значение вычисляется в bash, quoted heredoc не
+# подставляет переменные). hashsize задаётся через
+# /etc/modprobe.d/shieldnode-conntrack.conf (max/4).
 SYSCTL_EOF
+
+# v4.0.0-hotfix (находка 25): tier-aware sizing nf_conntrack_max по RAM.
+# Раньше shieldnode только ПРЕДУПРЕЖДАЛ в self-test («upgrade vpn-node-setup»)
+# — межскриптовая дыра владения: на standalone-ноде никто не выставлял max
+# (дефолт ядра 65536 заполнялся за секунды при spoofed SYN/UDP-флуде →
+# "nf_conntrack: table full" для ЛЕГИТИМНЫХ). ~300+ байт на запись —
+# даже tier 1048576 это ~330MB worst-case, реально намного меньше.
+# КООРДИНАЦИЯ ВЛАДЕНИЯ: nf_conntrack_max/hashsize теперь принадлежат
+# shieldnode (этот блок). vpn-node-setup владеет tcp_*-сокетами и UDP-таймаутами
+# базы (80-vpn-node-tuning.conf); если setup тоже пишет nf_conntrack_max —
+# выигрывает 90-shieldnode.conf (по алфавиту применяется позже).
+_CT_RAM_MB=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)
+if [ "$_CT_RAM_MB" -lt 2048 ]; then
+    SHIELD_CT_MAX_TIER=131072
+elif [ "$_CT_RAM_MB" -lt 4096 ]; then
+    SHIELD_CT_MAX_TIER=262144
+elif [ "$_CT_RAM_MB" -lt 8192 ]; then
+    SHIELD_CT_MAX_TIER=524288
+else
+    SHIELD_CT_MAX_TIER=1048576
+fi
+echo "net.netfilter.nf_conntrack_max = $SHIELD_CT_MAX_TIER" >> "$SYSCTL_FILE"
+print_info "nf_conntrack_max: tier по RAM (${_CT_RAM_MB}MB) → $SHIELD_CT_MAX_TIER"
+
+# hashsize = max/4 (иначе длинные цепочки корзин → деградация lookup).
+# hashsize — параметр МОДУЛЯ nf_conntrack (не sysctl): задаётся при загрузке
+# модуля через modprobe.d (persistent на reboot) + на лету через sysfs.
+SHIELD_CT_HASHSIZE=$((SHIELD_CT_MAX_TIER / 4))
+cat > /etc/modprobe.d/shieldnode-conntrack.conf <<EOF
+# Generated by shieldnode (v4.0.0-hotfix): conntrack hash table sizing.
+# hashsize = nf_conntrack_max/4 = $SHIELD_CT_HASHSIZE (tier по RAM ${_CT_RAM_MB}MB).
+# Применяется при загрузке модуля nf_conntrack (boot). Runtime — sysfs ниже.
+options nf_conntrack hashsize=$SHIELD_CT_HASHSIZE
+EOF
+if [ -w /sys/module/nf_conntrack/parameters/hashsize ]; then
+    echo "$SHIELD_CT_HASHSIZE" > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null && \
+        print_ok "nf_conntrack hashsize: $SHIELD_CT_HASHSIZE (runtime, sysfs)" || \
+        print_warn "hashsize runtime-write не удался — применится после ребута (modprobe.d записан)"
+fi
+unset _CT_RAM_MB
 
 # Применяем
 if sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1; then
@@ -2806,7 +3448,7 @@ if [ -z "$FIREWALL_TYPE" ]; then
     print_warn ""
     print_warn "Когда UFW активен, запусти этот скрипт повторно."
     print_warn "Скрипт защитит ВСЕ порты которые ты открыл (кроме SSH)."
-    exit 1
+    shield_install_fatal_exit 1
 fi
 
 BACKUP_DIR="/root/vpn-ddos-backup-$(date +%Y%m%d-%H%M%S)"
@@ -2894,6 +3536,8 @@ fi
 # v3.20.0+: удалить старые fail counter'ы
 rm -f /var/lib/shieldnode/mobile_ru_fail_count 2>/dev/null
 rm -f /var/lib/shieldnode/broadband_ru_fail_count 2>/dev/null
+# v4.0.0-hotfix (D7б): peak-state файлы удалённых mobile_ru/broadband_ru whitelist'ов
+rm -f /var/lib/shieldnode/.peak-mobile_ru /var/lib/shieldnode/.peak-broadband_ru 2>/dev/null
 
 # 8) v3.30.5: SYNPROXY вырезан из скрипта целиком. Реапер БЕЗУСЛОВНО снимает остатки
 #    прошлых установок (table shield_synproxy, synproxy.nft, 99-sysctl, сервис,
@@ -2917,6 +3561,103 @@ if true; then
         modprobe -r nf_synproxy 2>/dev/null || true
         print_ok "SYNPROXY-остатки сняты реапером (SYNPROXY удалён в v3.30.5; be_liberal→0)"
     fi
+fi
+
+# 9) v4.0.0 REAPER (фаза 2): PCAP-стек вырезан целиком (MAJOR). Дочистка после
+#    фазы 1 (которая уже сняла ring/archive до disk-check): unit-файлы,
+#    OnFailure drop-in'ы, archiver-скрипт, state, logrotate. Идемпотентно.
+_pc_found=0
+for _pc_unit in shieldnode-pcap-archiver.timer shieldnode-pcap-archiver.service shieldnode-pcap.service; do
+    if [ -f "/etc/systemd/system/$_pc_unit" ] || [ -d "/etc/systemd/system/${_pc_unit}.d" ] || \
+       systemctl list-unit-files "$_pc_unit" 2>/dev/null | grep -q "$_pc_unit"; then
+        _pc_found=1
+        systemctl disable --now "$_pc_unit" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/$_pc_unit"
+        rm -rf "/etc/systemd/system/${_pc_unit}.d"
+    fi
+done
+for _pc_f in /usr/local/sbin/shieldnode-pcap-archiver.sh /etc/logrotate.d/shieldnode-pcap \
+             /run/shieldnode/pcap-unit-hash /var/lib/shieldnode/.pcap-arch-state; do
+    [ -e "$_pc_f" ] && { _pc_found=1; rm -f "$_pc_f"; }
+done
+for _pc_d in /var/log/pcap /var/lib/shieldnode/pcap-archive; do
+    [ -d "$_pc_d" ] && { _pc_found=1; rm -rf "$_pc_d"; }
+done
+if [ "$_pc_found" = "1" ]; then
+    LEGACY_FOUND=1
+    print_ok "v4.0.0: pcap-стек снят реапером (юниты, скрипт, ring, архивы, state)"
+fi
+
+# 10) v4.0.0-hotfix: TARPIT удалён целиком (фича была мёртва — правила шли в
+#    несуществующий chain input таблицы ddos_protect, tarpit_caught никогда не
+#    наполнялся). Реапер для нод, где tarpit уже стоял: гасим endlessh, сносим
+#    наш юнит (+drop-in'ы) и конфиг, удаляем осиротевший nft set tarpit_caught
+#    (best-effort), вычищаем ключи SHIELD_TARPIT* из limits.conf. Пакет
+#    endlessh НЕ purge'им (прецедент tcpdump): apt purge endlessh — по желанию.
+#    Идемпотентно, на свежей ноде no-op.
+_tp_found=0
+if systemctl list-unit-files endlessh.service 2>/dev/null | grep -q endlessh || \
+   [ -f /etc/systemd/system/endlessh.service ] || [ -d /etc/systemd/system/endlessh.service.d ]; then
+    _tp_found=1
+    systemctl disable --now endlessh.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/endlessh.service
+    rm -rf /etc/systemd/system/endlessh.service.d
+fi
+# Наш конфиг (писал shieldnode); пакетный /etc/endlessh* пусть живёт с пакетом.
+if [ -f /etc/endlessh/config ] && grep -q 'управляется shieldnode' /etc/endlessh/config 2>/dev/null; then
+    _tp_found=1
+    rm -f /etc/endlessh/config
+fi
+# Осиротевший set из старой установки (best-effort: таблица может отсутствовать
+# до ШАГа 4 на свежем install — тогда no-op).
+if nft list set inet ddos_protect tarpit_caught >/dev/null 2>&1; then
+    _tp_found=1
+    nft delete set inet ddos_protect tarpit_caught 2>/dev/null || true
+fi
+# Ключи SHIELD_TARPIT* из существующего limits.conf (оставляем комментарии —
+# они безвредны; удаляем только активные присваивания).
+if [ -f /etc/shieldnode/limits.conf ] && grep -qE '^SHIELD_TARPIT' /etc/shieldnode/limits.conf 2>/dev/null; then
+    _tp_found=1
+    sed -i '/^SHIELD_TARPIT=/d;/^SHIELD_TARPIT_PORT=/d;/^SHIELD_TARPIT_BAN_HOURS=/d' /etc/shieldnode/limits.conf
+fi
+if [ "$_tp_found" = "1" ]; then
+    LEGACY_FOUND=1
+    systemctl daemon-reload 2>/dev/null || true
+    print_ok "v4.0.0-hotfix: tarpit-остатки сняты реапером (endlessh юнит/конфиг, tarpit_caught set, SHIELD_TARPIT* ключи)"
+    print_info "Пакет endlessh оставлен (не purge'им, как tcpdump): apt purge endlessh — по желанию"
+fi
+
+# 11) v4.0.0-hotfix (D7б): rsyslog kern-dedup drop-in — раньше ставился для
+#    дедупликации kernel-логов nft (под pcap/verbose-стек). Сейчас не нужен:
+#    rate-limit 1/sec на log-prefix'ах делает то же самое на уровне правил.
+if [ -f /etc/rsyslog.d/49-shieldnode-kern-dedup.conf ]; then
+    LEGACY_FOUND=1
+    rm -f /etc/rsyslog.d/49-shieldnode-kern-dedup.conf
+    systemctl restart rsyslog 2>/dev/null || true
+    print_ok "Удалён legacy /etc/rsyslog.d/49-shieldnode-kern-dedup.conf"
+fi
+
+# v4.0.0-hotfix (D7в): миграционная зачистка limits.conf — активные ключи
+# вырезанных в v4.0.0 стеков (SHIELD_PCAP_*, SHIELD_CTG_*) мертвы и путают
+# оператора. Комментарии (# ...) не трогаем. Только если файл есть (upgrade).
+if [ -f /etc/shieldnode/limits.conf ] && grep -qE '^SHIELD_(PCAP|CTG)_' /etc/shieldnode/limits.conf 2>/dev/null; then
+    LEGACY_FOUND=1
+    sed -i '/^SHIELD_PCAP_/d;/^SHIELD_CTG_/d' /etc/shieldnode/limits.conf
+    print_ok "limits.conf: удалены мёртвые ключи SHIELD_PCAP_*/SHIELD_CTG_* (стеки вырезаны в v4.0.0)"
+fi
+
+# 12) v4.0.0-hotfix (O6): shieldnode-metrics.timer слит в aggregator —
+#    metrics.sh вызывается из конца тика shieldnode-aggregator (минус один
+#    timer + service-прогон в минуту). Таймер больше не создаётся; снимаем
+#    с существующих нод (идемпотентно). shieldnode-metrics.service ОСТАЁТСЯ
+#    (ручной запуск / совместимость). Проверка и по unit-файлу, и по
+#    list-unit-files — на случай enabled-симлинка без юнита.
+if [ -f /etc/systemd/system/shieldnode-metrics.timer ] || \
+   systemctl list-unit-files shieldnode-metrics.timer 2>/dev/null | grep -q '^shieldnode-metrics\.timer'; then
+    LEGACY_FOUND=1
+    systemctl disable --now shieldnode-metrics.timer >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/shieldnode-metrics.timer
+    print_ok "shieldnode-metrics.timer снят (v4.0.0-hotfix O6: метрики тикают из aggregator'а, service оставлен)"
 fi
 
 if [ "$LEGACY_FOUND" = "1" ]; then
@@ -3256,7 +3997,7 @@ if [ -z "$PROTECTED_TCP" ] && [ -z "$PROTECTED_UDP" ]; then
     print_error "В фаерволе нет открытых портов (кроме SSH)."
     print_error "Скрипту нечего защищать. Открой VPN-порт в фаерволе и запусти повторно."
     print_info "Пример: ${BOLD}ufw allow 443${NC}"
-    exit 1
+    shield_install_fatal_exit 1
 fi
 
 # Объединяем для совместимости (старые места в скрипте)
@@ -3571,7 +4312,7 @@ if [ ! -f "$SHIELD_LIMITS_FILE" ]; then
 
 # ─── Авто-апгрейд зависимостей (v3.26.5) ───
 # 1 = при install/upgrade держать УЖЕ установленные управляемые пакеты (nftables,
-# conntrack, iproute2, tcpdump, sqlite3, jq, curl, zstd, xz-utils, crowdsec + баунсер)
+# conntrack, iproute2, sqlite3, jq, curl, xz-utils, crowdsec + баунсер)
 # на последней версии из репо (security-патчи). Апгрейд только если репо-версия новее
 # (downgrade исключён). 0 = заморозить версии. Можно и разово: SHIELD_UPGRADE_DEPS=0 bash shieldnode.sh
 SHIELD_UPGRADE_DEPS=1
@@ -3621,8 +4362,6 @@ SHIELD_CUSTOM_LOCAL_TTL_DAYS=90
 
 # ─── Retention ───
 SHIELD_EVENTS_DB_RETENTION_DAYS=90
-SHIELD_PCAP_RETENTION_DAYS=30
-SHIELD_PCAP_TRIGGER_DROPS=10000
 
 # ─── Aggregator (защита от RAM blow-up при rotating-IP storm) ───
 # JOURNAL_LINES — лимит на journalctl --lines (cap per-tick).
@@ -3637,17 +4376,6 @@ SHIELD_AGG_MAX_UNIQUE_IPS=50000
 #     будет остановлен и удалён при следующем install/upgrade).
 # После смены значения: sudo guard upgrade (или перезапуск shieldnode.sh).
 SHIELD_METRICS=1
-
-# ─── Tarpit (v3.33.0) ───
-# endlessh на фейковом порту. Кто стучится — 100% сканер (легитимные
-# пользователи порт не знают) → IP в tarpit_caught set на 24h, полный DROP.
-# Zero false positives by design. Ресурсы: endlessh ~1MB RAM, всегда.
-# 1 = включено, 0 = выключено.
-SHIELD_TARPIT=1
-# Порт-ловушка. Выбирай НЕзанятый (не SSH, не VPN, не 80/443).
-SHIELD_TARPIT_PORT=8022
-# Сколько часов IP из tarpit_caught в полном DROP.
-SHIELD_TARPIT_BAN_HOURS=24
 
 # ─── API (v3.33.0) ───
 # Unix-socket API: socat - UNIX-CONNECT:/run/shieldnode/api.sock
@@ -3676,6 +4404,18 @@ SHIELD_CS_HUB_UPDATE=1
 SHIELD_EARLYOOM=1
 # chrony + NTS: шифрованное время (~3MB RAM)
 SHIELD_CHRONY=1
+
+# ─── Feed mirror (v4.0.0-hotfix) ───
+# SHIELD_FEED_MIRROR — зеркало-префикс вместо https://raw.githubusercontent.com/
+# во всех feed-URL (shieldnode-defaults.sh → update-blocklist.sh) и в
+# seed-скачиваниях (SHIELD_REPO_URL). Работает и отсюда: limits.conf
+# source'ится ДО mirror-блоков — применится при следующем install/upgrade
+# (sudo guard upgrade). На РФ-ноде при недоступности raw.githubusercontent.com
+# раскомментируй и запусти guard upgrade:
+#SHIELD_FEED_MIRROR="https://mirror.example.com/"
+# Разовый override без правки файла:
+#   SHIELD_FEED_MIRROR="https://mirror.example.com/" sudo bash shieldnode.sh
+# Для точечного override списков без reinstall — REMOTE_BLOCKLISTS в shieldnode.conf.
 LIMITS_EOF
     chmod 0640 "$SHIELD_LIMITS_FILE"
     chown root:root "$SHIELD_LIMITS_FILE"
@@ -3697,8 +4437,7 @@ shield_ensure_numeric SHIELD_RATE_SYN_BURST 3000
 shield_ensure_numeric SHIELD_RATE_UDP_BURST 20000
 shield_ensure_numeric SHIELD_SSH_CT_LIMIT 5
 shield_ensure_numeric SHIELD_SSH_NEWCONN_BURST 20
-# Re-compute derived (после возможной правки SHIELD_CT_CONN_FLOOD)
-SHIELD_CT_CONN_FLOOD_MINUS_1=$((SHIELD_CT_CONN_FLOOD - 1))
+# (v4.0.0-hotfix: re-compute SHIELD_CT_CONN_FLOOD_MINUS_1 удалён — connwatch выпилен.)
 
 # v3.8: подготовка conditional-правил для nft template.
 # fib anti-spoofing — только на single-homed VPS.
@@ -3726,16 +4465,15 @@ fi
 # v3.20.5: priorities захардкожены под standalone-режим.
 # Forward chain удалён (см. Patch S1 ниже — MSS clamp принадлежит vpn-node-setup),
 # поэтому SHIELD_FORWARD_PRIO больше не используется в nft-конфиге.
-# Prerouting priority -100 применяется ко всем нодам одинаково.
-# Если оператор явно поставил PANEL_TYPE != "none" в pre-install.conf или
-# через env var — используем compat priority -150 для prerouting.
-if [ "${PANEL_TYPE:-none}" != "none" ]; then
-    SHIELD_PREROUTING_PRIO="-150"
-    print_info "PANEL_TYPE=$PANEL_TYPE — compat prerouting priority -150 (manual override)"
-else
-    SHIELD_PREROUTING_PRIO="-100"
-    print_info "Standalone — prerouting priority -100"
-fi
+# v4.0.0-hotfix (находка 23): prerouting priority -150 ВСЕГДА (условие по
+# PANEL_TYPE убрано). Standalone -100 численно совпадал с nat/dstnat (-100),
+# который держит docker (iptables-nft) — при равном priority порядок исполнения
+# = порядок регистрации hook'ов (хрупко при ручном nft / bouncer pre-inst
+# flush). -150 (раньше dstnat, после mangle) снимает коллизию и гарантирует,
+# что наши per-IP лимиты видят pre-DNAT dport вне зависимости от порядка
+# регистрации.
+SHIELD_PREROUTING_PRIO="-150"
+print_info "Prerouting priority: -150 (унифицировано, избегаем коллизии с docker dstnat -100)"
 
 # v3.23.0: generation of log prefix blocks based on SHIELDNODE_VERBOSE_LOGS.
 # При =0 (default) — лог-правила НЕ генерируются. Counter+drop остаются на своих
@@ -3850,30 +4588,42 @@ else
         add @suspect_v4 { ip saddr }'
 fi
 
-cat > "$NFT_DDOS_CONF" <<EOF
+# v4.0.0-hotfix (находка 16, часть): АТОМАРНАЯ запись ddos-protect.conf.
+# Раньше `cat >` писал прямо в боевой путь — обрыв записи (100% диск, сигнал,
+# OOM) оставлял обрезанный конфиг, и shieldnode-nftables.service
+# (ExecStartPre=nft -c) падал при следующем старте/ребуте до ручного фикса.
+# Теперь: tmp-файл в ТОМ ЖЕ каталоге (rename атомарен в пределах одной ФС) →
+# nft -c parse-check tmp → mv. При провале parse — rm tmp, exit 1, боевой
+# конфиг не тронут.
+NFT_DDOS_CONF_TMP="${NFT_DDOS_CONF}.tmp.$$"
+rm -f "$NFT_DDOS_CONF_TMP"
+cat > "$NFT_DDOS_CONF_TMP" <<EOF
 #!/usr/sbin/nft -f
-# Generated by vpn-node-ddos-protect.sh v1.4
-# Kernel-level SYN flood protection on Xray ports: $XRAY_PORTS
+# Generated by shieldnode.sh v${SHIELDNODE_VERSION}
+# Kernel-level DDoS protection on VPN ports: $XRAY_PORTS
 # SSH port $SSH_PORT excluded from rate-limit.
 #
-# v1.4: rate-limit 60/sec burst 100 — даёт запас для CGNAT-юзеров мобильных
-# операторов, где сотни легитимных пользователей могут сидеть за одним IP.
-# Реальный SYN-flood делает тысячи SYN/sec — лимит 60 их режет, но
-# обычных юзеров не трогает.
+# Актуальные лимиты (тюнинг: /etc/shieldnode/limits.conf → sudo guard upgrade):
+#   SYN flood:  $SHIELD_RATE_SYN (burst $SHIELD_RATE_SYN_BURST) — запас для
+#               CGNAT-юзеров мобильных операторов (сотни легитимных за одним
+#               IP); реальный SYN-flood делает тысячи SYN/sec.
+#   New-conn:   $SHIELD_RATE_NEWCONN (burst $SHIELD_RATE_NEWCONN_BURST)
+#   UDP:        $SHIELD_RATE_UDP (burst $SHIELD_RATE_UDP_BURST)
+#   Conntrack:  $SHIELD_CT_CONN_FLOOD entries per-IP
 #
-# v1.3: scanner_blocklist drop'ает известных сканеров (Shodan, Censys,
-# госсканеры) ДО rate-limit. Они даже не доходят до handshake.
-# Списки обновляются каждые 6 часов через scanner-blocklist-update.timer.
+# scanner_blocklist drop'ает известных сканеров (Shodan, Censys, госсканеры)
+# ДО rate-limit — они даже не доходят до handshake. Списки обновляются
+# таймером shieldnode-update@scanner.timer (systemctl list-timers).
 #
 # Whitelist в ЭТОЙ таблице — manual_whitelist_v4. v3.37.0: единственный
 # писатель set'а — shieldnode-whitelist-updater (мержит whitelist-local.txt
 # + mgmt-IP из UFW 'ALLOW from <IP>', которые update-protected-ports.sh
 # складывает в /run/shieldnode/mgmt-auto-v4.txt).
 #
-# Test:    hping3 -S -p ${XRAY_PORTS%%,*} -i u100 <YOUR_VPN_IP>
-# Monitor: nft list set inet ddos_protect syn_flood_v4
-#          nft list set inet ddos_protect scanner_blocklist_v4 | wc -l
-# Remove:  bash vpn-node-ddos-protect-v3_5.sh --uninstall
+# Test:      hping3 -S -p ${XRAY_PORTS%%,*} -i u100 <YOUR_VPN_IP>
+# Monitor:   nft list set inet ddos_protect syn_flood_v4
+#            nft list set inet ddos_protect scanner_blocklist_v4 | wc -l
+# Uninstall: sudo bash shieldnode.sh --uninstall
 
 # Идемпотентность
 table inet ddos_protect
@@ -3999,14 +4749,10 @@ $XRAY_PORTS_UDP_INIT
         size 65536
     }
 
-    # v3.24.2: connwatch_v4 — отдельный per-source-IP ct-count для LOG-правила
-    # near-threshold (X-1), чтобы лог НЕ матчился глобально. Без timeout (как
-    # connlimit_v4 — conntrack timers cleanup'ят сами). Не дропает, не банит.
-    set connwatch_v4 {
-        type ipv4_addr
-        flags dynamic
-        size 65536
-    }
+    # v4.0.0-hotfix (O4): set connwatch_v4 УДАЛЁН — второй ct-count dynset
+    # существовал только ради near-threshold лога [shield:conn_flood] (X-1) и
+    # стоил ~25% dynset-операций hot path. Log-атрибуция near-threshold удалена
+    # осознанно; реальные дропы покрывает counter conn_flood_v4 ниже.
 
     # v3.21.0: SSH-СПЕЦИФИЧНЫЕ сеты для pre-auth flood защиты.
     # ПРОБЛЕМА: SSH-порт ранее был полностью исключён из prerouting
@@ -4135,6 +4881,7 @@ $INFRASTRUCTURE_V6_INIT
     counter newconn_flood_v4 { }  # >50 new conn/min на src
     counter global_newconn_drop { } # v3.27.0 FIX(#3): глобальный new-conn backstop (opt-in SHIELD_GLOBAL_NEWCONN_CEIL)
     counter tcp_invalid { }       # invalid TCP flag combos
+    counter ct_invalid_v4 { }     # v4.0.0-hotfix: ct state invalid drops (out-of-window/ACK-flood)
     # v3.21.0: SSH pre-auth flood counters (v3.21.4: лимиты ужесточены)
     counter ssh_conn_flood_v4 { }     # ct count > 3 на src для SSH-порта (было 5 до v3.21.4)
     counter ssh_newconn_flood_v4 { }  # > 5 new conn/min на src для SSH-порта (было 10 до v3.21.4)
@@ -4147,9 +4894,9 @@ $INFRASTRUCTURE_V6_INIT
 
     chain prerouting {
         # v3.18.1: priority динамический ($SHIELD_PREROUTING_PRIO).
-        # Если есть VPN-панель (Remnawave/Marzban/3x-ui) — используем -150
-        # чтобы не конфликтовать с её 'priority dstnat' (=-100) для DSTNAT
-        # маршрутизации клиентов VLESS. Если панели нет — -100 (стандарт).
+        # v4.0.0-hotfix: всегда -150 — чтобы не конфликтовать с
+        # 'priority dstnat' (=-100) VPN-панелей/docker для DSTNAT
+        # маршрутизации клиентов VLESS (equal-priority порядок хрупок).
         type filter hook prerouting priority $SHIELD_PREROUTING_PRIO; policy accept;
 
         # Established/related — пропускаем без проверок.
@@ -4161,6 +4908,14 @@ $INFRASTRUCTURE_V6_INIT
         # v3.28.0: ноды флота из Remnawave-панели (auto-discovery) — свои серверы,
         # bypass всех лимитов как whitelist. Пустой сет = no-op.
         ip saddr @remnawave_nodes_v4 counter name remnawave_nodes_pass_v4 accept
+
+        # v4.0.0-hotfix (T4-5): ct state invalid drop — ПОСЛЕ established и
+        # whitelist-accept'ов (порядок: established → whitelist → invalid drop).
+        # Раньше invalid-пакеты (out-of-window TCP, ACK-flood без conntrack-
+        # записи, битый tracking) не матчили ни один ct state new лимитер и
+        # падали в policy accept — доезжали до host input и forward к
+        # контейнерам в обход всех лимитов.
+        ct state invalid counter name ct_invalid_v4 drop
 
         # SSH защита перенесена ниже scanner_blocklist для эффективности
         # (см. блок === SSH PRE-AUTH FLOOD PROTECTION ===).
@@ -4206,6 +4961,16 @@ $SHIELD_LOG_TCP_INVALID
         # залогировался бы только один IP в секунду. С meter — 1/min per IP,
         # каждый атакующий получит attribution хотя бы раз в минуту.
         # Лимит per-IP × timeout 1h автоматически собирает только активных.
+        # TODO(v4.0.0-hotfix, аудит O3): предложенное слияние пар
+        # "meter+log" + "drop" в ОДНО правило НЕ РЕАЛИЗОВАНО НАМЕРЕННО:
+        # meter/limit — match-statement ("a rule using this statement will
+        # match until this limit is reached", man nft(8)). При превышении
+        # rate правило ПЕРЕСТАЁТ матчить целиком → идущий следом
+        # counter+drop в том же правиле тоже перестал бы срабатывать, т.е.
+        # заблокированный IP дропался бы лишь 1/мин, а остальные его пакеты
+        # проваливались бы дальше по chain. Структура из ДВУХ правил
+        # (rate-limited log без verdict + unconditional counter drop) —
+        # единственная корректная для "лог редкий, дроп всегда".
         ip saddr @threat_blocklist_v4 \\
             meter shield_threat_log { ip saddr limit rate 1/minute burst 5 packets } \\
             log prefix "[shield:threat] " level info flags ip options
@@ -4363,8 +5128,8 @@ $SHIELD_V6_RULES
         # ловится. Реальные ботнет-атаки используют тысячи IP с 10-50 conn
         # на каждом — наш лимит per-source-IP их не ловит, но их ловят
         # threat_blocklist (Spamhaus) и CrowdSec CAPI community list.
-        # ВАЖНО: требует net.netfilter.nf_conntrack_max >= 262144 (Ubuntu
-        # default). На малых нодах (1GB RAM) — проверь sysctl.
+        # ВАЖНО: nf_conntrack_max с v4.0.0-hotfix выставляет сам shieldnode
+        # (tier-aware по RAM в 90-shieldnode.conf, min 131072) + hashsize=max/4.
         # История: v3.0=150 → v3.12.0=400 → v3.18.13=1500 → v3.20.0=3000 →
         #          v3.20.1=5000 → v3.22.0=50000 → v3.23.3=15000.
         # v3.23.3: снижение 50000→15000 после DDoS-инцидента 2026-05-24
@@ -4373,24 +5138,17 @@ $SHIELD_V6_RULES
         # 15000 = запас 20x от пика, при этом срезает все известные ботнеты
         # (топ атакующих в инциденте были >11k conn/IP).
         # v3.20.3: log УБРАН с этого правила (lograte 10000 строк/sec).
-        # v3.23.13 BUG-004a + SR-FIX-1 FIX: добавлено ОТДЕЛЬНОЕ log правило
-        # с per-IP meter — не trigger'ит add @set, не дропает.
-        # Семантика: log срабатывает когда IP достиг threshold-1 (на грани),
-        # meter rate-limit 1/min per-IP даёт fair attribution даже при
-        # massive ботнете (каждый атакующий хоть раз логируется в минуту).
-        #
-        # Архитектура:
-        #   (1) Log-rule: per-IP 'add @connwatch_v4 { ip saddr ct count over X-1 }'
-        #       — match ТОЛЬКО когда у конкретного src >X-1 conns (v3.24.2;
-        #       раньше был глобальный 'ct count over X-1' → лог-шум на busy-ноде).
-        #       meter per-IP rate-limit (1/min). Counter+drop НЕТ — пакет идёт
-        #       дальше в правило (2).
-        #   (2) Drop rule (как в v3.23.12): atomic match-add-counter-drop.
-        #       Counter показывает реальные дропы.
-        tcp dport @protected_ports_tcp ct state new \\
-            add @connwatch_v4 { ip saddr ct count over $SHIELD_CT_CONN_FLOOD_MINUS_1 } \\
-            meter shield_conn_flood_log { ip saddr limit rate 1/minute burst 5 packets } \\
-            log prefix "[shield:conn_flood] " level info flags ip options
+        # v3.23.13 BUG-004a + SR-FIX-1 добавили ОТДЕЛЬНОЕ log-правило с
+        # per-IP meter через set connwatch_v4 (ct count over X-1, near-
+        # threshold attribution).
+        # v4.0.0-hotfix (O4): connwatch_v4 и log-правило УДАЛЕНЫ — второй
+        # ct-count dynset на КАЖДЫЙ новый конн стоил ~25% dynset-операций
+        # hot path ради лога раз в минуту. Near-threshold атрибуция
+        # [shield:conn_flood] прекращена осознанно (events.db больше не
+        # получает conn_flood events из этого лога — auto-promote источник
+        # conn_flood теперь не питается; остальные источники syn_escalate/
+        # udp_escalate/ddos живы). Остаётся один drop-rule: atomic
+        # match-add-counter-drop. Counter показывает реальные дропы.
         tcp dport @protected_ports_tcp ct state new \\
             add @connlimit_v4 { ip saddr ct count over $SHIELD_CT_CONN_FLOOD } \\
             counter name conn_flood_v4 drop
@@ -4472,28 +5230,25 @@ $SHIELD_GLOBAL_NEWCONN_RULE
 }
 EOF
 
-# v3.23.13 SR-FIX-3: ДВУХФАЗНАЯ загрузка nft правил.
-# Раньше `nft -f` сразу применял ruleset — если ошибка, защита упала на
-# время до фикса.
-# Теперь:
-#   (1) `nft -c -f` parse-only check (НЕ применяет). Если syntax error
-#       выловит здесь и НЕ тронет работающий ruleset.
-#   (2) `nft -f` apply только после успешного parse.
+# v4.0.0-hotfix: parse-check TMP-файла, затем атомарный mv на боевой путь.
+# (Двухфазная загрузка v3.23.13 SR-FIX-3 сохранена: parse ДО apply.)
 # `-c` (--check) флаг доступен с nftables 0.9.0+.
-if nft -c -f "$NFT_DDOS_CONF" 2>&1; then
+if nft -c -f "$NFT_DDOS_CONF_TMP" 2>&1; then
     print_ok "nft conf parse-check OK"
 else
-    print_error "nft parse-check FAILED — конфиг содержит синтаксические ошибки"
-    print_error "Старый ruleset (если был) ОСТАЁТСЯ активен. Исправь $NFT_DDOS_CONF и retry."
-    exit 1
+    print_error "nft parse-check FAILED — сгенерированный конфиг содержит синтаксические ошибки"
+    print_error "Боевой $NFT_DDOS_CONF НЕ изменён, старый ruleset (если был) остаётся активен."
+    rm -f "$NFT_DDOS_CONF_TMP"
+    shield_install_fatal_exit 1
 fi
+mv -f "$NFT_DDOS_CONF_TMP" "$NFT_DDOS_CONF"
 
 # Загружаем правила
 if nft -f "$NFT_DDOS_CONF" 2>&1; then
     print_ok "nft rate-limit активен"
 else
     print_error "Ошибка загрузки nft-правил — смотри вывод выше"
-    exit 1
+    shield_install_fatal_exit 1
 fi
 
 # ============================================================================
@@ -4561,6 +5316,11 @@ ExecStartPre=/usr/sbin/nft -c -f $NFT_DDOS_CONF
 # Загружаем ТОЛЬКО нашу таблицу БЕЗ flush ruleset
 # Это сохраняет UFW и любые другие nft-правила
 ExecStart=/usr/sbin/nft -f $NFT_DDOS_CONF
+# Runtime-перезалив set'ов после restart/reboot (audit F3): ExecStart грузит
+# таблицу с ПУСТЫМИ set'ами — без триггера updater'ов blocklist'ы ждали бы
+# ближайший таймер (до 24ч). "-" → не ронять unit при ошибке запуска,
+# --no-block → не задерживать boot (updater'ы oneshot, сами ждут network-online).
+ExecStartPost=-/usr/bin/systemctl start --no-block shieldnode-update@scanner.service shieldnode-update@threat.service shieldnode-update@tor.service shieldnode-update@custom.service shieldnode-whitelist.service
 # При остановке/restart удаляем только нашу таблицу.
 # v3.18.8: префикс "-" → systemd игнорирует exit code. Если таблицу уже
 # флушнул внешний процесс (bouncer post-inst regression и т.п.), unit
@@ -4928,8 +5688,11 @@ print_ok "Watcher script: $PORTS_UPDATER"
 cat > /etc/systemd/system/protected-ports-update.service <<EOF
 [Unit]
 Description=Sync nft protected_ports sets with firewall rules
-After=nftables.service network-online.target
-Wants=nftables.service
+# audit C9 (находка 35): nftables.service masked shieldnode'ом (ШАГ 1.x) —
+# Wants= на masked-юнит шумел в journal при каждом триггере. Заменено на
+# ordering к shieldnode-nftables.service (table-wait внутри скрипта — fallback).
+After=shieldnode-nftables.service network-online.target
+Wants=network-online.target
 # Не запускать многократно если несколько триггеров сработали одновременно
 StartLimitIntervalSec=10
 StartLimitBurst=5
@@ -4996,13 +5759,16 @@ if [ -n "$PATH_UNIT_PATHS" ]; then
     cat > /etc/systemd/system/protected-ports-update.path <<EOF
 [Unit]
 Description=Watch firewall config files and trigger protected-ports-update
-After=nftables.service
+# audit C9 (находка 35): nftables.service masked — After= на него заменён.
+After=shieldnode-nftables.service
 
 [Path]
 $PATH_UNIT_PATHS
-# Не дребезжать при нескольких изменениях за короткий период
-TriggerLimitIntervalSec=2
-TriggerLimitBurst=3
+# audit C8 (находка 22): trigger rate-limit отключён (TriggerLimitIntervalSec=0),
+# как у custom/whitelist .path — раньше burst легитимных правок фаервола
+# (3 за 2с) мог убить watcher'а навсегда (systemd 250+; на старших директива
+# игнорируется с warning, лимиты сервиса остаются защитой).
+TriggerLimitIntervalSec=0
 Unit=protected-ports-update.service
 
 [Install]
@@ -5085,20 +5851,106 @@ command -v jq   >/dev/null 2>&1 || { logger -t "$TAG" "нет jq (нужен д�
 mkdir -p "$STATE" 2>/dev/null || true
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 
+# flock (audit T4-10): сериализация как у остальных updater'ов — параллельные
+# запуски (timer + boot-триггер) не должны гонять nft-транзакции одновременно.
+exec 9>"$STATE/.remnawave-sync.lock" 2>/dev/null || true
+flock -w 60 9 2>/dev/null || { logger -t "$TAG" "lock timeout 60s — выхожу (следующий триггер применит)"; exit 0; }
+
+# v6-условность (audit T4-12): v6-транзакции только если IPv6 включён глобально
+# (та же проверка, что в install: публичный inet6). Иначе v6-сет мёртв —
+# не создаём мёртвую работу (persist v6 продолжаем писать на случай включения).
+V6_ENABLED=0
+if ip -6 addr show scope global 2>/dev/null | grep -qE 'inet6 (2[0-9a-f]|3[0-9a-f])'; then
+    V6_ENABLED=1
+fi
+
+# Текущее persist-состояние (last-known-good) по семействам: нужно и для
+# re-apply при падении панели, и для per-family keep-stale.
+: > "$TMP/cur4.txt"; : > "$TMP/cur6.txt"
+if [ -s "$LIST" ]; then
+    grep -vE '^[[:space:]]*(#|$)' "$LIST" 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | sort -u > "$TMP/cur4.txt" || true
+    grep -vE '^[[:space:]]*(#|$)' "$LIST" 2>/dev/null | grep -vE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | grep -viE '^(::1|::)$' | sort -u > "$TMP/cur6.txt" || true
+fi
+
+# apply_set <set> <new_file> [cur_persist_file]: отдельная nft-транзакция
+# (битые данные не ломают ddos_protect). return 1 + WARN если table/set
+# отсутствует (audit F5 — раньше молчаливый return 0). Per-family keep-stale:
+# NEW пуст, а persist непуст → семейство НЕ флашим (частичный сбой источника
+# не должен опустошать whitelist одного семейства).
+apply_set(){
+    local set="$1" lf="$2" cur="${3:-}"
+    if ! nft list set "$TABLE" "$set" >/dev/null 2>&1; then
+        logger -t "$TAG" "WARN: set $TABLE $set не существует — apply невозможен (таблица старой версии?)"
+        return 1
+    fi
+    if [ ! -s "$lf" ] && [ -n "$cur" ] && [ -s "$cur" ]; then
+        logger -t "$TAG" "keep-stale: $set — новых данных нет, persist непуст ($(wc -l < "$cur" | tr -d ' ') шт.) — семейство не трогаю"
+        return 0
+    fi
+    {
+        echo "flush set $TABLE $set"
+        if [ -s "$lf" ]; then
+            awk -v s="$set" -v t="$TABLE" '
+                NR%500==1{ if(NR>1) print "}"; printf "add element %s %s { ", t, s }
+                { printf "%s%s", (NR%500==1?"":", "), $0 }
+                END{ if(NR>0) print " }" }' "$lf"
+        fi
+    } | nft -f - 2>"$TMP/nfterr"
+}
+
+# Last-known-good re-apply (audit T2-01): панель/DNS мертвы (типично сразу
+# после reboot) → переливаем set'ы из persist-файла, чтобы флот НЕ выпадал
+# из whitelist до первого успешного синка. Пустое persist-семейство не трогаем.
+reapply_persist(){
+    if [ ! -s "$LIST" ]; then
+        logger -t "$TAG" "last-known-good: persist $LIST пуст/отсутствует — оставляю kernel-сеты как есть"
+        return 0
+    fi
+    local rc=0
+    if [ -s "$TMP/cur4.txt" ]; then
+        apply_set "$SET4" "$TMP/cur4.txt" || { logger -t "$TAG" "WARN: $SET4 re-apply: $(tr '\n' ' ' < "$TMP/nfterr" 2>/dev/null | cut -c1-200)"; rc=1; }
+    fi
+    if [ "$V6_ENABLED" = "1" ] && [ -s "$TMP/cur6.txt" ]; then
+        apply_set "$SET6" "$TMP/cur6.txt" || { logger -t "$TAG" "WARN: $SET6 re-apply: $(tr '\n' ' ' < "$TMP/nfterr" 2>/dev/null | cut -c1-200)"; rc=1; }
+    fi
+    logger -t "$TAG" "last-known-good: применил persist ($(wc -l < "$TMP/cur4.txt" | tr -d ' ') v4 / $(wc -l < "$TMP/cur6.txt" | tr -d ' ') v6)"
+    return $rc
+}
+
+# audit C6 (T2-05): счётчик подряд-ошибок панели (401/unreachable) →
+# notify warn начиная с 3-й. Сброс при первом успешном синке. Отдельный
+# event-key у notify (rate-limit 300s/key не глушит другие алерты).
+rw_note_fail(){
+    local f="$STATE/.remnawave_fail_count" n
+    n=$(( $(cat "$f" 2>/dev/null || echo 0) + 1 ))
+    echo "$n" > "$f" 2>/dev/null || true
+    if [ "$n" -ge 3 ]; then
+        logger -t "$TAG" "ALERT: $n подряд ошибок синка с панелью — whitelist нод на last-known-good"
+        /usr/local/sbin/shieldnode-notify.sh warn "remnawave-sync-fail" \
+            "Remnawave sync: $n подряд ошибок (панель unreachable/401?) — whitelist нод на last-known-good, проверь панель/токен" \
+            2>/dev/null || true
+    fi
+}
+rw_note_ok(){ rm -f "$STATE/.remnawave_fail_count" 2>/dev/null || true; }
+
 # 1) fetch — fail-safe при недоступности панели
 HTTP="$(curl -fsS --max-time 15 -o "$TMP/resp.json" -w '%{http_code}' \
         -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
         "$URL/api/nodes" 2>/dev/null || true)"
 if [ "$HTTP" != "200" ] || [ ! -s "$TMP/resp.json" ]; then
-    logger -t "$TAG" "панель недоступна (HTTP=$HTTP) — оставляю текущий whitelist нод (last-known-good)"
-    exit 0
+    logger -t "$TAG" "панель недоступна (HTTP=$HTTP) — last-known-good re-apply из persist"
+    rw_note_fail
+    reapply_persist
+    exit $?
 fi
 
 # 2) address каждой ноды (IP или hostname). Робастно к обёртке {response:[...]}.
 jq -r '.. | objects | .address? // empty' "$TMP/resp.json" 2>/dev/null | awk 'NF' | sort -u > "$TMP/addrs.txt"
 if [ ! -s "$TMP/addrs.txt" ]; then
-    logger -t "$TAG" "в ответе /api/nodes нет address — оставляю текущий whitelist (защита от кривого ответа)"
-    exit 0
+    logger -t "$TAG" "в ответе /api/nodes нет address — last-known-good re-apply из persist (защита от кривого ответа)"
+    rw_note_fail
+    reapply_persist
+    exit $?
 fi
 
 # 3) hostname → IP (getent: A и AAAA, без доп. зависимостей), разносим v4/v6
@@ -5107,7 +5959,9 @@ while IFS= read -r a; do
     a="$(printf '%s' "$a" | tr -d '[:space:]')"; [ -n "$a" ] || continue
     if printf '%s' "$a" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then echo "$a" >> "$TMP/v4.txt"; continue; fi
     if printf '%s' "$a" | grep -qiE '^[0-9a-f]*:[0-9a-f:]+$'; then echo "$a" >> "$TMP/v6.txt"; continue; fi
-    getent ahosts "$a" 2>/dev/null | awk '{print $1}' | sort -u | while IFS= read -r ip; do
+    # audit C7 (T2-12): timeout 5 на getent — мёртвый DNS иначе ел ~20s на
+    # hostname и мог съесть весь бюджет unit'а до apply.
+    timeout 5 getent ahosts "$a" 2>/dev/null | awk '{print $1}' | sort -u | while IFS= read -r ip; do
         if printf '%s' "$ip" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then echo "$ip" >> "$TMP/v4.txt"
         elif printf '%s' "$ip" | grep -qiE '^[0-9a-f]*:[0-9a-f:]+$'; then echo "$ip" >> "$TMP/v6.txt"; fi
     done
@@ -5119,31 +5973,31 @@ grep -viE '^(::1|::)$' "$TMP/v6.txt" 2>/dev/null | sort -u > "$TMP/v6.clean"
 N4="$(wc -l < "$TMP/v4.clean" 2>/dev/null)"; N4="${N4:-0}"
 N6="$(wc -l < "$TMP/v6.clean" 2>/dev/null)"; N6="${N6:-0}"
 if [ "$N4" -eq 0 ] && [ "$N6" -eq 0 ]; then
-    logger -t "$TAG" "после резолва 0 валидных IP нод — оставляю текущий whitelist (fail-safe)"
-    exit 0
+    logger -t "$TAG" "после резолва 0 валидных IP нод (DNS мёртв?) — last-known-good re-apply из persist"
+    rw_note_fail
+    reapply_persist
+    exit $?
 fi
 
-# 5) применяем ОТДЕЛЬНОЙ nft-транзакцией (битые данные не ломают ddos_protect),
-#    только если сет существует (backward-compat со старой таблицей)
-apply_set(){
-    local set="$1" lf="$2"
-    nft list set "$TABLE" "$set" >/dev/null 2>&1 || return 0
-    {
-        echo "flush set $TABLE $set"
-        if [ -s "$lf" ]; then
-            awk -v s="$set" -v t="$TABLE" '
-                NR%500==1{ if(NR>1) print "}"; printf "add element %s %s { ", t, s }
-                { printf "%s%s", (NR%500==1?"":", "), $0 }
-                END{ if(NR>0) print " }" }' "$lf"
-        fi
-    } | nft -f - 2>"$TMP/nfterr"
-}
+# 5) применяем (apply_set определён выше: отдельная nft-транзакция, per-family
+#    keep-stale, WARN + return 1 при отсутствующем table/set — audit F5).
+#    v6 — только если v6 включён глобально (audit T4-12), иначе skip.
 RC=0
-apply_set "$SET4" "$TMP/v4.clean" || { logger -t "$TAG" "WARN: $SET4: $(cat "$TMP/nfterr" 2>/dev/null)"; RC=1; }
-apply_set "$SET6" "$TMP/v6.clean" || { logger -t "$TAG" "WARN: $SET6: $(cat "$TMP/nfterr" 2>/dev/null)"; RC=1; }
+apply_set "$SET4" "$TMP/v4.clean" "$TMP/cur4.txt" || { logger -t "$TAG" "WARN: $SET4: $(tr '\n' ' ' < "$TMP/nfterr" 2>/dev/null | cut -c1-200)"; RC=1; }
+if [ "$V6_ENABLED" = "1" ]; then
+    apply_set "$SET6" "$TMP/v6.clean" "$TMP/cur6.txt" || { logger -t "$TAG" "WARN: $SET6: $(tr '\n' ' ' < "$TMP/nfterr" 2>/dev/null | cut -c1-200)"; RC=1; }
+elif [ "$N6" -gt 0 ]; then
+    logger -t "$TAG" "IPv6 глобально выключен — $N6 v6-адресов пропущены (persist обновлён)"
+fi
 
-# 6) persist для guard/visibility
-{ echo "# updated $(date -u +%FT%TZ) v4=$N4 v6=$N6 src=$URL/api/nodes"; cat "$TMP/v4.clean" "$TMP/v6.clean" 2>/dev/null; } > "$LIST" 2>/dev/null || true
+# 6) persist для guard/visibility. Keep-stale durable: если семейство сейчас
+#    пустое (keep-stale сработал), сохраняем в persist ПРЕЖНИЕ записи — иначе
+#    следующий прогон потерял бы last-known-good и флашнул бы семейство.
+{ echo "# updated $(date -u +%FT%TZ) v4=$N4 v6=$N6 src=$URL/api/nodes"
+  if [ -s "$TMP/v4.clean" ]; then cat "$TMP/v4.clean"; else cat "$TMP/cur4.txt"; fi
+  if [ -s "$TMP/v6.clean" ]; then cat "$TMP/v6.clean"; else cat "$TMP/cur6.txt"; fi
+} > "$LIST" 2>/dev/null || true
+[ "$RC" = "0" ] && rw_note_ok
 [ "$RC" = "0" ] && logger -t "$TAG" "whitelist нод обновлён: $N4 IPv4 + $N6 IPv6 (из $URL/api/nodes)"
 exit "$RC"
 RWEOF
@@ -5153,11 +6007,16 @@ RWEOF
     cat > /etc/systemd/system/shieldnode-remnawave-sync.service <<EOF
 [Unit]
 Description=Sync Remnawave fleet node IPs into shieldnode whitelist
-After=nftables.service network-online.target
+# audit C9 (находка 35): nftables.service masked shieldnode'ом — After= на
+# него заменён на shieldnode-nftables.service (шум в journal убран).
+After=shieldnode-nftables.service network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
+# audit C7 (T2-12): 17 hostname'ов × мёртвый DNS могли съесть дефолтные
+# 90s до apply — даём 180s (getent внутри скрипта ограничен timeout 5).
+TimeoutStartSec=180
 ExecStart=/usr/local/sbin/shieldnode-remnawave-sync.sh
 NoNewPrivileges=true
 ProtectSystem=strict
@@ -5176,6 +6035,9 @@ Requires=shieldnode-remnawave-sync.service
 OnBootSec=45s
 OnUnitActiveSec=$RW_INTERVAL
 AccuracySec=30s
+# audit C9 (находка 35): jitter — все ноды флота не должны дёргать панель
+# одновременно после boot/тика.
+RandomizedDelaySec=60
 Persistent=false
 
 [Install]
@@ -5411,6 +6273,21 @@ if [ "$REMOTE_TRIED" -gt 0 ] && [ "$REMOTE_DOWNLOADED" -eq 0 ] && [ "$LOCAL_FOUN
     # Только alert в syslog.
     if [ "$CURRENT" -ge "$FAIL_THRESHOLD_VAL" ]; then
         logger -t "$LOG_TAG" "ALERT: $CURRENT consecutive fetch failures for $NFT_SET — keeping last-known-good set (stale OK)"
+        # audit C6 (T2-05): дублируем ALERT в notify (rate-limit 300s/key,
+        # ключ per-list — одна штормящая лента не глушит алерты остальных).
+        # v4.0.0-hotfix (U-M3): notify только при ПЕРЕХОДЕ через порог
+        # (== threshold) и далее не чаще раза в сутки (marker-файл с датой
+        # последнего алерта per feed) — раньше алерт уходил на КАЖДОМ тике,
+        # пока fail_count >= threshold. Marker сбрасывается при успехе (ниже).
+        STALE_ALERT_MARK="$STATE_DIR/.alert-stale-${NAME}"
+        TODAY_UTC=$(date -u +%F)
+        if [ "$CURRENT" -eq "$FAIL_THRESHOLD_VAL" ] || \
+           [ "$(cat "$STALE_ALERT_MARK" 2>/dev/null)" != "$TODAY_UTC" ]; then
+            /usr/local/sbin/shieldnode-notify.sh warn "blocklist-${NAME}-stale" \
+                "Blocklist $NAME: $CURRENT подряд ошибок загрузки — set протух (last-known-good), проверь источники/сеть" \
+                2>/dev/null || true
+            echo "$TODAY_UTC" > "$STALE_ALERT_MARK" 2>/dev/null || true
+        fi
     fi
     exit 1
 fi
@@ -5560,6 +6437,18 @@ if [ "$V4_COUNT" -lt "$MIN_ENTRIES" ]; then
     # Stale OK; alert в syslog.
     if [ "$CURRENT" -ge "$FAIL_THRESHOLD_VAL" ]; then
         logger -t "$LOG_TAG" "ALERT: $CURRENT consecutive min-check failures for $NFT_SET — keeping last-known-good (stale OK)"
+        # audit C6 (T2-05): дублируем ALERT в notify.
+        # v4.0.0-hotfix (U-M3): только переход через порог + далее раз в сутки
+        # (marker per feed) — анти-спам при хронически деградировавшем фиде.
+        MINCHECK_ALERT_MARK="$STATE_DIR/.alert-mincheck-${NAME}"
+        TODAY_UTC=$(date -u +%F)
+        if [ "$CURRENT" -eq "$FAIL_THRESHOLD_VAL" ] || \
+           [ "$(cat "$MINCHECK_ALERT_MARK" 2>/dev/null)" != "$TODAY_UTC" ]; then
+            /usr/local/sbin/shieldnode-notify.sh warn "blocklist-${NAME}-mincheck" \
+                "Blocklist $NAME: $CURRENT подряд min-check ошибок (скачано < $MIN_ENTRIES) — set протух, проверь источники" \
+                2>/dev/null || true
+            echo "$TODAY_UTC" > "$MINCHECK_ALERT_MARK" 2>/dev/null || true
+        fi
     fi
     exit 1
 fi
@@ -5646,6 +6535,9 @@ fi
 V4_OK=0
 if nft -f "$TMP/nft-batch" 2>"$TMP/nft.err"; then
     echo 0 > "$FAIL_COUNTER"
+    # v4.0.0-hotfix (U-M3): фид восстановился — сбрасываем daily-маркеры
+    # stale/mincheck алертов, чтобы следующий инцидент снова алертил на пороге.
+    rm -f "$STATE_DIR/.alert-stale-${NAME}" "$STATE_DIR/.alert-mincheck-${NAME}" 2>/dev/null || true
     V4_OK=1
 else
     logger -t "$LOG_TAG" "ERROR: nft -f failed: $(cat "$TMP/nft.err")"
@@ -5655,6 +6547,7 @@ fi
 
 # 7.1) v3.27.0 FIX(#7): v6-транзакция (изолирована — не влияет на статус/exit v4).
 V6_APPLIED=0
+V6_FAILED=0
 if [ "$HAVE_V6_SET" = "1" ] && [ -s "$TMP/parsed6.list" ]; then
     {
         echo "flush set inet ddos_protect $NFT_SET_V6"
@@ -5667,6 +6560,7 @@ if [ "$HAVE_V6_SET" = "1" ] && [ -s "$TMP/parsed6.list" ]; then
     if nft -f "$TMP/nft-batch6" 2>"$TMP/nft6.err"; then
         V6_APPLIED="$V6_COUNT"
     else
+        V6_FAILED=1
         logger -t "$LOG_TAG" "WARN(v6): nft -f failed for $NFT_SET_V6 ($(cat "$TMP/nft6.err")) — v6 пропущен, v4 не затронут"
     fi
 fi
@@ -5674,8 +6568,15 @@ fi
 if [ "$V4_OK" = "1" ]; then
     logger -t "$LOG_TAG" "Updated $NFT_SET: $V4_COUNT IPv4 + $V6_APPLIED IPv6 подсетей (remote=$REMOTE_DOWNLOADED/$REMOTE_TRIED, local=$LOCAL_FOUND)"
     # v3.37.6: фиксируем hash применённых источников (no-op guard в начале скрипта)
+    # audit F10: marker пишем только при успехе ОБЕИХ транзакций (v4 И v6) —
+    # иначе failed v6-заливка помечалась бы applied и не повторялась до
+    # изменения источника.
     if [ "$NAME" = "custom" ] && [ -n "${CUR_HASH:-}" ]; then
-        echo "$CUR_HASH" > "${HASH_MARKER:-$STATE_DIR/.applied-custom.sha256}" 2>/dev/null || true
+        if [ "$V6_FAILED" = "0" ]; then
+            echo "$CUR_HASH" > "${HASH_MARKER:-$STATE_DIR/.applied-custom.sha256}" 2>/dev/null || true
+        else
+            logger -t "$LOG_TAG" "marker .applied-custom НЕ пишу: v6-транзакция failed — следующий триггер повторит полный apply"
+        fi
     fi
     exit 0
 else
@@ -5801,8 +6702,32 @@ fi
 UPSTREAM_HEADER=\$(curl -fsSL --max-time 10 --range 0-4095 "\$URL" 2>/dev/null)
 if [ -z "\$UPSTREAM_HEADER" ]; then
     logger -t "\$LOG_TAG" "WARN: не смог скачать header с \$URL"
+    # audit C10 (T2-17): обновляем checked_at (время ПОСЛЕДНЕЙ ПОПЫТКИ) и
+    # флаг failed=1 — guard покажет возраст проверки рядом со stale
+    # upgrade_available, а не вечное «есть апгрейд» при мёртвом GitHub.
+    NOW_TS=\$(date +%s)
+    {
+        [ -f "\$STATE_FILE" ] && grep -vE '^(checked_at|failed)=' "\$STATE_FILE"
+        echo "checked_at=\$NOW_TS"
+        echo "failed=1"
+    } > "\$STATE_FILE.tmp" 2>/dev/null && mv "\$STATE_FILE.tmp" "\$STATE_FILE" || true
+    # audit C6 (T2-05): GitHub недоступен > 7 дней подряд → notify warn.
+    # Отдельный marker first-fail; notify rate-limit (300s/key) + дневной
+    # тик timer'а дают не чаще раза в сутки.
+    FIRST_FAIL_FILE="\$STATE_DIR/.github-unreachable-since"
+    [ -f "\$FIRST_FAIL_FILE" ] || echo "\$NOW_TS" > "\$FIRST_FAIL_FILE"
+    FIRST_FAIL=\$(cat "\$FIRST_FAIL_FILE" 2>/dev/null || echo "\$NOW_TS")
+    FIRST_FAIL="\${FIRST_FAIL:-\$NOW_TS}"
+    if [ \$((NOW_TS - FIRST_FAIL)) -gt 604800 ]; then
+        logger -t "\$LOG_TAG" "ALERT: GitHub недоступен > 7 дней — version-check протух"
+        /usr/local/sbin/shieldnode-notify.sh warn "version-check-github-down" \
+            "GitHub недоступен > 7 дней — version-check протух; upgrade_available может быть ложным. Проверь сеть/DNS." \
+            2>/dev/null || true
+    fi
     exit 1
 fi
+# Успех — сбрасываем marker недоступности
+rm -f "\$STATE_DIR/.github-unreachable-since" 2>/dev/null || true
 
 # Ищем строку формата 'VPN NODE DDoS PROTECTION v3.X.Y' в первых строках
 UPSTREAM_VERSION=\$(echo "\$UPSTREAM_HEADER" | grep -oE 'VPN NODE DDoS PROTECTION v[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
@@ -5819,6 +6744,7 @@ if [ "\$UPSTREAM_VERSION" = "\$LOCAL_VERSION" ]; then
     echo "upstream=\$UPSTREAM_VERSION" >> "\$STATE_FILE"
     echo "upgrade_available=0" >> "\$STATE_FILE"
     echo "checked_at=\$(date +%s)" >> "\$STATE_FILE"
+    echo "failed=0" >> "\$STATE_FILE"
     exit 0
 fi
 
@@ -5830,6 +6756,7 @@ if [ "\$NEWER" = "\$UPSTREAM_VERSION" ]; then
         echo "upstream=\$UPSTREAM_VERSION"
         echo "upgrade_available=1"
         echo "checked_at=\$(date +%s)"
+        echo "failed=0"
     } > "\$STATE_FILE"
     logger -t "\$LOG_TAG" "Доступна новая версия: \$UPSTREAM_VERSION (текущая: \$LOCAL_VERSION). Run: sudo guard upgrade"
 else
@@ -5839,6 +6766,7 @@ else
         echo "upstream=\$UPSTREAM_VERSION"
         echo "upgrade_available=0"
         echo "checked_at=\$(date +%s)"
+        echo "failed=0"
     } > "\$STATE_FILE"
 fi
 exit 0
@@ -5923,19 +6851,22 @@ Wants=shieldnode-nftables.service
 # серией. Расширяем лимит запусков чтобы избежать unit-start-limit-hit.
 StartLimitBurst=30
 StartLimitIntervalSec=60
+# audit C1: падение updater'а (curl/feeds/network) → notify, как у
+# crowdsec/bouncer drop-in (ШАГ 12.10). notify@ поддерживает %N-инстанс.
+OnFailure=shieldnode-notify@%N.service
 
 [Service]
 Type=oneshot
-# v3.37.6: дублируем лимиты в [Service] — на systemd 254+ это честное место
-# ([Unit]-копии выше оставлены для старших версий).
-StartLimitBurst=30
-StartLimitIntervalSec=60
+# audit C9 (находка 35): StartLimitBurst/IntervalSec в [Service] НЕВАЛИДНЫ
+# (это директивы [Unit]) — убраны, оставлены только в [Unit] выше.
 ExecStart=$SHIELD_UPDATER_SCRIPT %i
-# v3.18.11 SH-NEW-141: TimeoutStartSec=120s — если updater hangs (slow URL-feed
-# за РКН, hung curl), systemd убьёт его через 2 мин. Раньше FINAL TRIGGER
-# делал timeout-обертку вокруг systemctl start, но timeout убивал только
-# CLI, а не сам updater (который продолжал работать в background).
-TimeoutStartSec=120
+# audit C1 (находка 5): TimeoutStartSec=600s. Было 120s — этого мало под
+# worst-case: 3 URL-фида × 90s curl --max-time (retry) = до 270s+ на один
+# список. Если updater hangs (slow URL-feed за РКН, hung curl), systemd
+# убьёт его через 10 мин. Раньше FINAL TRIGGER делал timeout-обертку
+# вокруг systemctl start, но timeout убивал только CLI, а не сам updater
+# (который продолжал работать в background).
+TimeoutStartSec=600
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -6257,50 +7188,84 @@ exec 9>"$WL_STATE_DIR/.whitelist.lock" 2>/dev/null || true
 flock -w 60 9 2>/dev/null || exit 0
 WL_HASH_MARKER="$WL_STATE_DIR/.applied-whitelist.sha256"
 WL_CUR_HASH=$( { cat "$WHITELIST_FILE" 2>/dev/null; cat "$MGMT_FILE" 2>/dev/null; } | sha256sum | awk '{print $1}' )
-if [ -f "$WL_HASH_MARKER" ] && [ "$(cat "$WL_HASH_MARKER" 2>/dev/null)" = "$WL_CUR_HASH" ] \
-   && nft list set $NFT_TABLE $NFT_SET 2>/dev/null | grep -q 'elements'; then
-    # Источники не менялись с последнего успешного применения и set не пуст.
+# hash-guard v2 (audit T3-1/T4-2): эвристика «marker совпал && set непуст»
+# заменена на сравнение ДВУХ хешей. Формат marker'а: "<src_hash> <kernel_hash>".
+# no-op только если marker==хеш источников И marker==хеш ФАКТИЧЕСКОГО содержимого
+# kernel-set'а — иначе полный apply (set мог быть флашнут внешним процессом
+# при непустом «непустом» виде, или содержать чужие элементы).
+# Backward-compat: старый однохешевый marker (без 2-го поля) считается протухшим.
+WL_KRN_HASH=$( nft list set $NFT_TABLE $NFT_SET 2>/dev/null | sha256sum | awk '{print $1}' )
+WL_MK_SRC=""; WL_MK_KRN=""
+if [ -f "$WL_HASH_MARKER" ]; then
+    read -r WL_MK_SRC WL_MK_KRN _ < "$WL_HASH_MARKER" 2>/dev/null || true
+fi
+if [ -n "$WL_MK_KRN" ] && [ "$WL_MK_SRC" = "$WL_CUR_HASH" ] && [ "$WL_MK_KRN" = "$WL_KRN_HASH" ]; then
+    # Источники и kernel-set совпадают с последним успешным применением.
     exit 0
 fi
 
 # Парсим IPs из обоих источников (без комментариев, пустых строк, валидируем)
-IPS=$( { grep -vE '^[[:space:]]*(#|$)' "$WHITELIST_FILE" 2>/dev/null; \
+# Строгая валидация (audit F4/T4-7): октеты 0-255, префикс 8-32.
+# /0-/7 отклоняем — опечатка вида 0.0.0.0/0 не должна whitelist'ить интернет.
+IPS_RAW=$( { grep -vE '^[[:space:]]*(#|$)' "$WHITELIST_FILE" 2>/dev/null; \
          cat "$MGMT_FILE" 2>/dev/null; } | \
        grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | \
        sort -u)
+IPS=$(printf '%s\n' "$IPS_RAW" | awk -F'[./]' '
+    NF==4 { ok=($1<=255 && $2<=255 && $3<=255 && $4<=255) }
+    NF==5 { ok=($1<=255 && $2<=255 && $3<=255 && $4<=255 && $5>=8 && $5<=32) }
+    NF<4 || NF>5 { ok=0 }
+    ok { print }')
+WL_N_RAW=$(printf '%s\n' "$IPS_RAW" | grep -c . || true)
+WL_N_OK=$(printf '%s\n' "$IPS" | grep -c . || true)
+if [ "$WL_N_RAW" -gt "$WL_N_OK" ]; then
+    logger -t "$LOG_TAG" "WARN: отклонено $((WL_N_RAW - WL_N_OK)) невалидных whitelist-записей (нужны октеты 0-255, префикс /8-/32)"
+fi
 
+WL_NFT_ERR="$WL_STATE_DIR/.whitelist-nft.err"
 if [ -n "$IPS" ]; then
     {
         echo "flush set $NFT_TABLE $NFT_SET"
         while IFS= read -r ip; do
             echo "add element $NFT_TABLE $NFT_SET { $ip }"
         done <<< "$IPS"
-    } | nft -f - 2>&1
+    } | nft -f - 2>"$WL_NFT_ERR"
+    # Exit code nft -f ПРОВЕРЯЕМ (audit F4/T4-7): marker ниже пишется только
+    # при успехе. При fail — logger + exit 1: следующий триггер повторит
+    # полный apply (marker не записан → hash-guard не no-op'нется).
+    if [ "${PIPESTATUS[1]:-1}" -ne 0 ]; then
+        logger -t "$LOG_TAG" "ERROR: nft -f failed ($NFT_SET): $(tr '\n' ' ' < "$WL_NFT_ERR" 2>/dev/null | cut -c1-300)"
+        exit 1
+    fi
 
     # Удаляем whitelisted IPs из drop sets — нельзя одновременно whitelist'ить и банить.
     # v3.23.9: batch nft -f - вместо 6 fork'ов на каждый IP.
-    # Раньше: 3 IP × 6 sets = 18 nft processes → CPU spike до 90%.
-    # Теперь: 1 nft process для всех операций.
-    {
-        while IFS= read -r ip; do
-            echo "delete element $NFT_TABLE confirmed_attack_v4 { $ip }"
-            echo "delete element $NFT_TABLE suspect_v4 { $ip }"
-            echo "delete element $NFT_TABLE custom_blocklist_v4 { $ip }"
-            echo "delete element $NFT_TABLE scanner_blocklist_v4 { $ip }"
-            echo "delete element $NFT_TABLE threat_blocklist_v4 { $ip }"
-            echo "delete element $NFT_TABLE tor_exit_blocklist_v4 { $ip }"
-        done <<< "$IPS"
-    } | nft -f - 2>/dev/null || true   # || true — некоторые элементы могут отсутствовать в set'ах
+    # Per-set ОТДЕЛЬНЫЕ транзакции (audit F32): отсутствие элемента в одном set'е
+    # раньше откатывало ВЕСЬ batch (все 6 set'ов). Теперь сбой ограничен одним
+    # set'ом; ошибки — debug-лог вместо молчаливого `|| true`.
+    for DEL_SET in confirmed_attack_v4 suspect_v4 custom_blocklist_v4 scanner_blocklist_v4 threat_blocklist_v4 tor_exit_blocklist_v4; do
+        DEL_ERR=$(
+            while IFS= read -r ip; do
+                echo "delete element $NFT_TABLE $DEL_SET { $ip }"
+            done <<< "$IPS" | nft -f - 2>&1 >/dev/null
+        ) || logger -t "$LOG_TAG" "debug: cleanup $DEL_SET: $(printf '%s' "$DEL_ERR" | tr '\n' ' ' | cut -c1-200) (часть элементов отсутствовала в set'е)"
+    done
 
     COUNT=$(echo "$IPS" | wc -l)
     logger -t "$LOG_TAG" "Updated $NFT_SET: $COUNT IPs (cleaned from blocklists/attack sets)"
 else
-    nft flush set $NFT_TABLE $NFT_SET 2>/dev/null
+    if ! nft flush set $NFT_TABLE $NFT_SET 2>"$WL_NFT_ERR"; then
+        logger -t "$LOG_TAG" "ERROR: flush $NFT_SET failed: $(tr '\n' ' ' < "$WL_NFT_ERR" 2>/dev/null | cut -c1-300)"
+        exit 1
+    fi
     logger -t "$LOG_TAG" "Whitelist empty — flushed $NFT_SET"
 fi
 
-# v3.37.6: фиксируем hash применённых источников (no-op guard в начале скрипта)
-echo "${WL_CUR_HASH:-}" > "${WL_HASH_MARKER:-/var/lib/shieldnode/.applied-whitelist.sha256}" 2>/dev/null || true
+# Marker пишем ТОЛЬКО после успешного apply (при fail выше — exit 1).
+# Формат v2: "<src_hash> <kernel_hash>" — kernel hash от ФАКТИЧЕСКОГО слепка
+# set'а ПОСЛЕ применения (hash-guard в начале скрипта сверяет оба поля).
+WL_KRN_HASH=$( nft list set $NFT_TABLE $NFT_SET 2>/dev/null | sha256sum | awk '{print $1}' )
+echo "${WL_CUR_HASH:-} ${WL_KRN_HASH:-}" > "${WL_HASH_MARKER:-/var/lib/shieldnode/.applied-whitelist.sha256}" 2>/dev/null || true
 
 exit 0
 WHITELIST_UPDATER_EOF
@@ -6320,9 +7285,8 @@ StartLimitIntervalSec=60
 
 [Service]
 Type=oneshot
-# v3.37.6: дублируем лимиты в [Service] (systemd 254+ честное место).
-StartLimitBurst=30
-StartLimitIntervalSec=60
+# audit C9 (находка 35): StartLimitBurst/IntervalSec в [Service] невалидны
+# (это директивы [Unit]) — убраны, оставлены только в [Unit] выше.
 ExecStart=$WHITELIST_UPDATER
 EOF
 
@@ -6345,6 +7309,23 @@ Unit=shieldnode-whitelist.service
 
 [Install]
 WantedBy=multi-user.target
+EOF
+
+# 4.5 Boot-gap cover (audit T3-1/T4-2): .path срабатывает только на ИЗМЕНЕНИЕ
+# файла. После reboot shieldnode-nftables грузит таблицу с ПУСТЫМ
+# manual_whitelist_v4, и без boot-триггера whitelist ждал бы первого изменения
+# файла (или protected-ports-update). Timer даёт гарантированный apply через
+# 45с после boot. Только boot (OnUnitActiveSec не нужен — изменения ловит .path).
+cat > /etc/systemd/system/shieldnode-whitelist.timer <<EOF
+[Unit]
+Description=Shieldnode whitelist boot-gap cover (apply file -> nft shortly after boot)
+
+[Timer]
+OnBootSec=45s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
 EOF
 
 # 5. Запуск + первая инициализация (с reset-failed для idempotency)
@@ -6374,7 +7355,9 @@ fi
 systemctl daemon-reload
 systemctl reset-failed shieldnode-whitelist.path 2>/dev/null
 systemctl reset-failed shieldnode-whitelist.service 2>/dev/null
+systemctl reset-failed shieldnode-whitelist.timer 2>/dev/null
 systemctl enable --now shieldnode-whitelist.path >/dev/null 2>&1
+systemctl enable --now shieldnode-whitelist.timer >/dev/null 2>&1
 systemctl start shieldnode-whitelist.service >/dev/null 2>&1
 
 WHITELIST_COUNT=$(grep -vE '^[[:space:]]*(#|$)' "$WHITELIST_LOCAL" 2>/dev/null | grep -cE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
@@ -6403,7 +7386,7 @@ SHIELDNODE_CROWDSEC_MANAGED=0
 if ! command -v cscli >/dev/null 2>&1; then
     wait_for_apt_lock
     print_status "Подключаю репозиторий CrowdSec..."
-    if ! curl -fsSL https://install.crowdsec.net | bash; then
+    if ! curl -fsSL --max-time 60 https://install.crowdsec.net | timeout --kill-after=10s 300 bash; then
         print_error "Не удалось подключить репозиторий CrowdSec"
         print_info "Проверь интернет: curl -v https://install.crowdsec.net"
         exit 1
@@ -7005,6 +7988,29 @@ if ! nft list table inet ddos_protect >/dev/null 2>&1; then
     fi
 fi
 
+# v4.0.0-hotfix (находка T4-3, ПРОПУСК-7): flush ruleset от bouncer pre-inst/
+# postinst сносит не только ddos_protect/UFW/bouncer-таблицы (их мы выше
+# восстановили), но и docker'овские iptables-nft таблицы (ip nat / ip filter).
+# Docker пересоздаёт их ТОЛЬКО на (re)start'е демона → без restart docker
+# DNAT/MASQUERADE мертвы, VPN-порты контейнеров недоступны до ручного вмешательства.
+# Гейт на iptables-backend=nf_tables: на iptables-legacy хостах table ip nat
+# в nft не существует штатно — не дёргаем docker зря (restart = даунтайм VPN).
+if systemctl is-active --quiet docker 2>/dev/null && \
+   iptables --version 2>/dev/null | grep -q nf_tables && \
+   ! nft list table ip nat 2>/dev/null | grep -q .; then
+    logger -t shieldnode "WARN: docker active, но table ip nat отсутствует (flush ruleset?) — restart docker для пересоздания его таблиц"
+    print_warn "Docker активен, но table ip nat отсутствует (ruleset был flushed) — перезапускаю docker (пересоздаст ip nat/ip filter; краткий даунтайм контейнеров)"
+    systemctl restart docker 2>/dev/null || true
+    sleep 2
+    if nft list table ip nat >/dev/null 2>&1; then
+        print_ok "Docker: table ip nat восстановлена после restart docker"
+        logger -t shieldnode "docker restarted — table ip nat восстановлена"
+    else
+        print_error "Docker: table ip nat НЕ появилась после restart — VPN-порты контейнеров мертвы. Проверь: journalctl -u docker -n 30"
+        logger -t shieldnode "ERROR: table ip nat отсутствует и после restart docker"
+    fi
+fi
+
 # ============================================================================
 # v3.10.3 BUG-11 SECURITY FIX: добавляем mgmt IPs в CrowdSec whitelist
 # ============================================================================
@@ -7038,8 +8044,10 @@ fi
 # CrowdSec >= 1.7.2 имеет встроенный systemd timer (hubupdate.timer), на
 # старых версиях нужен cron.
 print_status "Обновляю CrowdSec hub..."
-if cscli hub update >/dev/null 2>&1; then
-    if cscli hub upgrade >/dev/null 2>&1; then
+# audit C7 (T2-11): timeout 120 как на fresh-install выше — при blackholed
+# сети инсталлер раньше висел минуты на connect+скачивании коллекций.
+if timeout --kill-after=10s 120s cscli hub update >/dev/null 2>&1; then
+    if timeout --kill-after=10s 120s cscli hub upgrade >/dev/null 2>&1; then
         print_ok "Hub: коллекции/сценарии обновлены"
     fi
 fi
@@ -7066,7 +8074,65 @@ CRON_EOF
             systemctl enable --now crowdsec-hubupdate.timer >/dev/null 2>&1 || true
             print_info "CrowdSec $CS_VER >= 1.7.2 — встроенный hub-upgrade timer"
         fi
+        # v4.0.0-hotfix (D7a): на >=1.7.2 cron-fallback больше не нужен —
+        # снимаем, если остался от прошлой установки на старом CrowdSec.
+        if [ -f /etc/cron.daily/cscli-hub-upgrade ]; then
+            rm -f /etc/cron.daily/cscli-hub-upgrade
+            print_info "Удалён legacy cron /etc/cron.daily/cscli-hub-upgrade (есть hubupdate.timer)"
+        fi
     fi
+fi
+
+# ==============================================================================
+# ШАГ 10.5: DOCKER LOG LIMITS (audit C4, T2-09/находка 18)
+# ==============================================================================
+# Docker json-file логи контейнеров (remnanode/xray) по умолчанию НЕ
+# ограничены — главный неконтролируемый потребитель диска на ноде
+# (исторический инцидент: 100% диска). Ставим ротацию в daemon.json.
+# Restart docker НЕ делаем автоматически — на живой ноде это даунтайм VPN;
+# настройка применится при следующем restart'е docker (окно оператора).
+
+print_header "ШАГ 10.5: DOCKER LOG LIMITS"
+
+if [ -d /etc/docker ]; then
+    DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
+    if [ -f "$DOCKER_DAEMON_JSON" ] && \
+       jq -e 'has("log-opts")' "$DOCKER_DAEMON_JSON" >/dev/null 2>&1; then
+        print_info "daemon.json уже содержит log-opts — не трогаем (конфиг оператора)"
+    elif command -v jq >/dev/null 2>&1; then
+        # Backup перед правкой
+        if [ -f "$DOCKER_DAEMON_JSON" ]; then
+            cp -a "$DOCKER_DAEMON_JSON" "${DOCKER_DAEMON_JSON}.shieldnode-bak.$(date +%s)" 2>/dev/null || true
+        fi
+        DOCKER_TMP=$(mktemp) || DOCKER_TMP=""
+        if [ -n "$DOCKER_TMP" ]; then
+            # Merge: существующий daemon.json + наши log-opts (пустой/битый
+            # файл трактуем как {}).
+            if jq '. + {"log-driver":"json-file","log-opts":{"max-size":"50m","max-file":"3"}}' \
+                   "$DOCKER_DAEMON_JSON" > "$DOCKER_TMP" 2>/dev/null \
+               || printf '%s\n' '{"log-driver":"json-file","log-opts":{"max-size":"50m","max-file":"3"}}' > "$DOCKER_TMP"; then
+                if jq -e . "$DOCKER_TMP" >/dev/null 2>&1; then
+                    chmod 0644 "$DOCKER_TMP"
+                    mv "$DOCKER_TMP" "$DOCKER_DAEMON_JSON"
+                    print_ok "Docker log-opts: json-file max-size=50m max-file=3 → $DOCKER_DAEMON_JSON"
+                    print_warn "Перезапустите docker при окне для применения: systemctl restart docker (даунтайм контейнеров VPN!)"
+                else
+                    rm -f "$DOCKER_TMP"
+                    print_warn "Сгенерированный daemon.json невалиден — не применяю (backup рядом)"
+                fi
+            else
+                rm -f "$DOCKER_TMP"
+                print_warn "Не смог записать daemon.json — пропущено"
+            fi
+        else
+            print_warn "mktemp failed — daemon.json не тронут"
+        fi
+    else
+        print_warn "jq не найден — docker log-opts не настроены. Рекомендуется вручную добавить в /etc/docker/daemon.json:"
+        print_info '  {"log-driver":"json-file","log-opts":{"max-size":"50m","max-file":"3"}}'
+    fi
+else
+    print_info "Docker не установлен (/etc/docker отсутствует) — пропускаю log limits"
 fi
 
 # ==============================================================================
@@ -7187,9 +8253,13 @@ else
     print_warn "systemd-journald restart failed — лимит применится при следующем restart'е"
 fi
 
-# v3.5: logrotate для events.log + install.log
+# v3.5: logrotate для install.log
+# audit C5 (находка 19): events.log УБРАН из logrotate — его ротирует сам
+# aggregator (self-rotate при 100MB, mv + gzip). Гонка copytruncate vs mv
+# могла терять события / конфликтовать с fd aggregator'а. Остаётся
+# install.log (пишется только установщиком, copytruncate безопасен).
 cat > /etc/logrotate.d/shieldnode <<'LOGROTATE_EOF'
-/var/log/shieldnode/*.log {
+/var/log/shieldnode/install.log {
     daily
     rotate 30
     maxsize 100M
@@ -7202,7 +8272,7 @@ cat > /etc/logrotate.d/shieldnode <<'LOGROTATE_EOF'
     create 0640 root root
 }
 LOGROTATE_EOF
-print_ok "Logrotate: /etc/logrotate.d/shieldnode (daily, rotate 30, maxsize 100M, compress)"
+print_ok "Logrotate: /etc/logrotate.d/shieldnode (install.log; daily, rotate 30, maxsize 100M, compress)"
 
 # v3.20.3 / v3.23.13 SR-FIX-8: aggressive ротация для /var/log/syslog/kern.log/auth.log.
 # Причина: shieldnode/nftables/CrowdSec пишут много drop-events в kern.log.
@@ -7247,13 +8317,14 @@ if [ -f /etc/logrotate.d/shieldnode-syslog-aggressive ]; then
     print_info "Removed legacy /etc/logrotate.d/shieldnode-syslog-aggressive (duplicate entries with rsyslog)"
 fi
 
-# v3.20.3: Hourly logrotate timer (вместо daily cron)
-# Дефолтный logrotate cron запускается раз в день. При активной ноде с DDoS
-# атаками логи могут вырасти до 1+ GB за день. Hourly проверка ловит overflow
-# раньше — maxsize 100M будет ротировать сразу при превышении.
+# v3.20.3: logrotate timer (вместо daily cron)
+# audit C5 (T2-10): тик hourly → каждые 10 мин. При DDoS-шторме kern.log/
+# syslog растут ~10-15 MB/мин; hourly maxsize-ротация допускала ~700-900MB
+# набега между тиками. 10-минутный тик — шторм-бэкстоп для maxsize-ротации
+# (events.log здесь НЕ участвует — его ротирует aggregator, см. выше).
 cat > /etc/systemd/system/shieldnode-logrotate.service <<'EOF'
 [Unit]
-Description=shieldnode hourly logrotate (catches log overflow before disk fills)
+Description=shieldnode logrotate (10-min tick; catches log overflow before disk fills)
 After=multi-user.target
 
 [Service]
@@ -7270,17 +8341,18 @@ ExecStart=/usr/sbin/logrotate --state /var/lib/shieldnode/logrotate-hourly.state
 # Failures игнорируем — exit code 1 (skipped logs) считается успехом
 SuccessExitStatus=0 1 2
 
-Restart=on-failure
-RestartSec=60
+# audit C5 (T3-5): Restart=on-failure/RestartSec убраны — мёртвые директивы
+# для Type=oneshot (Restart= применяется только к долгоживущим сервисам).
 EOF
 
 cat > /etc/systemd/system/shieldnode-logrotate.timer <<'EOF'
 [Unit]
-Description=Run logrotate hourly (shieldnode aggressive rotation)
+Description=Run logrotate every 10 min (shieldnode aggressive rotation)
 
 [Timer]
-OnCalendar=hourly
-RandomizedDelaySec=300
+# audit C5 (T2-10): hourly → каждые 10 минут (storm backstop для maxsize).
+OnCalendar=*:0/10
+RandomizedDelaySec=60
 Persistent=true
 
 [Install]
@@ -7288,7 +8360,7 @@ WantedBy=timers.target
 EOF
 systemctl daemon-reload
 systemctl enable --now shieldnode-logrotate.timer >/dev/null 2>&1
-print_ok "Hourly logrotate timer: shieldnode-logrotate.timer"
+print_ok "Logrotate timer: shieldnode-logrotate.timer (каждые 10 мин, maxsize-ротация)"
 
 # v3.20.3: Weekly cleanup timer — старые backup'ы shieldnode + ASN cache
 # v3.20.3 FIX: используем отдельный скрипт вместо ExecStart с inline bash -c.
@@ -7381,12 +8453,29 @@ fi
 # 4) Удаляем старые failed fetch counters (>30 дней)
 find /var/lib/shieldnode -maxdepth 1 -name "*_fail_count" -mtime +30 -delete 2>/dev/null
 
+# 5) audit C4 (T2-09): weekly disk watchdog — /var заполнен > 85% →
+# notify warn. Runtime-мониторинга диска больше нигде нет (check_disk_space
+# работает только на старте install). Rate-limit notify 300s/key + weekly
+# тик = не чаще раза в неделю.
+VAR_USE=$(df --output=pcent /var 2>/dev/null | tail -1 | tr -dc '0-9')
+VAR_USE="${VAR_USE:-0}"
+if [ "$VAR_USE" -ge 85 ]; then
+    logger -t shieldnode-cleanup "WARN: /var usage ${VAR_USE}% > 85%"
+    /usr/local/sbin/shieldnode-notify.sh warn "disk-var-high" \
+        "Диск /var заполнен на ${VAR_USE}% (>85%) — риск disk-full (docker-логи? events.db?). Освободите место." \
+        2>/dev/null || true
+fi
+
+# 6) audit C10 (T2-13): /root/vpn-ddos-backup-* — keep 2 последних по mtime
+# (раньше не чистились никогда — утечка по одному backup'у на upgrade).
+ls -1dt /root/vpn-ddos-backup-* 2>/dev/null | tail -n +3 | xargs -r rm -rf
+
 exit 0
 CLEANUP_EOF
 # v3.23.13 BUG-019: подставляем retention из limits.conf
 sed -i "s|__SHIELD_EVENTS_DB_RETENTION_DAYS__|$SHIELD_EVENTS_DB_RETENTION_DAYS|g" \
     /usr/local/sbin/shieldnode-cleanup.sh
-verify_no_placeholders /usr/local/sbin/shieldnode-cleanup.sh || exit 1
+verify_no_placeholders /usr/local/sbin/shieldnode-cleanup.sh || shield_install_fatal_exit 1
 chmod 0755 /usr/local/sbin/shieldnode-cleanup.sh
 
 cat > /etc/systemd/system/shieldnode-cleanup.service <<'EOF'
@@ -7484,6 +8573,16 @@ cat > "$AGG_SCRIPT" <<'AGG_EOF'
 DB="/var/lib/shieldnode/events.db"
 EVENTS_LOG="/var/log/shieldnode/events.log"
 LOG_TAG="shieldnode-agg"
+
+# v4.0.0 (G6 UX-audit): лимиты для текстов events.log читаем из limits.conf
+# (раньше hardcode ct=15000 / 40000/min расходился с реальным nft-лимитом).
+_agg_limit() {
+    local v
+    v=$(grep -E "^$1=" /etc/shieldnode/limits.conf 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "\"'")
+    echo "${v:-$2}"
+}
+AGG_CT_LIMIT=$(_agg_limit SHIELD_CT_CONN_FLOOD 15000)
+AGG_NEWCONN_RATE=$(_agg_limit SHIELD_RATE_NEWCONN "40000/minute")
 
 # Если БД нет — выходим
 [ -r "$DB" ] || { logger -t "$LOG_TAG" "DB not found: $DB"; exit 0; }
@@ -8011,11 +9110,11 @@ TS=$(date '+%Y-%m-%d %H:%M:%S')
     done
     for ip in "${!conn_flood_ips[@]}"; do
         cnt=${conn_flood_ips[$ip]}
-        should_log "$ip" "CONN-FLOOD" "$cnt" && echo "[$TS] CONN-FLOOD ip=$ip hits=$cnt (exceeded ct=15000)"
+        should_log "$ip" "CONN-FLOOD" "$cnt" && echo "[$TS] CONN-FLOOD ip=$ip hits=$cnt (exceeded ct=${AGG_CT_LIMIT})"
     done
     for ip in "${!newconn_flood_ips[@]}"; do
         cnt=${newconn_flood_ips[$ip]}
-        should_log "$ip" "NEWCONN-FLOOD" "$cnt" && echo "[$TS] NEWCONN-FLOOD ip=$ip hits=$cnt (>40000 new conn/min — banned 15min)"
+        should_log "$ip" "NEWCONN-FLOOD" "$cnt" && echo "[$TS] NEWCONN-FLOOD ip=$ip hits=$cnt (>${AGG_NEWCONN_RATE} — banned 15min)"
     done
     for ip in "${!tcp_invalid_ips[@]}"; do
         cnt=${tcp_invalid_ips[$ip]}
@@ -8171,9 +9270,25 @@ NOW=$(date +%s)
     # cleanup'у нужно эксклюзивное окно. Берём lock в shared (exclusive не нужен —
     # SQLite сам через WAL обработает concurrent inserts, нам важно только
     # не пересечься с `mv` в момент cleanup'a).
-    exec {DB_LOCK_FD}> /run/shieldnode/db.lock 2>/dev/null || true
-    flock -s -w 10 "$DB_LOCK_FD" 2>/dev/null || true
-    sqlite3 "$DB" 2>/dev/null
+    #
+    # v4.0.0-hotfix (D11): при неудаче lock'а — ПРОПУСКАЕМ тик (exit 0), а не
+    # продолжаем без lock (race с VACUUM-swap cleanup'ом → частичная запись /
+    # SQLITE_CORRUPT). Cursor обновляется в ТОЙ ЖЕ транзакции BEGIN…COMMIT,
+    # что и события: при failed COMMIT sqlite откатывает и cursor → следующий
+    # тик перечитает journal с правильного места (дубли склеит
+    # ON CONFLICT count=count+N). Cursor отдельно от транзакции не пишется.
+    if ! exec {DB_LOCK_FD}> /run/shieldnode/db.lock 2>/dev/null; then
+        logger -t "$LOG_TAG" "skip tick: /run/shieldnode/db.lock недоступен (RO fs / sandbox?) — тик пропущен, cursor не сдвинут"
+        exit 0
+    fi
+    if ! flock -s -w 10 "$DB_LOCK_FD" 2>/dev/null; then
+        logger -t "$LOG_TAG" "skip tick: db.lock занят >10s (cleanup VACUUM?) — тик пропущен, cursor не сдвинут"
+        exit 0
+    fi
+    if ! sqlite3 "$DB" 2>/tmp/.shieldnode-agg-sqlite.err; then
+        logger -t "$LOG_TAG" "WARN: sqlite batch failed — COMMIT не прошёл, события и cursor откачены (повтор на следующем тике): $(tail -1 /tmp/.shieldnode-agg-sqlite.err 2>/dev/null)"
+    fi
+    rm -f /tmp/.shieldnode-agg-sqlite.err 2>/dev/null
 )
 
 # Лог
@@ -8198,6 +9313,13 @@ fi
 if [ "$STORM_DROPPED" -gt 0 ]; then
     logger -t "$LOG_TAG" "STORM: $STORM_DROPPED unique IPs dropped from attribution (cap $MAX_UNIQUE_IPS_PER_TYPE/type reached). nft drops continue independently."
 fi
+
+# v4.0.0-hotfix (O6): metrics.timer слит в aggregator — метрики экспортируются
+# в конце КАЖДОГО тика (минус отдельный timer + service-прогон в минуту).
+# Метрики запаздывают на длительность тика (≤1 мин) — приемлемо.
+# shieldnode-metrics.service остаётся для ручного запуска/совместимости.
+# || true: сбой метрик не должен фейлить тик aggregator'а.
+[ -x /usr/local/sbin/shieldnode-metrics.sh ] && /usr/local/sbin/shieldnode-metrics.sh || true
 AGG_EOF
 
 # v3.23.13 BUG-019: подставляем настраиваемые значения из limits.conf
@@ -8205,10 +9327,17 @@ sed -i \
     -e "s|__SHIELD_AGG_JOURNAL_LINES__|$SHIELD_AGG_JOURNAL_LINES|g" \
     -e "s|__SHIELD_AGG_MAX_UNIQUE_IPS__|$SHIELD_AGG_MAX_UNIQUE_IPS|g" \
     "$AGG_SCRIPT"
-verify_no_placeholders "$AGG_SCRIPT" || exit 1
+verify_no_placeholders "$AGG_SCRIPT" || shield_install_fatal_exit 1
 
 chmod 0750 "$AGG_SCRIPT"
 print_ok "Aggregator: $AGG_SCRIPT"
+
+# v4.0.0-hotfix (O6): каталог metrics textfile. Aggregator вызывает
+# shieldnode-metrics.sh в конце тика (metrics.timer слит), а его unit ниже
+# имеет ReadWritePaths=/var/lib/node_exporter/textfile_collector — гарантируем
+# существование каталога даже при SHIELD_METRICS=0 (иначе namespace setup
+# сервиса мог бы не собраться на старых systemd).
+mkdir -p /var/lib/node_exporter/textfile_collector
 
 # Systemd service + timer (раз в минуту)
 cat > /etc/systemd/system/shieldnode-aggregator.service <<EOF
@@ -8225,6 +9354,10 @@ ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=$DB_DIR
 ReadWritePaths=$LOG_DIR
+# v4.0.0-hotfix (O6): aggregator вызывает shieldnode-metrics.sh в конце тика
+# (metrics.timer слит). Метрики пишут .prom в textfile_collector — без этой
+# строки под ProtectSystem=strict запись молча падала бы.
+ReadWritePaths=/var/lib/node_exporter/textfile_collector
 # v3.23.19 FIX: под ProtectSystem=strict вся ФС RO кроме ReadWritePaths.
 # Агрегатор пишет lock в /run/shieldnode/agg-state.lock — без этих строк путь RO,
 # lock падает, агрегатор скипает каждый тик и events.db не обновляется.
@@ -8282,19 +9415,25 @@ print_header "ШАГ 12: УСТАНОВКА КОМАНДЫ guard"
 # Запуск:
 #   sudo guard          текстовый снимок
 #   sudo guard --json   JSON для интеграций (Zabbix/Prometheus/боты)
-#   sudo watch -n 5 guard   "live"-режим через стандартный watch(1)
+#   sudo watch -n 5 guard --once   "live"-режим через стандартный watch(1)
 
 GUARD_BIN="/usr/local/bin/guard"
 
 cat > "$GUARD_BIN" <<'GUARD_EOF'
 #!/bin/bash
-# guard — minimalist snapshot dashboard для VPN-ноды.
+# guard — snapshot-дашборд защиты VPN-ноды.
 #
-# v2.3: минималистичный английский интерфейс + интерактив.
-#   sudo guard            снимок + интерактивное меню (1/2/3/4/r/0)
+# v4.0.0 (UX-рестайл): чистое RU-меню; экраны history/top attackers убраны
+#   из UI (events.db продолжает писаться — нужен auto-promote и метрикам).
+#   sudo guard            снимок + интерактивное меню (1/2/3/s/r/0)
 #   sudo guard --json     JSON для интеграций
-#   sudo guard --once     снимок без меню (для cron/мониторинга)
+#   sudo guard --once     снимок без меню (для cron/мониторинга/watch)
 #   sudo guard --help     помощь
+
+# v4.0.0-hotfix (U-L5): LC_ALL=C — printf "%'d" в дашборде не вставляет
+# locale-сепараторы тысяч (в ru_RU это дало бы мусор в числах). Кириллица в
+# строках-литералах bash не затрагивается — байты проходят как есть.
+export LC_ALL=C
 
 case "${1:-}" in
     --help|-h)
@@ -8312,10 +9451,11 @@ Usage:
   sudo guard self-test  health check (v3.23.5+): conntrack, disk, MY_IP, services
 
 Interactive menu:
-  [2] crowdsec banned IPs       [3] whitelist IPs
-  [6] recent history            [7] top attackers (all-time)
+  [1] CrowdSec banned IPs       [2] whitelist management
+  [3] unban all (suspect + confirmed)
   [s] settings                  [r] refresh
   [0] exit
+  (non-tty stdin: prints snapshot once and exits — same as --once)
 
 HELP
         exit 0
@@ -8362,18 +9502,20 @@ HELP
             ISSUES=$((ISSUES + 1))
         fi
 
-        # 5. conntrack_max vs RAM
+        # 5. conntrack_max vs RAM (v4.0.0-hotfix: shieldnode сам выставляет
+        #    tier-aware nf_conntrack_max в 90-shieldnode.conf + hashsize=max/4
+        #    в /etc/modprobe.d/shieldnode-conntrack.conf — проверяем соответствие)
         CT_MAX=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo 0)
         RAM_MB=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
-        RECOMMENDED=262144
-        [ "$RAM_MB" -gt 2000 ] && RECOMMENDED=786432
-        [ "$RAM_MB" -gt 4000 ] && RECOMMENDED=2097152
-        [ "$RAM_MB" -gt 8000 ] && RECOMMENDED=4194304
+        RECOMMENDED=131072
+        [ "$RAM_MB" -ge 2048 ] && RECOMMENDED=262144
+        [ "$RAM_MB" -ge 4096 ] && RECOMMENDED=524288
+        [ "$RAM_MB" -ge 8192 ] && RECOMMENDED=1048576
         if [ "$CT_MAX" -ge "$RECOMMENDED" ]; then
-            echo "  [✓] nf_conntrack_max: $CT_MAX (рекомендованный для ${RAM_MB}MB RAM: $RECOMMENDED)"
+            echo "  [✓] nf_conntrack_max: $CT_MAX (tier для ${RAM_MB}MB RAM: $RECOMMENDED)"
         else
-            echo "  [⚠] nf_conntrack_max: $CT_MAX — мало для ${RAM_MB}MB RAM (рекомендовано $RECOMMENDED)"
-            echo "      Fix: upgrade vpn-node-setup до v5.1.1+ (tier-aware sizing)"
+            echo "  [⚠] nf_conntrack_max: $CT_MAX — мало для ${RAM_MB}MB RAM (ожидается tier $RECOMMENDED)"
+            echo "      Fix: sudo guard upgrade (shieldnode v4.0.0-hotfix+ сам выставляет tier-aware nf_conntrack_max/hashsize)"
             WARNINGS=$((WARNINGS + 1))
         fi
 
@@ -8428,15 +9570,7 @@ HELP
             echo "  [✓] shieldnode-logrotate: OK"
         fi
 
-        # 10. PCAP capture
-        if systemctl is-active --quiet shieldnode-pcap; then
-            echo "  [✓] shieldnode-pcap: active (forensics готов)"
-        else
-            echo "  [⚠] shieldnode-pcap: не активен — нет pcap для хостера при DDoS"
-            WARNINGS=$((WARNINGS + 1))
-        fi
-
-        # 11. Threat blocklist health
+        # 10. Threat blocklist health
         THREAT_COUNT=$(nft list set inet ddos_protect threat_blocklist_v4 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
         if [ "$THREAT_COUNT" -lt 1000 ]; then
             echo "  [⚠] threat_blocklist_v4: только $THREAT_COUNT IPs — feeds могли сломаться"
@@ -8462,13 +9596,31 @@ HELP
         #          Без этого 404/MITM/empty body превращался в `bash <(<html>)` и
         #          мог снести работающую установку.
         if [[ $EUID -ne 0 ]]; then echo "Run as root: sudo guard upgrade"; exit 1; fi
-        REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/shield/main}"
+        # v4.0.0-hotfix (H4): __SHIELD_REPO_URL__ — placeholder, выпекается в
+        # финальный SHIELD_REPO_URL (с учётом SHIELD_FEED_MIRROR на момент
+        # install/upgrade) через sed после генерации guard. Guard — отдельный
+        # скрипт, env установщика у него нет. env SHIELD_REPO_URL по-прежнему
+        # имеет приоритет (runtime override).
+        REPO_URL="${SHIELD_REPO_URL:-__SHIELD_REPO_URL__}"
+        # v4.0.0-hotfix (H4): runtime mirror-override для РФ-нод — тот же
+        # префикс-трюк, что в установщике (no-op если URL уже на mirror).
+        if [ -n "${SHIELD_FEED_MIRROR:-}" ]; then
+            SHIELD_FEED_MIRROR="${SHIELD_FEED_MIRROR%/}/"
+            case "$REPO_URL" in
+                https://raw.githubusercontent.com/*)
+                    REPO_URL="${SHIELD_FEED_MIRROR}${REPO_URL#https://raw.githubusercontent.com/}"
+                    ;;
+            esac
+        fi
         TMP_INSTALLER=$(mktemp /tmp/shieldnode-upgrade.XXXXXX.sh) || { echo "FATAL: mktemp failed"; exit 1; }
         # Удалим временный файл при выходе если до exec не дойдём
         trap 'rm -f "$TMP_INSTALLER"' EXIT
         echo "Downloading installer from $REPO_URL/shieldnode.sh ..."
         if ! curl -fsSL --max-time 60 --retry 2 "$REPO_URL/shieldnode.sh" -o "$TMP_INSTALLER"; then
             echo "FATAL: download failed (network/404/TLS). Aborting upgrade — старая версия не тронута."
+            echo "Если raw.githubusercontent.com недоступен (РФ-нода), задай зеркало:"
+            echo "  постоянно: SHIELD_FEED_MIRROR=https://mirror/ в /etc/shieldnode/limits.conf → повтори guard upgrade"
+            echo "  разово:    sudo SHIELD_FEED_MIRROR=https://mirror/ guard upgrade"
             exit 1
         fi
         if [ ! -s "$TMP_INSTALLER" ]; then
@@ -8551,12 +9703,27 @@ HELP
         fi
         FROM_VER=$(cat "$SNAP/.from_version" 2>/dev/null || echo "?")
         echo "Rolling back to version $FROM_VER (snapshot: $SNAP)"
-        echo -n "Подтвердить rollback? [y/N]: "
-        read -r CONFIRM
-        case "$CONFIRM" in
-            y|Y|yes|YES) ;;
-            *) echo "Отменено."; exit 0 ;;
-        esac
+        # v4.0.0-hotfix (D10 + U-L6): downgrade-warn СЛИТ с общим confirm в
+        # один вопрос (раньше rollback на v3.x задавал два подряд). Rollback
+        # на v3.x воскресит pcap-стек и даст полу-состояние юнитов
+        # (pcap/tarpit/synproxy/ctguard сняты реапером v4.0.0, а v3.x-скрипты
+        # из снапшота их ожидают). Рекомендуется остаться на v4.0.0.
+        # Bypass подтверждения: --force или GUARD_FORCE=1.
+        if [ "${GUARD_FORCE:-0}" != "1" ] && [ "${2:-}" != "--force" ]; then
+            if [[ "$FROM_VER" =~ ^[0-9] ]] && [ "$FROM_VER" != "4.0.0" ] && \
+               [ "$(printf '%s\n4.0.0\n' "$FROM_VER" | sort -V | head -1)" = "$FROM_VER" ]; then
+                echo "⚠ WARNING: rollback на v$FROM_VER (v3.x) воскресит удалённый в v4.0.0 pcap-стек"
+                echo "  и даст полу-состояние юнитов. Рекомендуется остаться на v4.0.0."
+                echo -n "Всё равно подтвердить downgrade-rollback на v$FROM_VER? [y/N]: "
+            else
+                echo -n "Подтвердить rollback? [y/N]: "
+            fi
+            read -r CONFIRM
+            case "$CONFIRM" in
+                y|Y|yes|YES) ;;
+                *) echo "Отменено. (bypass: --force)"; exit 0 ;;
+            esac
+        fi
 
         # Останавливаем юниты ПЕРЕД восстановлением файлов чтобы избежать race
         # v3.18.11 SH-NEW-98: правильные имена unit'ов (раньше были опечатки —
@@ -8568,19 +9735,58 @@ HELP
                        protected-ports-update.service \
                        shieldnode-nftables.service \
                        shieldnode-whitelist.path shieldnode-whitelist.service \
+                       shieldnode-whitelist.timer \
                        shieldnode-update@custom.path 2>/dev/null || true
 
-        # Восстанавливаем /etc/shieldnode
+        # v4.0.0-hotfix (D5): АТОМАРНЫЙ restore /etc/shieldnode и /etc/nftables.d.
+        # Раньше: rm -rf && cp -a — при fail копии (диск полон / IO error) нода
+        # оставалась БЕЗ конфига (хуже исходного состояния). Теперь:
+        #   1) df-проверка места на /etc ДО начала (staging + копия = 2× размера)
+        #   2) staging-сборка из снапшота в /etc/.shieldnode-rollback.XXXXXX
+        #      (та же FS → mv атомарен)
+        #   3) swap: mv текущее в *.pre-rollback.$$ → mv staging на место →
+        #      rm -rf *.pre-rollback.$$
+        # При любой ошибке ДО swap — ничего не тронуто; при ошибке swap —
+        # аварийно возвращаем *.pre-rollback.$$ обратно.
+        atomic_restore_dir() {
+            local src="$1" dst="$2" label="$3"
+            local need_kb avail_kb stage
+            need_kb=$(du -sk "$src" 2>/dev/null | awk '{print $1}'); need_kb=${need_kb:-0}
+            avail_kb=$(df -k --output=avail /etc 2>/dev/null | tail -1 | tr -d ' '); avail_kb=${avail_kb:-0}
+            if [ "$avail_kb" -gt 0 ] && [ "$need_kb" -gt 0 ] && [ "$avail_kb" -lt $((need_kb * 2 + 1024)) ]; then
+                echo "FATAL: мало места на /etc для rollback $label (нужно ~$((need_kb*2))K, доступно ${avail_kb}K) — ничего не тронуто" >&2
+                exit 1
+            fi
+            stage=$(mktemp -d /etc/.shieldnode-rollback.XXXXXX) || { echo "FATAL: mktemp staging failed — ничего не тронуто" >&2; exit 1; }
+            if ! cp -a "$src" "$stage/content" 2>/dev/null; then
+                rm -rf "$stage"
+                echo "FATAL: staging copy $label failed — ничего не тронуто" >&2
+                exit 1
+            fi
+            if [ -d "$dst" ]; then
+                if ! mv "$dst" "${dst}.pre-rollback.$$"; then
+                    rm -rf "$stage"
+                    echo "FATAL: не смог убрать $dst — rollback прерван, ничего не тронуто" >&2
+                    exit 1
+                fi
+            fi
+            if mv "$stage/content" "$dst"; then
+                rm -rf "${dst}.pre-rollback.$$"
+                rm -rf "$stage"
+                echo "  ✔ $label восстановлен (atomic swap)"
+            else
+                # Аварийный откат: возвращаем прежнее состояние
+                [ -d "${dst}.pre-rollback.$$" ] && mv "${dst}.pre-rollback.$$" "$dst" 2>/dev/null
+                rm -rf "$stage"
+                echo "FATAL: swap $label failed — возвращено прежнее состояние" >&2
+                exit 1
+            fi
+        }
         if [ -d "$SNAP/etc-shieldnode" ]; then
-            rm -rf /etc/shieldnode
-            cp -a "$SNAP/etc-shieldnode" /etc/shieldnode
-            echo "  ✔ /etc/shieldnode восстановлен"
+            atomic_restore_dir "$SNAP/etc-shieldnode" /etc/shieldnode "/etc/shieldnode"
         fi
-        # /etc/nftables.d
         if [ -d "$SNAP/etc-nftables.d" ]; then
-            rm -rf /etc/nftables.d
-            cp -a "$SNAP/etc-nftables.d" /etc/nftables.d
-            echo "  ✔ /etc/nftables.d восстановлен"
+            atomic_restore_dir "$SNAP/etc-nftables.d" /etc/nftables.d "/etc/nftables.d"
         fi
         # Бинарники
         for prev in "$SNAP"/*.previous; do
@@ -8602,20 +9808,46 @@ HELP
             echo "  ✔ systemd-юниты восстановлены"
         fi
 
-        # Восстанавливаем nft ruleset напрямую — flush и применяем snapshot
+        # Восстанавливаем nft ruleset — v4.0.0-hotfix (D6): ТОЛЬКО table inet
+        # ddos_protect из снапшота, а не весь ruleset. Полный `nft -f snapshot`
+        # воскрешал таблицы удалённых в v4.0.0 стеков (shield_synproxy,
+        # shield_ctguard) и затирал чужие (docker, ufw). Таблицы старых стеков
+        # при этом сносим (их место — в реапере v4.0.0, не в live-ruleset).
         if [ -s "$SNAP/nft-ruleset.snapshot" ]; then
-            # v3.28.8 FIX: флашим ВСЕ наши таблицы (раньше только ddos_protect →
-            # shield_synproxy/shield_ctguard из снапшота конфликтовали с живыми
-            # при nft -f → частичный/битый restore).
-            for _t in ddos_protect shield_synproxy shield_ctguard; do
+            for _t in shield_synproxy shield_ctguard; do
                 nft delete table inet "$_t" 2>/dev/null || true
             done
-            if nft -f "$SNAP/nft-ruleset.snapshot" 2>/tmp/.nft-rollback.err; then
-                echo "  ✔ nft ruleset восстановлен"
-            else
-                echo "  ⚠ nft -f частично failed — детали: cat /tmp/.nft-rollback.err"
-                echo "    Юниты shieldnode-nftables всё равно перезагружают template'ы при старте."
+            NFT_TMP=$(mktemp /tmp/guard-rollback-nft.XXXXXX.nft 2>/dev/null)
+            if [ -z "$NFT_TMP" ]; then
+                echo "FATAL: mktemp failed — nft ruleset НЕ тронут" >&2
+                exit 1
             fi
+            awk '
+                /^table inet ddos_protect[[:space:]]*\{/ { inblk=1; depth=0 }
+                inblk {
+                    print
+                    depth += gsub(/\{/, "{") - gsub(/\}/, "}")
+                    if (depth == 0) { inblk=0; exit }
+                }
+            ' "$SNAP/nft-ruleset.snapshot" > "$NFT_TMP"
+            if [ -s "$NFT_TMP" ]; then
+                nft delete table inet ddos_protect 2>/dev/null || true
+                if nft -f "$NFT_TMP" 2>/tmp/.nft-rollback.err; then
+                    echo "  ✔ nft table inet ddos_protect восстановлен из снапшота"
+                else
+                    echo "ERROR: nft -f failed — ddos_protect НЕ восстановлен." >&2
+                    echo "       Детали: cat /tmp/.nft-rollback.err; snapshot: $SNAP/nft-ruleset.snapshot" >&2
+                    rm -f "$NFT_TMP"
+                    # Best-effort: сервис перечитает template'ы из /etc/nftables.d
+                    # (уже восстановлены выше) — лучше degraded, чем без защиты.
+                    systemctl daemon-reload 2>/dev/null || true
+                    systemctl restart shieldnode-nftables.service 2>/dev/null || true
+                    exit 1
+                fi
+            else
+                echo "  ℹ В снапшоте нет table inet ddos_protect — только restart сервиса"
+            fi
+            rm -f "$NFT_TMP"
         fi
 
         # Перезапускаем юниты (v3.18.11 SH-NEW-98: правильные имена)
@@ -8640,20 +9872,36 @@ HELP
     sync)
         if [[ $EUID -ne 0 ]]; then echo "Run as root: sudo guard sync"; exit 1; fi
         echo "Syncing lists/custom.txt from github..."
-        systemctl start shieldnode-github-sync.service
-        sleep 2
-        journalctl -t shieldnode-github-sync -n 5 --no-pager 2>/dev/null
-        exit 0
+        # v4.0.0-hotfix (U-M7): systemctl start для Type=oneshot СИНХРОНЕН —
+        # возвращает код завершения сервиса. Убран слепой sleep 2: проверяем
+        # честный результат (exit code + is-failed) и возвращаем !=0 при fail.
+        if systemctl start shieldnode-github-sync.service && \
+           ! systemctl is-failed --quiet shieldnode-github-sync.service; then
+            echo "Sync OK."
+            journalctl -t shieldnode-github-sync -n 5 --no-pager 2>/dev/null
+            exit 0
+        else
+            echo "SYNC FAILED — последние строки журнала:" >&2
+            journalctl -t shieldnode-github-sync -n 10 --no-pager >&2 2>/dev/null
+            exit 1
+        fi
         ;;
     check)
         if [[ $EUID -ne 0 ]]; then echo "Run as root: sudo guard check"; exit 1; fi
         echo "Checking for new version..."
-        systemctl start shieldnode-version-check.service
-        sleep 2
-        if [ -r /var/lib/shieldnode/.upstream_version ]; then
-            cat /var/lib/shieldnode/.upstream_version
+        # v4.0.0-hotfix (U-M7): честный результат вместо sleep 2 (oneshot
+        # синхронен); при fail — журнал + exit 1.
+        if systemctl start shieldnode-version-check.service && \
+           ! systemctl is-failed --quiet shieldnode-version-check.service; then
+            if [ -r /var/lib/shieldnode/.upstream_version ]; then
+                cat /var/lib/shieldnode/.upstream_version
+            fi
+            exit 0
+        else
+            echo "VERSION CHECK FAILED — последние строки журнала:" >&2
+            journalctl -u shieldnode-version-check.service -n 10 --no-pager >&2 2>/dev/null
+            exit 1
         fi
-        exit 0
         ;;
 esac
 
@@ -8668,16 +9916,28 @@ case "${1:-}" in
     --once) MODE="once" ;;
 esac
 
-# ANSI цвета
+# ANSI цвета (v4.0.0 G3: приглушённая палитра — magenta M убрана из палитры)
 if [ "$MODE" != "json" ] && [ -t 1 ]; then
     R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; C='\033[0;36m'
-    M='\033[0;35m'; W='\033[1;37m'; B='\033[1m'; N='\033[0m'
+    W='\033[1;37m'; B='\033[1m'; N='\033[0m'
     DIM='\033[2m'
 else
-    R=''; G=''; Y=''; C=''; M=''; W=''; B=''; N=''; DIM=''
+    R=''; G=''; Y=''; C=''
+    W=''; B=''; N=''; DIM=''
 fi
 
 CS_DB="/var/lib/crowdsec/data/crowdsec.db"
+
+# v4.0.0 (G6 UX-audit): лимиты для UI-текстов читаем из limits.conf, а не
+# hardcode. grep-read вместо source — guard работает от root, limits.conf
+# потенциально редактировался руками (не выполняем чужой код).
+guard_read_limit() {
+    local key="$1" default="$2" val
+    val=$(grep -E "^${key}=" /etc/shieldnode/limits.conf 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "\"'")
+    echo "${val:-$default}"
+}
+SHIELD_CT_CONN_FLOOD=$(guard_read_limit SHIELD_CT_CONN_FLOOD 15000)
+SHIELD_RATE_NEWCONN=$(guard_read_limit SHIELD_RATE_NEWCONN "40000/minute")
 
 # === СБОР МЕТРИК ===
 collect_stats() {
@@ -8724,6 +9984,14 @@ collect_stats() {
         --property=ExecMainExitTimestamp --value 2>/dev/null | \
         xargs -I{} env LC_ALL=C date -d {} '+%Y-%m-%d %H:%M' 2>/dev/null)
     LAST_UPDATE="${LAST_UPDATE:-—}"
+    # audit C6 (T2-05): честный статус — ExecMainExitTimestamp обновляется
+    # даже при FAILED прогоне (timestamp ≠ успех). Сверяем ExecMainStatus.
+    BL_LAST_STATUS=$(systemctl show shieldnode-update@scanner.service \
+        --property=ExecMainStatus --value 2>/dev/null)
+    BL_LAST_STATUS="${BL_LAST_STATUS:-0}"
+    if [ "$BL_LAST_STATUS" != "0" ] || systemctl is-failed --quiet shieldnode-update@scanner.service 2>/dev/null; then
+        LAST_UPDATE="$LAST_UPDATE (last run FAILED — см. journalctl -u shieldnode-update@scanner)"
+    fi
 
     # v2.7: nftables counters — статистика "всего заблокировано"
     # Формат вывода: "counter packets X bytes Y"
@@ -8846,173 +10114,70 @@ human_num() {
     printf "%'d" "${1:-0}" 2>/dev/null || echo "${1:-0}"
 }
 
-# v3.12.0: ASN/owner lookup для top attackers. v3.27.2: через Team Cymru whois.
-# Кэш в events.db (asn_cache table), TTL 7 дней.
-# При no-internet или rate-limit возвращает "?" — guard продолжает работать.
-asn_ttl=604800   # 7 дней
+# (v4.0.0 G1: ASN-lookup'и и top_attackers_24h удалены вместе с UI-экранами
+# history/top attackers. Таблица asn_cache в events.db остаётся — чистится cleanup'ом.)
 
-asn_cache_get() {
-    # echoes "asn|owner|country" if cached and fresh; empty otherwise
-    local ip="$1" db="/var/lib/shieldnode/events.db"
-    [ -r "$db" ] || return 1
-    command -v sqlite3 >/dev/null 2>&1 || return 1
-    local now; now=$(date +%s)
-    # v3.18.11 SH-NEW-106: SQL escape ip — защита от rogue logger-пакетов в journal
-    local esc_ip="${ip//\'/\'\'}"
-    sqlite3 "$db" "SELECT asn || '|' || COALESCE(owner,'') || '|' || COALESCE(country,'') FROM asn_cache WHERE ip = '$esc_ip' AND cached_at + $asn_ttl > $now LIMIT 1" 2>/dev/null
-}
-
-asn_cache_put() {
-    local ip="$1" asn="$2" owner="$3" country="$4" db="/var/lib/shieldnode/events.db"
-    [ -w "$db" ] || return 1
-    command -v sqlite3 >/dev/null 2>&1 || return 1
-    local now; now=$(date +%s)
-    # SQL-escape одинарных кавычек (v3.18.11 SH-NEW-106: ip также)
-    local esc_ip esc_asn esc_owner esc_country
-    esc_ip="${ip//\'/\'\'}"
-    esc_asn=$(echo "$asn"     | sed "s/'/''/g")
-    esc_owner=$(echo "$owner" | sed "s/'/''/g")
-    esc_country=$(echo "$country" | sed "s/'/''/g")
-    sqlite3 "$db" "INSERT INTO asn_cache(ip, asn, owner, country, cached_at) VALUES('$esc_ip','$esc_asn','$esc_owner','$esc_country',$now) ON CONFLICT(ip) DO UPDATE SET asn='$esc_asn', owner='$esc_owner', country='$esc_country', cached_at=$now" 2>/dev/null
-}
-
-asn_lookup_remote() {
-    # v3.27.2 FIX(#3): ipinfo.io (legacy free API) заменён на Team Cymru whois.
-    # Причина: ipinfo legacy без токена = 1000 req/день ОБЩИЕ на исходящий IP +
-    # deprecation-путь + утечка IP атакующих коммерческому geoIP. Team Cymru: без
-    # ключа, поддерживается, отдаёт ASN+owner одним запросом, стандарт в netsec.
-    # Нужен пакет 'whois' (best-effort ставится; нет → "?" в дашборде, не лагает).
-    local ip="$1"
-    if [ -n "${SHIELDNODE_ASN_OFFLINE:-}" ]; then
-        return 1
-    fi
-    command -v whois >/dev/null 2>&1 || { export SHIELDNODE_ASN_OFFLINE=1; return 1; }
-    local resp
-    # timeout-обёртка: whois может зависнуть; 2с — запас для RU→Cymru.
-    resp=$(timeout 2 whois -h whois.cymru.com " -v $ip" 2>/dev/null)
-    if [ -z "$resp" ]; then
-        export SHIELDNODE_ASN_OFFLINE=1
-        return 1
-    fi
-    # Формат Cymru -v (pipe-delimited): AS | IP | BGP Prefix | CC | Registry | Allocated | AS Name
-    # Берём строку, где первое поле — чистое число (данные, не заголовок/NA).
-    echo "$resp" | awk -F'|' '
-        { for (i=1;i<=NF;i++){ gsub(/^[ \t]+|[ \t]+$/,"",$i) } }
-        $1 ~ /^[0-9]+$/ { printf "AS%s|%s|%s\n", $1, ($7==""?"?":$7), ($4==""?"?":$4); exit }'
-}
-
-# Lookup IP → "owner (country)" string (для отображения).
-# Использует кэш + если miss/expired → один lookup через Team Cymru whois.
-asn_owner_string() {
-    local ip="$1"
-    local cached; cached=$(asn_cache_get "$ip")
-    if [ -n "$cached" ]; then
-        local owner country
-        IFS='|' read -r _asn owner country <<< "$cached"
-        if [ -n "$owner" ] && [ "$owner" != "?" ]; then
-            echo "${owner} (${country})"
-        else
-            echo "?"
-        fi
-        return 0
-    fi
-    # Cache miss
-    local fresh; fresh=$(asn_lookup_remote "$ip" 2>/dev/null)
-    if [ -n "$fresh" ]; then
-        local asn owner country
-        IFS='|' read -r asn owner country <<< "$fresh"
-        asn_cache_put "$ip" "$asn" "$owner" "$country"
-        if [ -n "$owner" ] && [ "$owner" != "?" ]; then
-            echo "${owner} (${country})"
-        else
-            echo "?"
-        fi
-        return 0
-    fi
-    echo "?"
-}
-
-# Top-N attackers из events.db за последние 24 часа.
-# Печатает строки "ip<TAB>hits" (наибольшие сверху).
-top_attackers_24h() {
-    local n="${1:-20}" db="/var/lib/shieldnode/events.db"
-    [ -r "$db" ] || return 1
-    command -v sqlite3 >/dev/null 2>&1 || return 1
-    local since=$(( $(date +%s) - 86400 ))
-    sqlite3 -separator $'\t' "$db" \
-        "SELECT ip, SUM(count) as hits FROM events WHERE last_seen >= $since GROUP BY ip ORDER BY hits DESC LIMIT $n" 2>/dev/null
-}
 
 # === ВЫВОД ===
+# v4.0.0 (UX G2/G3): строки «Services ● crowdsec ● bouncer ● ports» и
+# «Conntrack N%» убраны из дашборда («и так известно что работает»); сбор
+# CS_ACTIVE/BOUNCER_ACTIVE/PORTS_PATH_ACTIVE остаётся в collect_stats —
+# они нужны выводу --json. Блок Top attackers убран вместе с экраном [4] (G1).
 draw_snapshot() {
-    local now=$(date '+%Y-%m-%d %H:%M:%S')
     local ip=$(hostname -I 2>/dev/null | awk '{print $1}')
     local hn=$(hostname -s 2>/dev/null)
     local uptime_str
     uptime_str=$(uptime -p 2>/dev/null | sed 's/^up //')
 
-    # ===== HEADER (v3.12.0) =====
+    # ===== ШАПКА =====
     echo ""
-    echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
-    printf  "  ${B}shieldnode v${SHIELDNODE_VERSION}${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
-    echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
+    echo -e "  ${C}══════════════════════════════════════════════════════════════${N}"
+    printf  "  ${B}shieldnode v${SHIELDNODE_VERSION}${N}  ${DIM}·${N}  %s  ${DIM}·  аптайм %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
+    echo -e "  ${C}══════════════════════════════════════════════════════════════${N}"
 
-    # v3.14.0: upgrade banner (если version-check нашёл новую версию)
+    # Баннер обновления (если version-check нашёл новую версию)
     if [ -r /var/lib/shieldnode/.upstream_version ]; then
         UPGRADE_AVAIL=$(grep '^upgrade_available=' /var/lib/shieldnode/.upstream_version 2>/dev/null | cut -d= -f2)
         UPSTREAM_VER=$(grep '^upstream=' /var/lib/shieldnode/.upstream_version 2>/dev/null | cut -d= -f2)
+        # audit C10 (T2-17): показываем возраст проверки — при мёртвом GitHub
+        # upgrade_available не должен выглядеть свежим вечно.
+        VC_CHECKED_AT=$(grep '^checked_at=' /var/lib/shieldnode/.upstream_version 2>/dev/null | cut -d= -f2)
+        VC_FAILED=$(grep '^failed=' /var/lib/shieldnode/.upstream_version 2>/dev/null | cut -d= -f2)
+        VC_AGE_STR=""
+        if [ -n "$VC_CHECKED_AT" ]; then
+            VC_AGE_DAYS=$(( ($(date +%s) - VC_CHECKED_AT) / 86400 ))
+            VC_AGE_STR=" ${DIM}(проверено ${VC_AGE_DAYS}д назад${N}"
+            [ "$VC_FAILED" = "1" ] && VC_AGE_STR="${VC_AGE_STR}${Y}, последняя проверка FAILED${N}"
+            VC_AGE_STR="${VC_AGE_STR}${DIM})${N}"
+        fi
         if [ "$UPGRADE_AVAIL" = "1" ] && [ -n "$UPSTREAM_VER" ]; then
-            echo -e "  ${Y}▲${N} ${B}upgrade available:${N} ${G}v$UPSTREAM_VER${N} — run ${C}sudo guard upgrade${N}"
+            echo -e "  ${Y}▲${N} ${B}Доступно обновление:${N} ${G}v$UPSTREAM_VER${N}$VC_AGE_STR — ${C}sudo guard upgrade${N}"
         fi
     fi
     echo ""
 
-    # ===== ACTIVE THREATS (right now) =====
+    # ===== АКТИВНЫЕ УГРОЗЫ (прямо сейчас) =====
     local active_color="${G}"
     [ "$((CS_BANS + CONFIRMED_COUNT))" -gt 0 ] && active_color="${R}"
-    echo -e "  ${B}Active threats (right now)${N}"
-    printf  "  ├─ ${active_color}confirmed attack${N}    %s IP banned 15min\n"          "$(human_num "$CONFIRMED_COUNT")"
-    printf  "  ├─ ${active_color}suspect (watched)${N}   %s IP under 30min observation\n" "$(human_num "$SUSPECT_COUNT")"
-    printf  "  ├─ ${active_color}crowdsec bans${N}       %s IPs\n"                       "$(human_num "$CS_BANS")"
+    echo -e "  ${B}Активные угрозы${N} ${DIM}(прямо сейчас)${N}"
+    printf  "  ├─ ${active_color}подтверждённая атака${N}  %8s IP ${DIM}(бан 15 мин)${N}\n"      "$(human_num "$CONFIRMED_COUNT")"
+    printf  "  ├─ ${active_color}под наблюдением${N}       %8s IP ${DIM}(30 мин наблюдения)${N}\n" "$(human_num "$SUSPECT_COUNT")"
+    printf  "  ├─ ${active_color}баны CrowdSec${N}         %8s IP\n"                        "$(human_num "$CS_BANS")"
     local bl_summary="scanner=$(human_num "$BL_V4")"
     [ "$THREAT_SET_SIZE" -gt 0 ] && bl_summary+=", threat=$(human_num "$THREAT_SET_SIZE")"
     [ "$TOR_SET_SIZE"    -gt 0 ] && bl_summary+=", tor=$(human_num "$TOR_SET_SIZE")"
-    bl_summary+=", custom=$(human_num "$CUSTOM_SET_SIZE")"   # v3.23.18: всегда видно (даже 0)
-    # v3.27.0 FIX(#7): суммарный v6-blocklist (если фиды отдали v6)
+    bl_summary+=", custom=$(human_num "$CUSTOM_SET_SIZE")"   # всегда видно (даже 0)
+    # Суммарный v6-blocklist (если фиды отдали v6)
     BL_V6_TOTAL=0
     for s in scanner_blocklist_v6 threat_blocklist_v6 custom_blocklist_v6 tor_exit_blocklist_v6; do
         _n=$(nft list set inet ddos_protect "$s" 2>/dev/null | tr '\n' ' ' | grep -oiE '([0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}(/[0-9]+)?' | grep -c ':')
         BL_V6_TOTAL=$(( BL_V6_TOTAL + ${_n:-0} ))
     done
     [ "$BL_V6_TOTAL" -gt 0 ] 2>/dev/null && bl_summary+=", ${C}v6=$(human_num "$BL_V6_TOTAL")${N}"
-    # v3.28.2 FIX: %b (не %s) — bl_summary содержит ${C}/${N} (=\033[..]); в %s-аргументе
-    # printf escape НЕ интерпретирует → раньше печатался сырой "\033[0;36m" вокруг v6.
-    printf  "  └─ ${DIM}blocklists${N}          %b\n" "$bl_summary"
-    # v3.20.0+: mobile-RU и broadband-RU whitelist строки УБРАНЫ (whitelist'ы удалены)
+    # %b (не %s) — bl_summary содержит ${C}/${N} (=\033[..]); в %s-аргументе
+    # printf escape НЕ интерпретирует (v3.28.2 FIX).
+    printf  "  └─ ${DIM}blocklists${N}            %b\n" "$bl_summary"
     echo ""
-
-    # ===== SERVICES (compact one-line) =====
-    local svc_line=""
-    svc_line+=$(svc_dot "$CS_ACTIVE" "crowdsec")"  "
-    svc_line+=$(svc_dot "$BOUNCER_ACTIVE" "bouncer")"  "
-    svc_line+=$(svc_dot "$PORTS_PATH_ACTIVE" "ports")
-    echo -e "  ${B}Services${N}    $svc_line"
-    echo ""
-
-    # ===== CONNTRACK PRESSURE (v3.24.0) =====
-    local ct_cnt ct_max ct_pct ct_color="${G}"
-    ct_cnt=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo 0)
-    ct_max=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo 0)
-    if [ "${ct_max:-0}" -gt 0 ] 2>/dev/null; then
-        ct_pct=$(( ct_cnt * 100 / ct_max ))
-        [ "$ct_pct" -ge 80 ] && ct_color="${Y}"
-        [ "$ct_pct" -ge 90 ] && ct_color="${R}"
-        printf "  ${B}Conntrack${N}   ${ct_color}%s%%${N} ${DIM}(%s / %s)${N}" "$ct_pct" "$(human_num "$ct_cnt")" "$(human_num "$ct_max")"
-        echo ""
-        echo ""
-    fi
-
-    # v3.37.0: секция ctguard убрана из дашборда — слой удалён.
 
     # ===== v3.27.0 FIX(#10): BRIDGE/WHITELIST DRIFT ADVISORY (read-only, O(1) на IP) =====
     # TRUSTED_IPS из conf, которых НЕТ в живом nft manual_whitelist_v4 → их трафик
@@ -9045,86 +10210,51 @@ draw_snapshot() {
         fi
     fi
 
-    # ===== PROTECTED PORTS =====
-    echo -e "  ${B}Protected${N}"
+
+    # ===== ЗАЩИЩЁННЫЕ ПОРТЫ =====
+    echo -e "  ${B}Защищённые порты${N}"
     printf  "  ├─ ${DIM}TCP:${N}  ${C}%s${N}\n" "$PROTECTED_TCP_LIST"
     printf  "  └─ ${DIM}UDP:${N}  ${C}%s${N}\n" "$PROTECTED_UDP_LIST"
     echo ""
 
-    # ===== TOP ATTACKERS (v3.12.0, last 24h, with ASN/owner) =====
-    local top_lines
-    top_lines=$(top_attackers_24h 5)
-    if [ -n "$top_lines" ]; then
-        echo -e "  ${B}Top attackers${N} ${DIM}(last 24h)${N}"
-        local fmtd=""
-        local lcount=0
-        while IFS=$'\t' read -r ip hits; do
-            [ -z "$ip" ] && continue
-            lcount=$((lcount+1))
-            local owner; owner=$(asn_owner_string "$ip")
-            local prefix="├─"
-            fmtd+=$(printf "  %s ${R}%-15s${N} ${DIM}%5s hits${N}   %s\n" "$prefix" "$ip" "$(human_num "$hits")" "$owner")
-            fmtd+=$'\n'
-        done <<< "$top_lines"
-        # Меняем последний ├─ на └─
-        if [ -n "$fmtd" ]; then
-            fmtd=$(echo -e "$fmtd" | sed -E '$ s/├─/└─/' )
-            echo -e "$fmtd"
-        fi
-        echo ""
-    fi
-
-    # ===== TODAY (drops / bytes) =====
-    # v3.37.0: ctguard counters убраны из тотала (слой удалён)
+    # ===== ДРОПЫ ПАКЕТОВ (со старта защиты) =====
     local total_pkts=$((SCANNER_PKTS_V4 + TOR_PKTS_V4 + THREAT_PKTS_V4 + CUSTOM_PKTS_V4 + CONFIRMED_PKTS_V4 + SYN_CONF_PKTS_V4 + UDP_CONF_PKTS_V4 + CONN_FLOOD_PKTS_V4 + NEWCONN_FLOOD_PKTS_V4 + TCP_INVALID_PKTS + SSH_CONN_FLOOD_PKTS_V4 + SSH_NEWCONN_FLOOD_PKTS_V4))
     local total_bytes=$((SCANNER_BYTES_V4 + TOR_BYTES_V4 + THREAT_BYTES_V4 + CUSTOM_BYTES_V4 + CONFIRMED_BYTES_V4 + SYN_CONF_BYTES_V4 + UDP_CONF_BYTES_V4 + CONN_FLOOD_BYTES_V4 + NEWCONN_FLOOD_BYTES_V4 + TCP_INVALID_BYTES + SSH_CONN_FLOOD_BYTES_V4 + SSH_NEWCONN_FLOOD_BYTES_V4))
 
-    echo -e "  ${B}Drops since reboot${N} ${DIM}($NFT_SINCE)${N}"
-    printf  "  ├─ ${DIM}scanner${N}             %12s pkts  ${DIM}/${N} %s\n" "$(human_num "$SCANNER_PKTS_V4")" "$(human_bytes "$SCANNER_BYTES_V4")"
+    # v4.0.0-hotfix (U-M5): label честно называет baseline — счётчики nft
+    # живут с момента загрузки ruleset (перезагрузки nftables), не с reboot.
+    echo -e "  ${B}Дропы с перезагрузки nftables${N} ${DIM}(с $NFT_SINCE)${N}"
+    printf  "  ├─ ${DIM}сканеры${N}               %12s pkts  ${DIM}/${N} %s\n" "$(human_num "$SCANNER_PKTS_V4")" "$(human_bytes "$SCANNER_BYTES_V4")"
     if [ "$THREAT_SET_SIZE" -gt 0 ] || [ "$THREAT_PKTS_V4" -gt 0 ]; then
-        printf  "  ├─ ${DIM}threat${N}              %12s pkts  ${DIM}/${N} %s\n" "$(human_num "$THREAT_PKTS_V4")" "$(human_bytes "$THREAT_BYTES_V4")"
+        printf  "  ├─ ${DIM}threat-feed${N}           %12s pkts  ${DIM}/${N} %s\n" "$(human_num "$THREAT_PKTS_V4")" "$(human_bytes "$THREAT_BYTES_V4")"
     fi
     if [ "$CUSTOM_SET_SIZE" -gt 0 ] || [ "$CUSTOM_PKTS_V4" -gt 0 ]; then
-        printf  "  ├─ ${DIM}custom${N}              %12s pkts  ${DIM}/${N} %s\n" "$(human_num "$CUSTOM_PKTS_V4")" "$(human_bytes "$CUSTOM_BYTES_V4")"
+        printf  "  ├─ ${DIM}custom-feed${N}           %12s pkts  ${DIM}/${N} %s\n" "$(human_num "$CUSTOM_PKTS_V4")" "$(human_bytes "$CUSTOM_BYTES_V4")"
     fi
     if [ "$TOR_SET_SIZE" -gt 0 ] || [ "$TOR_PKTS_V4" -gt 0 ]; then
-        printf  "  ├─ ${DIM}tor exit${N}            %12s pkts  ${DIM}/${N} %s\n" "$(human_num "$TOR_PKTS_V4")" "$(human_bytes "$TOR_BYTES_V4")"
+        printf  "  ├─ ${DIM}tor exit${N}              %12s pkts  ${DIM}/${N} %s\n" "$(human_num "$TOR_PKTS_V4")" "$(human_bytes "$TOR_BYTES_V4")"
     fi
-    printf  "  ├─ ${DIM}confirmed-attack${N}    %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$CONFIRMED_PKTS_V4")" "$(human_bytes "$CONFIRMED_BYTES_V4")"
-    printf  "  ├─ ${DIM}rate-limit (syn)${N}    %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$SYN_CONF_PKTS_V4")" "$(human_bytes "$SYN_CONF_BYTES_V4")"
-    printf  "  ├─ ${DIM}rate-limit (udp)${N}    %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$UDP_CONF_PKTS_V4")" "$(human_bytes "$UDP_CONF_BYTES_V4")"
-    printf  "  ├─ ${DIM}conn-flood (ct>15000)${N} %10s pkts  ${DIM}/${N} %s\n"   "$(human_num "$CONN_FLOOD_PKTS_V4")" "$(human_bytes "$CONN_FLOOD_BYTES_V4")"
-    printf  "  ├─ ${DIM}new-conn flood${N}      %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$NEWCONN_FLOOD_PKTS_V4")" "$(human_bytes "$NEWCONN_FLOOD_BYTES_V4")"
-    printf  "  ├─ ${DIM}ssh conn-flood${N}      %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$SSH_CONN_FLOOD_PKTS_V4")" "$(human_bytes "$SSH_CONN_FLOOD_BYTES_V4")"
-    printf  "  ├─ ${DIM}ssh new-conn flood${N}  %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$SSH_NEWCONN_FLOOD_PKTS_V4")" "$(human_bytes "$SSH_NEWCONN_FLOOD_BYTES_V4")"
-    printf  "  ├─ ${DIM}TCP flag invalid${N}    %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$TCP_INVALID_PKTS")" "$(human_bytes "$TCP_INVALID_BYTES")"
-    printf  "  └─ ${B}total${N}               ${B}%12s${N} pkts  ${DIM}/${N} ${B}%s${N}\n" "$(human_num "$total_pkts")" "$(human_bytes "$total_bytes")"
+    printf  "  ├─ ${DIM}подтверждённые${N}        %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$CONFIRMED_PKTS_V4")" "$(human_bytes "$CONFIRMED_BYTES_V4")"
+    printf  "  ├─ ${DIM}rate-limit (syn)${N}      %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$SYN_CONF_PKTS_V4")" "$(human_bytes "$SYN_CONF_BYTES_V4")"
+    printf  "  ├─ ${DIM}rate-limit (udp)${N}      %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$UDP_CONF_PKTS_V4")" "$(human_bytes "$UDP_CONF_BYTES_V4")"
+    printf  "  ├─ ${DIM}conn-flood${N}            %12s pkts  ${DIM}/${N} %s  ${DIM}(лимит ct>%s)${N}\n" "$(human_num "$CONN_FLOOD_PKTS_V4")" "$(human_bytes "$CONN_FLOOD_BYTES_V4")" "$SHIELD_CT_CONN_FLOOD"
+    printf  "  ├─ ${DIM}new-conn flood${N}        %12s pkts  ${DIM}/${N} %s  ${DIM}(лимит %s)${N}\n" "$(human_num "$NEWCONN_FLOOD_PKTS_V4")" "$(human_bytes "$NEWCONN_FLOOD_BYTES_V4")" "$SHIELD_RATE_NEWCONN"
+    printf  "  ├─ ${DIM}ssh conn-flood${N}        %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$SSH_CONN_FLOOD_PKTS_V4")" "$(human_bytes "$SSH_CONN_FLOOD_BYTES_V4")"
+    printf  "  ├─ ${DIM}ssh new-conn flood${N}    %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$SSH_NEWCONN_FLOOD_PKTS_V4")" "$(human_bytes "$SSH_NEWCONN_FLOOD_BYTES_V4")"
+    printf  "  ├─ ${DIM}TCP flag invalid${N}      %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$TCP_INVALID_PKTS")" "$(human_bytes "$TCP_INVALID_BYTES")"
+    printf  "  └─ ${B}всего${N}                 ${B}%12s${N} pkts  ${DIM}/${N} ${B}%s${N}\n" "$(human_num "$total_pkts")" "$(human_bytes "$total_bytes")"
     echo ""
 
-    # ===== ALL-TIME (persistent) =====
-    echo -e "  ${B}All-time history${N} ${DIM}(since $DB_SINCE)${N}"
-    printf  "  ├─ ${M}scanners blocked:${N}    %12s unique IPs ${DIM}(%s hits)${N}\n" "$(human_num "$ALLTIME_SCANNERS")"   "$(human_num "$ALLTIME_SCANNER_PKTS")"
-    printf  "  ├─ ${M}ddos blocked:${N}        %12s unique IPs ${DIM}(%s hits)${N}\n" "$(human_num "$ALLTIME_DDOS")"       "$(human_num "$ALLTIME_DDOS_PKTS")"
-    printf  "  └─ ${M}ssh brute attempts:${N}  %12s unique IPs ${DIM}(crowdsec)${N}\n" "$(human_num "$CS_ALLTIME_BANS")"
+    # ===== ЗА ВСЁ ВРЕМЯ (persistent, events.db) =====
+    echo -e "  ${B}За всё время${N} ${DIM}(с $DB_SINCE)${N}"
+    printf  "  ├─ ${C}сканеры:${N}          %12s уникальных IP ${DIM}(%s hits)${N}\n" "$(human_num "$ALLTIME_SCANNERS")"   "$(human_num "$ALLTIME_SCANNER_PKTS")"
+    printf  "  ├─ ${C}DDoS:${N}              %12s уникальных IP ${DIM}(%s hits)${N}\n" "$(human_num "$ALLTIME_DDOS")"       "$(human_num "$ALLTIME_DDOS_PKTS")"
+    printf  "  └─ ${C}ssh-брутфорс:${N}     %12s уникальных IP ${DIM}(CrowdSec)${N}\n" "$(human_num "$CS_ALLTIME_BANS")"
     echo ""
 
-    # v3.15.1: блок "Recent events (last 5)" убран — дублировал [9] view full log
-
-    printf "  ${DIM}Blocklist updated: %s${N}\n" "$LAST_UPDATE"
+    printf "  ${DIM}Обновление blocklists: %s${N}\n" "$LAST_UPDATE"
 }
 
-# Helper: status dot для compact services line
-svc_dot() {
-    local status="$1"
-    local label="$2"
-    case "$status" in
-        active)        echo -e "${G}●${N} ${DIM}${label}${N}" ;;
-        inactive)      echo -e "${Y}●${N} ${DIM}${label}${N}" ;;
-        failed)        echo -e "${R}●${N} ${DIM}${label}${N}" ;;
-        activating)    echo -e "${Y}◐${N} ${DIM}${label}${N}" ;;
-        *)             echo -e "${Y}?${N} ${DIM}${label}${N}" ;;
-    esac
-}
 
 # === Просмотр списков ===
 show_crowdsec_bans() {
@@ -9203,9 +10333,17 @@ show_whitelist_ips() {
                 # v3.18.11 SH-NEW-10: явно отклоняем 0.0.0.0/x (whitelist всего интернета)
                 #                     и multicast/broadcast.
                 if ! echo "$NEW_IP" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$'; then
-                    echo -e "  ${Y}Invalid format. Expected: 1.2.3.4 or 10.0.0.0/24${N}"
+                    echo -e "  ${Y}Неверный формат. Ожидается: 1.2.3.4 или 10.0.0.0/24${N}"
                 elif echo "$NEW_IP" | grep -qE '^(0\.|22[4-9]\.|23[0-9]\.|24[0-9]\.|25[0-5]\.|255\.255\.255\.255)'; then
-                    echo -e "  ${R}Refused:${N} $NEW_IP (0.0.0.0/x, multicast и broadcast не разрешены)"
+                    echo -e "  ${R}Отклонено:${N} $NEW_IP (0.0.0.0/x, multicast и broadcast не разрешены)"
+                elif ! printf '%s\n' "$NEW_IP" | awk -F'[./]' '
+                        NF==4 { ok=($1<=255 && $2<=255 && $3<=255 && $4<=255) }
+                        NF==5 { ok=($1<=255 && $2<=255 && $3<=255 && $4<=255 && $5>=8 && $5<=32) }
+                        NF<4 || NF>5 { ok=0 }
+                        END{ exit(ok?0:1) }'; then
+                    # Строгая проверка (audit F4): октеты 0-255, префикс /8-/32 —
+                    # /0-/7 отклоняем (whitelist огромных блоков через опечатку).
+                    echo -e "  ${R}Отклонено:${N} $NEW_IP (октеты 0-255, префикс /8-/32; /0-/7 запрещены)"
                 else
                     # Проверяем дубликат
                     if grep -qxF "$NEW_IP" "$WL_FILE" 2>/dev/null; then
@@ -9278,9 +10416,17 @@ show_whitelist_ips() {
             f|F)
                 echo ""
                 echo -e "  Force re-sync..."
+                # Честный force (audit T4-7): сносим hash-marker — иначе hash-guard
+                # превратит запуск в no-op. И проверяем РЕЗУЛЬТАТ, а не печатаем
+                # ложный «✓ Re-sync done» безусловно.
+                rm -f /var/lib/shieldnode/.applied-whitelist.sha256 2>/dev/null
                 systemctl start shieldnode-whitelist.service 2>&1
                 sleep 1
-                echo -e "  ${G}✓${N} Re-sync done"
+                if systemctl is-failed --quiet shieldnode-whitelist.service 2>/dev/null; then
+                    echo -e "  ${R}✗${N} Re-sync FAILED — см. journalctl -u shieldnode-whitelist -n 20"
+                else
+                    echo -e "  ${G}✓${N} Re-sync done"
+                fi
                 journalctl -t shieldnode-whitelist -n 1 --no-pager 2>/dev/null | sed 's/^/  /'
                 echo ""
                 echo -ne "  ${DIM}Press Enter...${N}"
@@ -9297,75 +10443,6 @@ show_whitelist_ips() {
     done
 }
 
-show_history() {
-    echo ""
-    local db="/var/lib/shieldnode/events.db"
-
-    if [ ! -r "$db" ] || ! command -v sqlite3 >/dev/null 2>&1; then
-        echo -e "${Y}History DB not available${N}"
-        echo -e "${DIM}Aggregator должен запуститься: sudo systemctl start shieldnode-aggregator.service${N}"
-        echo ""
-        return
-    fi
-
-    echo -e "${B}Recent blocked events${N} ${DIM}(last 30, from /var/lib/shieldnode/events.db)${N}"
-    echo -e "${DIM}─────────────────────────────────${N}"
-    printf "  ${DIM}%-10s %-18s %-9s %s${N}\n" "TYPE" "IP" "HITS" "LAST SEEN"
-
-    sqlite3 "$db" "
-        SELECT type, ip, count, datetime(last_seen, 'unixepoch', 'localtime')
-        FROM events
-        ORDER BY last_seen DESC
-        LIMIT 30
-    " 2>/dev/null | while IFS='|' read -r type ip cnt ts; do
-        case "$type" in
-            scanner) color="${Y}" ;;
-            ddos)    color="${R}" ;;
-            *)       color="${N}" ;;
-        esac
-        printf "  ${color}%-10s${N} %-18s ${B}%-9s${N} ${DIM}%s${N}\n" "$type" "$ip" "$cnt" "$ts"
-    done
-    echo ""
-
-    local total_scan total_ddos
-    total_scan=$(sqlite3 "$db" "SELECT COUNT(*) FROM events WHERE type='scanner'" 2>/dev/null)
-    total_ddos=$(sqlite3 "$db" "SELECT COUNT(*) FROM events WHERE type='ddos'" 2>/dev/null)
-    printf "  Total in DB: ${Y}${B}%d${N} scanners, ${R}${B}%d${N} ddos\n" "${total_scan:-0}" "${total_ddos:-0}"
-    echo ""
-}
-
-# v2.9: топ-атакующих из sqlite
-show_top_attackers() {
-    echo ""
-    local db="/var/lib/shieldnode/events.db"
-
-    if [ ! -r "$db" ] || ! command -v sqlite3 >/dev/null 2>&1; then
-        echo -e "${Y}History DB not available${N}"
-        echo ""
-        return
-    fi
-
-    echo -e "${B}Top-20 attackers (by hit count, all-time)${N}"
-    echo -e "${DIM}─────────────────────────────────${N}"
-    printf "  ${DIM}%-10s %-18s %-9s %s${N}\n" "TYPE" "IP" "HITS" "FIRST SEEN"
-
-    sqlite3 "$db" "
-        SELECT type, ip, count, datetime(first_seen, 'unixepoch', 'localtime')
-        FROM events
-        ORDER BY count DESC
-        LIMIT 20
-    " 2>/dev/null | while IFS='|' read -r type ip cnt ts; do
-        case "$type" in
-            scanner) color="${Y}" ;;
-            ddos)    color="${R}" ;;
-            *)       color="${N}" ;;
-        esac
-        printf "  ${color}%-10s${N} %-18s ${B}%-9s${N} ${DIM}%s${N}\n" "$type" "$ip" "$cnt" "$ts"
-    done
-    echo ""
-    echo -e "  ${DIM}Tip: высокий hit-count → персистентный сканер/атакующий${N}"
-    echo ""
-}
 
 # v3.9: разбан всех IP в suspect_v4 и confirmed_attack_v4 одной командой.
 # Используется при ложных срабатываниях или при ручной коррекции.
@@ -9378,8 +10455,8 @@ unban_all() {
         grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
     # v3.22.0: собираем уникальные IP из обоих set'ов для последующего
     # conntrack -D. Это критично для CGNAT FP: если юзер успел до бана
-    # открыть 15000+ соединений (conntrack ESTABLISHED держит до 5 дней),
-    # ct count over 15000 продолжает дропать его SYN'ы даже после
+    # открыть SHIELD_CT_CONN_FLOOD+ соединений (conntrack ESTABLISHED держит до 5 дней),
+    # ct count over $SHIELD_CT_CONN_FLOOD продолжает дропать его SYN'ы даже после
     # nft flush. conntrack -D -s сбрасывает существующие entries.
     banned_ips=$( (nft list set inet ddos_protect suspect_v4 2>/dev/null;
                    nft list set inet ddos_protect confirmed_attack_v4 2>/dev/null) | \
@@ -9409,7 +10486,7 @@ unban_all() {
             if [ "$ct_flushed" -gt 0 ]; then
                 echo -e "  ${G}✓${N} Conntrack entries сброшены для $ct_flushed IP (extreme-CGNAT defence)"
             elif ! command -v conntrack >/dev/null 2>&1; then
-                echo -e "  ${Y}!${N} conntrack пакет не установлен — extreme-CGNAT юзеры могут остаться в ct count over 15000"
+                echo -e "  ${Y}!${N} conntrack пакет не установлен — extreme-CGNAT юзеры могут остаться в ct count over ${SHIELD_CT_CONN_FLOOD}"
                 echo -e "  ${DIM}Установи: sudo apt install -y conntrack${N}"
             fi
             ;;
@@ -9543,7 +10620,7 @@ show_settings_menu() {
         echo -e "  [${B}2${N}] Check for shieldnode updates  $s2  ${DIM}(every 1d)${N}"
         echo -e "  [${B}3${N}] Tor exit blocklist            $s4"
         echo ""
-        echo -e "  ${DIM}Единый лимит ct=15000 для всех IP.${N}"
+        echo -e "  ${DIM}Единый лимит conn-flood ct=${SHIELD_CT_CONN_FLOOD}, new-conn ${SHIELD_RATE_NEWCONN} для всех IP (limits.conf).${N}"
         echo ""
         echo ""
         # v3.18.8: Trusted IPs counter
@@ -9658,14 +10735,14 @@ show_settings_menu() {
                             if [ "$is_cidr_input" = "1" ]; then
                                 local prefix="${NEW_IP##*/}"
                                 if [ "$prefix" -lt 8 ] || [ "$prefix" -gt 32 ]; then
-                                    echo -e "  ${R}Refused:${N} prefix должен быть от /8 до /32"
+                                    echo -e "  ${R}Отклонено:${N} prefix должен быть от /8 до /32"
                                     sleep 1
                                     continue
                                 fi
                             fi
                             # v3.18.11 SH-NEW-10: отклоняем 0.0.0.0, multicast, broadcast
                             if echo "$NEW_IP" | grep -qE '^(0\.|22[4-9]\.|23[0-9]\.|24[0-9]\.|25[0-5]\.|255\.255\.255\.255)'; then
-                                echo -e "  ${R}Refused:${N} $NEW_IP (0.x, multicast и broadcast не разрешены)"
+                                echo -e "  ${R}Отклонено:${N} $NEW_IP (0.x, multicast и broadcast не разрешены)"
                                 sleep 1
                                 continue
                             fi
@@ -9910,40 +10987,53 @@ if [ "$MODE" = "once" ]; then
 fi
 
 # === MODE: INTERACTIVE ===
+# v4.0.0-hotfix (UX): без tty (pipe, cron, systemd) — показываем снимок один
+# раз и выходим, вместо busy-loop на `read` при EOF stdin.
+if [ ! -t 0 ]; then
+    collect_stats
+    draw_snapshot
+    exit 0
+fi
 while true; do
     collect_stats
     clear 2>/dev/null
     draw_snapshot
 
-    # ===== MENU =====
-    # v3.2: убраны эмодзи из меню — они занимают 2-cell в терминале и ломают рамки
-    echo -e "${C}┌─────────────────────────────────────────────────────────────────┐${N}"
-    echo -e "${C}│${N}  ${B}Actions${N}                                                        ${C}│${N}"
-    echo -e "${C}├─────────────────────────────────────────────────────────────────┤${N}"
-    echo -e "${C}│${N}  [${B}1${N}] CrowdSec bans          [${B}2${N}] Whitelist manage                ${C}│${N}"
-    echo -e "${C}│${N}  [${B}3${N}] Recent history         [${B}4${N}] Top attackers                   ${C}│${N}"
-    echo -e "${C}│${N}  [${B}5${N}] Unban all                                                  ${C}│${N}"
-    echo -e "${C}│${N}  [${B}s${N}] Settings                                                   ${C}│${N}"
-    echo -e "${C}├─────────────────────────────────────────────────────────────────┤${N}"
-    echo -e "${C}│${N}  [${B}r${N}] Refresh                [${B}0${N}] Exit                            ${C}│${N}"
-    echo -e "${C}└─────────────────────────────────────────────────────────────────┘${N}"
+    # ===== МЕНЮ (v4.0.0 G1/G3: history/top attackers убраны, нумерация плотная,
+    # единый RU-стиль, приглушённая палитра cyan/gray) =====
+    # Без эмодзи: они занимают 2-cell в терминале и ломают рамки (v3.2).
+    echo -e "  ${C}┌────────────────────────────────────────────────────────────────┐${N}"
+    echo -e "  ${C}│${N}  ${B}Действия${N}                                                      ${C}│${N}"
+    echo -e "  ${C}├────────────────────────────────────────────────────────────────┤${N}"
+    echo -e "  ${C}│${N}  [${B}1${N}] Баны CrowdSec           [${B}2${N}] Whitelist (управление)        ${C}│${N}"
+    echo -e "  ${C}│${N}  [${B}3${N}] Разбанить всех           [${B}s${N}] Настройки                    ${C}│${N}"
+    echo -e "  ${C}├────────────────────────────────────────────────────────────────┤${N}"
+    echo -e "  ${C}│${N}  [${B}r${N}] Обновить                 [${B}0${N}] Выход                        ${C}│${N}"
+    echo -e "  ${C}└────────────────────────────────────────────────────────────────┘${N}"
+    echo -e "  ${DIM}Клавиша — действие. Enter — обновить снимок.${N}"
     echo -ne "  ${B}>${N} "
 
-    read -r CHOICE
+    # EOF на stdin (Ctrl-D / pipe закрылся) = выход, иначе read возвращает 1
+    # мгновенно → busy-loop с clear/draw_snapshot (v4.0.0-hotfix UX).
+    read -r CHOICE || { echo; clear 2>/dev/null; exit 0; }
     case "$CHOICE" in
         1) show_crowdsec_bans    ;;
         2) show_whitelist_ips    ;;
-        3) show_history          ;;
-        4) show_top_attackers    ;;
-        5) unban_all             ;;
+        3) unban_all             ;;
         s|S) show_settings_menu  ;;
         r|R|"") continue ;;
         0|q|quit|exit) clear 2>/dev/null; exit 0 ;;
-        *) echo -e "  ${Y}Unknown: $CHOICE${N}" ;;
+        *)
+            # Неизвестная клавиша: короткое сообщение + перерисовка
+            # (НЕ молчаливый continue).
+            echo -e "  ${Y}Нет такого пункта: '$CHOICE'${N} ${DIM}— клавиши: 1, 2, 3, s, r, 0${N}"
+            sleep 1
+            continue
+            ;;
     esac
 
     if [ "$CHOICE" != "r" ] && [ "$CHOICE" != "R" ] && [ "$CHOICE" != "" ]; then
-        echo -ne "  ${DIM}Press Enter to return...${N}"
+        echo -ne "  ${DIM}Enter — назад в меню...${N}"
         read -r _
     fi
 done
@@ -9952,6 +11042,13 @@ GUARD_EOF
 # v3.20.6: literal '${SHIELDNODE_VERSION}' внутри quoted heredoc'а не expand'ится.
 # Подставляем актуальную версию через sed после генерации файла.
 sed -i "s/\${SHIELDNODE_VERSION}/${SHIELDNODE_VERSION}/g" "$GUARD_BIN"
+# v4.0.0-hotfix (H4): выпекаем финальный SHIELD_REPO_URL (уже с учётом
+# SHIELD_FEED_MIRROR) в guard upgrade — guard отдельный скрипт без env
+# установщика, раньше всегда падал на github-default даже при active mirror.
+# Паттерн тот же, что у остальных embedded-скриптов (__SHIELD_*__ + sed +
+# verify_no_placeholders). & в URL escape'им для sed replacement.
+sed -i "s|__SHIELD_REPO_URL__|${SHIELD_REPO_URL//&/\\&}|g" "$GUARD_BIN"
+verify_no_placeholders "$GUARD_BIN" || shield_install_fatal_exit 1
 
 chmod 0755 "$GUARD_BIN"
 print_ok "Команда установлена: $GUARD_BIN"
@@ -10322,39 +11419,6 @@ if [ "$DISK_USAGE" -ge 80 ]; then
     [ "$LARGE_LOGS_ROTATED" -gt 0 ] && \
         print_info "  forced rotate $LARGE_LOGS_ROTATED больших системных логов"
 
-    # 8. v3.23.8: PCAP archive — СЖИМАЕМ старее 7 дней в tar.zst, удаляем старее 30 дней.
-    # Защищает forensics от потери (раньше удаляли >3 дней при critical disk).
-    if [ -d /var/lib/shieldnode/pcap-archive ]; then
-        PCAP_USAGE_MB=$(du -sm /var/lib/shieldnode/pcap-archive 2>/dev/null | awk '{print $1}')
-        PCAP_USAGE_MB="${PCAP_USAGE_MB:-0}"
-
-        # Сжимаем директории старше 7 дней в tar.zst (если zstd есть)
-        if command -v zstd >/dev/null 2>&1; then
-            PCAP_COMPRESSED=0
-            # shellcheck disable=SC2044  # имена архивов генерируются нами, пробелов нет
-            for archive_dir in $(find /var/lib/shieldnode/pcap-archive -mindepth 1 -maxdepth 1 -type d -mtime +7 2>/dev/null); do
-                tar_name="${archive_dir}.tar.zst"
-                [ -f "$tar_name" ] && continue
-                if tar --use-compress-program="zstd -19 -T2" -cf "$tar_name" -C "$(dirname "$archive_dir")" "$(basename "$archive_dir")" 2>/dev/null && [ -s "$tar_name" ]; then
-                    rm -rf "$archive_dir"
-                    PCAP_COMPRESSED=$((PCAP_COMPRESSED + 1))
-                fi
-            done
-            [ "$PCAP_COMPRESSED" -gt 0 ] && \
-                print_info "  PCAP archives (>7d): compressed $PCAP_COMPRESSED to tar.zst"
-        fi
-
-        # Удаляем tar.zst и uncompressed >30 дней
-        BEFORE=$PCAP_USAGE_MB
-        find /var/lib/shieldnode/pcap-archive -mindepth 1 -maxdepth 1 -mtime +30 -exec rm -rf {} \; 2>/dev/null
-        AFTER=$(du -sm /var/lib/shieldnode/pcap-archive 2>/dev/null | awk '{print $1}')
-        AFTER="${AFTER:-0}"
-        if [ "$BEFORE" -gt "$AFTER" ]; then
-            SAVED=$((BEFORE - AFTER))
-            CLEANED_MB=$((CLEANED_MB + SAVED))
-            print_info "  pcap-archive (>30d): -${SAVED}MB"
-        fi
-    fi
 
     # Финальная проверка
     NEW_DISK_USAGE=$(df --output=pcent /var/log 2>/dev/null | tail -1 | tr -d ' %')
@@ -10371,268 +11435,6 @@ if [ "$DISK_USAGE" -ge 80 ]; then
 else
     print_info "Disk /var/log: ${DISK_USAGE}% — cleanup не требуется"
 fi
-
-# ==============================================================================
-# ШАГ 12.7: PCAP-CAPTURE (v3.23.3) — rolling forensics для DDoS-инцидентов
-# ==============================================================================
-
-print_header "ШАГ 12.7: PCAP-CAPTURE (rolling SYN dump)"
-
-# Хостер при DDoS требует pcap для блокировки upstream / abuse-report.
-# tcpdump на SYN-пакеты без ACK (начало TCP-соединения), 128 байт payload.
-# Ring buffer: 20 нумерованных файлов × 50MB = max 1GB (-W 20 -C 50).
-# v3.23.17 FIX: убраны strftime-имя и -G — с ними -W НЕ удалял старые файлы,
-# каждый rotate создавал уникальное имя → /var/log/pcap рос до десятков GB.
-# На нормальной нагрузке: ~100-200MB/сутки.
-
-# v3.23.9: tcpdump install с retry + проверка что binary реально доступен
-TCPDUMP_BIN=""
-if ! command -v tcpdump >/dev/null 2>&1; then
-    print_status "Устанавливаю tcpdump..."
-    for try in 1 2 3; do
-        if apt-get install -y tcpdump >/dev/null 2>&1; then
-            break
-        fi
-        sleep $((try * 2))
-    done
-fi
-
-# Auto-detect tcpdump path (Ubuntu 22/24: /usr/bin, RHEL/Debian-old: /usr/sbin)
-TCPDUMP_BIN=$(command -v tcpdump 2>/dev/null)
-if [ -z "$TCPDUMP_BIN" ] || [ ! -x "$TCPDUMP_BIN" ]; then
-    print_warn "tcpdump НЕ установлен или недоступен — PCAP capture будет disabled"
-    print_info "  Ручная установка: sudo apt update && sudo apt install -y tcpdump"
-    TCPDUMP_AVAILABLE=0
-else
-    TCPDUMP_AVAILABLE=1
-    print_info "tcpdump найден: $TCPDUMP_BIN"
-fi
-
-mkdir -p /var/log/pcap
-chmod 755 /var/log/pcap
-# v3.23.17: удаляем legacy strftime-pcap от старого сломанного ring (могло быть десятки GB)
-find /var/log/pcap -maxdepth 1 -type f -name 'syn-*.pcap' -delete 2>/dev/null || true
-
-if [ "$TCPDUMP_AVAILABLE" = "1" ]; then
-# Используем single-quote heredoc (literal) чтобы $VAR и % не expand'ились,
-# затем sed подставляет ровно один placeholder __TCPDUMP_BIN__.
-cat > /etc/systemd/system/shieldnode-pcap.service <<'PCAP_UNIT_EOF'
-[Unit]
-Description=Shieldnode rolling SYN packet capture for DDoS forensics
-After=network.target shieldnode-nftables.service
-Wants=network.target
-
-[Service]
-Type=simple
-ExecStart=__TCPDUMP_BIN__ -i any -nn -s 128 \
-    -w /var/log/pcap/syn.pcap \
-    -W 20 -C 50 -Z root \
-    '(tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack == 0)'
-Restart=always
-RestartSec=10
-StandardOutput=null
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-PCAP_UNIT_EOF
-
-# Подставляем actual путь к tcpdump
-sed -i "s|__TCPDUMP_BIN__|$TCPDUMP_BIN|g" /etc/systemd/system/shieldnode-pcap.service
-
-systemctl daemon-reload
-systemctl enable shieldnode-pcap.service >/dev/null 2>&1
-
-# Restart только если сервис ещё не запущен ИЛИ конфиг изменился.
-# Не обрывать активный capture зря: если идёт атака, теряются последние секунды.
-PCAP_UNIT_HASH_NEW=$(sha256sum /etc/systemd/system/shieldnode-pcap.service 2>/dev/null | awk '{print $1}')
-# Hash в /run/ (volatile, очищается при reboot — это ок: после ребута restart ОК).
-mkdir -p /run/shieldnode
-PCAP_UNIT_HASH_FILE=/run/shieldnode/pcap-unit-hash
-PCAP_UNIT_HASH_OLD=$(cat "$PCAP_UNIT_HASH_FILE" 2>/dev/null || echo "")
-
-if ! systemctl is-active --quiet shieldnode-pcap.service; then
-    systemctl start shieldnode-pcap.service >/dev/null 2>&1
-    echo "$PCAP_UNIT_HASH_NEW" > "$PCAP_UNIT_HASH_FILE"
-elif [ "$PCAP_UNIT_HASH_NEW" != "$PCAP_UNIT_HASH_OLD" ]; then
-    systemctl restart shieldnode-pcap.service >/dev/null 2>&1
-    echo "$PCAP_UNIT_HASH_NEW" > "$PCAP_UNIT_HASH_FILE"
-fi
-sleep 2
-
-if systemctl is-active --quiet shieldnode-pcap.service; then
-    print_ok "PCAP capture запущен (ring 1GB, /var/log/pcap/syn.pcap*)"
-else
-    print_warn "PCAP capture не стартовал — проверь: systemctl status shieldnode-pcap"
-fi
-
-else
-    # tcpdump не доступен — пропускаем установку pcap service
-    # Если был установлен ранее — disable чтобы не было crashes status=203/EXEC
-    systemctl disable --now shieldnode-pcap.service 2>/dev/null || true
-    rm -f /etc/systemd/system/shieldnode-pcap.service 2>/dev/null
-    print_warn "PCAP capture skipped — tcpdump не установлен (apt не сработал)"
-fi
-
-# Note: logrotate для /var/log/pcap НЕ нужен — tcpdump сам ротирует через -W 20 -C 50.
-# Сторонний logrotate может удалить файлы которые tcpdump переиспользует в ring buffer.
-# Если есть legacy logrotate-config от старых версий — удаляем.
-rm -f /etc/logrotate.d/shieldnode-pcap 2>/dev/null
-
-# === PCAP archive-on-attack-detect ===
-# Ring buffer 1GB при volumetric атаке 100k SYN/sec заполнится за ~80 секунд
-# и начнёт перезаписывать сами себя. Если хостер попросит pcap через час —
-# уже поздно. Каждую минуту проверяем drop-counters: если резкий скачок
-# (>10k drops за минуту = атака), копируем все текущие pcap-файлы в
-# /var/lib/shieldnode/pcap-archive/ с меткой времени.
-
-mkdir -p /var/lib/shieldnode/pcap-archive
-chmod 700 /var/lib/shieldnode/pcap-archive
-
-cat > /usr/local/sbin/shieldnode-pcap-archiver.sh <<'PCAP_ARCH_EOF'
-#!/bin/bash
-# Архивирует pcap-файлы при детекте атаки (по nft drop counters)
-# Запускается каждую минуту через timer
-set -euo pipefail
-
-LOCK_DIR=/run/shieldnode
-LOCK="$LOCK_DIR/pcap-archiver.lock"
-LOG_TAG=shieldnode-pcap-arch
-STATE_FILE=/var/lib/shieldnode/.pcap-arch-state
-ARCHIVE_DIR=/var/lib/shieldnode/pcap-archive
-PCAP_DIR=/var/log/pcap
-TRIGGER_THRESHOLD=__SHIELD_PCAP_TRIGGER_DROPS__   # drops/min → trigger archive
-
-mkdir -p "$LOCK_DIR"
-exec {LOCK_FD}> "$LOCK"
-flock -n "$LOCK_FD" || exit 0
-
-# Проверяем что nft table существует. Если нет — shieldnode-nftables упал,
-# что само по себе серьёзный инцидент. Записываем alert и не делаем сравнения
-# (иначе CURRENT_DROPS=0 → дельта negative → trigger не сработает в реальной атаке).
-if ! nft list table inet ddos_protect >/dev/null 2>&1; then
-    logger -t "$LOG_TAG" "CRITICAL: nft table 'inet ddos_protect' missing — shieldnode-nftables.service may be down"
-    exit 1
-fi
-
-# Текущий счётчик drop'ов из всех counters в ddos_protect
-# v3.30.1 FIX(F11): named-counters в nft печатаются МНОГОСТРОЧНО → старый /counter packets/
-# матчил только анонимные v6-счётчики и суммировал мусор ("6" из ipv6) → trigger НИКОГДА
-# не срабатывал на v4-флуде. Трекаем имя counter'а и суммируем его packets, исключая pass.
-CURRENT_DROPS=$(nft list counters table inet ddos_protect 2>/dev/null | \
-    awk '/counter [a-z]/{n=$2} /^[[:space:]]*packets /{ if(n !~ /pass/) sum+=$2 } END{print sum+0}')
-
-# Предыдущий замер (из state файла)
-PREV_DROPS=$(cat "$STATE_FILE" 2>/dev/null || echo 0)
-PREV_DROPS="${PREV_DROPS:-0}"
-
-# Записываем текущий замер для следующей итерации
-echo "$CURRENT_DROPS" > "$STATE_FILE"
-
-# Дельта за минуту
-DELTA=$((CURRENT_DROPS - PREV_DROPS))
-[ "$DELTA" -lt 0 ] && DELTA=0   # после ребута/flush counter обнулился
-
-if [ "$DELTA" -ge "$TRIGGER_THRESHOLD" ]; then
-    TS=$(date -u +%Y%m%d-%H%M%S)
-    ARCH_SUBDIR="$ARCHIVE_DIR/attack-$TS"
-    mkdir -p "$ARCH_SUBDIR"
-
-    # Копируем все pcap-файлы (cp -p сохранит mtime)
-    if compgen -G "$PCAP_DIR/syn.pcap*" > /dev/null; then
-        cp -p "$PCAP_DIR"/syn.pcap* "$ARCH_SUBDIR/" 2>/dev/null || true
-        # Метаданные: drop-counters, conntrack snapshot, suspect_v4
-        nft list table inet ddos_protect > "$ARCH_SUBDIR/nft-state.txt" 2>/dev/null || true
-        # v3.23.13 BUG-012 FIX: conntrack snapshot полный + gzip (раньше head -10000
-        # обрезал на 10k entries, и uncompressed файл занимал 5-10MB на каждый
-        # attack-archive). Предпочитаем conntrack(8) который через netlink работает
-        # без блокировки kernel'а; fallback на /proc если нет.
-        if command -v conntrack >/dev/null 2>&1; then
-            conntrack -L -o save 2>/dev/null | gzip -1 > "$ARCH_SUBDIR/conntrack.txt.gz" || true
-        else
-            gzip -1 < /proc/net/nf_conntrack 2>/dev/null > "$ARCH_SUBDIR/conntrack.txt.gz" || true
-        fi
-        echo "delta_drops=$DELTA, total_drops=$CURRENT_DROPS, ts=$TS" > "$ARCH_SUBDIR/metadata.txt"
-        logger -t "$LOG_TAG" "ATTACK DETECTED ($DELTA drops/min) — pcap archived to $ARCH_SUBDIR"
-        # v3.31.0 (stage1): crit-уведомление оператору (Telegram/webhook, если настроен notify.conf)
-        /usr/local/sbin/shieldnode-notify.sh crit "attack-pcap" "ATTACK DETECTED ($DELTA drops/min) — pcap: $ARCH_SUBDIR" 2>/dev/null || true
-    fi
-fi
-
-# Cleanup: v3.23.13 BUG-010 FIX. Раньше было только `rm -rf` после 7 дней,
-# tar.zst compression жил только в install-time disk-cleanup и почти никогда
-# не срабатывал. Теперь:
-#   - >7 дней без compress → tar.zst (lossless forensics).
-#   - >SHIELD_PCAP_RETENTION_DAYS (compressed или uncompressed) → удаление.
-# Это реализует обещанную retention из design doc / changelog v3.23.7.
-PCAP_RETENTION_DAYS=__SHIELD_PCAP_RETENTION_DAYS__
-if command -v zstd >/dev/null 2>&1; then
-    find "$ARCHIVE_DIR" -mindepth 1 -maxdepth 1 -type d -mtime +7 2>/dev/null | while read -r archive_dir; do
-        tar_name="${archive_dir}.tar.zst"
-        [ -f "$tar_name" ] && continue
-        if tar --use-compress-program="zstd -19 -T2" \
-            -cf "$tar_name" \
-            -C "$(dirname "$archive_dir")" "$(basename "$archive_dir")" 2>/dev/null \
-            && [ -s "$tar_name" ]; then
-            rm -rf "$archive_dir"
-            logger -t "$LOG_TAG" "compressed archive $(basename "$archive_dir") to tar.zst"
-        else
-            # Compression failed — оставляем uncompressed (лучше чем потерять)
-            rm -f "$tar_name" 2>/dev/null
-            logger -t "$LOG_TAG" "WARN: failed to compress $(basename "$archive_dir"), keeping uncompressed"
-        fi
-    done
-fi
-# Удаляем всё (uncompressed dirs + tar.zst) старше retention
-find "$ARCHIVE_DIR" -mindepth 1 -maxdepth 1 -mtime +"$PCAP_RETENTION_DAYS" \( -type d -o -name '*.tar.zst' \) -exec rm -rf {} \; 2>/dev/null || true
-# v3.23.17: чистим legacy strftime-pcap (старый сломанный ring) + жёсткий size-cap на ring-каталог.
-find /var/log/pcap -maxdepth 1 -type f -name 'syn-*.pcap' -delete 2>/dev/null || true
-RING_MB=$(du -sm /var/log/pcap 2>/dev/null | awk '{print $1+0}')
-if [ "${RING_MB:-0}" -gt 1536 ]; then
-    ls -1t /var/log/pcap/syn.pcap* 2>/dev/null | tail -n +21 | while read -r f; do rm -f "$f" 2>/dev/null || true; done
-    logger -t "$LOG_TAG" "WARN: /var/log/pcap=${RING_MB}MB > 1536MB cap — trimmed stale files"
-fi
-
-exit 0
-PCAP_ARCH_EOF
-
-# v3.23.13 BUG-019: подставляем настраиваемые значения
-sed -i \
-    -e "s|__SHIELD_PCAP_TRIGGER_DROPS__|$SHIELD_PCAP_TRIGGER_DROPS|g" \
-    -e "s|__SHIELD_PCAP_RETENTION_DAYS__|$SHIELD_PCAP_RETENTION_DAYS|g" \
-    /usr/local/sbin/shieldnode-pcap-archiver.sh
-verify_no_placeholders /usr/local/sbin/shieldnode-pcap-archiver.sh || exit 1
-
-chmod +x /usr/local/sbin/shieldnode-pcap-archiver.sh
-
-cat > /etc/systemd/system/shieldnode-pcap-archiver.service <<'PCAP_ARCH_UNIT_EOF'
-[Unit]
-Description=Shieldnode PCAP archiver (on attack detect)
-After=shieldnode-pcap.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/shieldnode-pcap-archiver.sh
-Nice=15
-PCAP_ARCH_UNIT_EOF
-
-cat > /etc/systemd/system/shieldnode-pcap-archiver.timer <<'PCAP_ARCH_TIMER_EOF'
-[Unit]
-Description=Run shieldnode-pcap-archiver every minute
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=1min
-AccuracySec=10s
-
-[Install]
-WantedBy=timers.target
-PCAP_ARCH_TIMER_EOF
-
-systemctl daemon-reload
-systemctl enable shieldnode-pcap-archiver.timer >/dev/null 2>&1
-systemctl start shieldnode-pcap-archiver.timer >/dev/null 2>&1
-print_ok "PCAP archiver enabled (trigger >10k drops/min, archive 7d retention)"
 
 # ==============================================================================
 # ШАГ 12.8: AUTO-PROMOTE (v3.23.3) — events.db → custom-local.txt
@@ -10875,7 +11677,7 @@ sed -i \
     -e "s|__SHIELD_AUTOPROMOTE_THRESHOLD__|$SHIELD_AUTOPROMOTE_THRESHOLD|g" \
     -e "s|__SHIELD_AUTOPROMOTE_WINDOW_HOURS__|$SHIELD_AUTOPROMOTE_WINDOW_HOURS|g" \
     /usr/local/sbin/shieldnode-auto-promote.sh
-verify_no_placeholders /usr/local/sbin/shieldnode-auto-promote.sh || exit 1
+verify_no_placeholders /usr/local/sbin/shieldnode-auto-promote.sh || shield_install_fatal_exit 1
 
 chmod +x /usr/local/sbin/shieldnode-auto-promote.sh
 
@@ -10999,7 +11801,7 @@ fi
 # ШАГ 12.10: NOTIFY (v3.31.0, stage1) — Telegram/webhook уведомления
 # ==============================================================================
 #
-# Тихий защитный стек = слепой оператор. События (атака+pcap, падение сервиса,
+# Тихий защитный стек = слепой оператор. События (падение сервиса,
 # fail smoke-test, mass auto-promote) должны доходить до человека.
 #
 # Архитектура:
@@ -11012,7 +11814,6 @@ fi
 #     по образцу remnawave.env — секреты отдельно).
 #
 # Подключение:
-#   - pcap-archiver → при ATTACK DETECTED
 #   - systemd OnFailure → для ключевых сервисов (drop-in conf)
 #   - smoke-test FAIL → в конце установки (ниже, inline)
 #
@@ -11144,10 +11945,15 @@ Description=Shieldnode failure notification for %i
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/shieldnode-notify.sh crit "service-failed" "Service %i FAILED — проверь: journalctl -u %i -n 50"
+# v4.0.0-hotfix (U-M2): event-key per-service (%i = имя упавшего юнита) —
+# раньше общий ключ "service-failed" для всех 3 watched-сервисов означал, что
+# rate-limit (300s/key) глушил алерт о падении crowdsec, если недавно уже
+# алертили про bouncer. %i подставит напр. crowdsec.service (точки режутся
+# tr-санитизатором ключа в shieldnode-notify.sh).
+ExecStart=/usr/local/sbin/shieldnode-notify.sh crit "service-failed-%i" "Service %i FAILED — проверь: journalctl -u %i -n 50"
 NOTIFY_UNIT_EOF
 
-NOTIFY_WATCHED_SERVICES="crowdsec.service crowdsec-firewall-bouncer.service shieldnode-nftables.service shieldnode-pcap.service"
+NOTIFY_WATCHED_SERVICES="crowdsec.service crowdsec-firewall-bouncer.service shieldnode-nftables.service"
 NOTIFY_HOOKED=0
 for svc in $NOTIFY_WATCHED_SERVICES; do
     # Хукаем только реально существующие сервисы (bouncer может называться иначе)
@@ -11162,25 +11968,7 @@ ONFAILURE_EOF
     fi
 done
 systemctl daemon-reload 2>/dev/null || true
-print_ok "OnFailure hooks: $NOTIFY_HOOKED сервисов (crowdsec, bouncer, nftables, pcap)"
-
-# ─── Интеграция в pcap-archiver: ATTACK DETECTED → crit-уведомление ───
-# pcap-archiver уже пишет в journal; добавляем вызов notify после archive.
-# Делаем через отдельный drop-in скрипт-обёртку НЕЛЬЗЯ (oneshot), поэтому
-# патчим сам archiver inline если он уже существует (upgrade-путь), а для
-# fresh-install — archiver создаётся ВЫШЕ (ШАГ 12.7) и уже содержит вызов.
-if [ -f /usr/local/sbin/shieldnode-pcap-archiver.sh ]; then
-    if ! grep -q 'shieldnode-notify' /usr/local/sbin/shieldnode-pcap-archiver.sh; then
-        # Вставляем notify-вызов после строки ATTACK DETECTED logger
-        sed -i 's|^\(\s*logger -t "\$LOG_TAG" "ATTACK DETECTED.*\)$|\1\n        /usr/local/sbin/shieldnode-notify.sh crit "attack-pcap" "ATTACK DETECTED ($DELTA drops/min) — pcap: $ARCH_SUBDIR" 2>/dev/null \|\| true|' \
-            /usr/local/sbin/shieldnode-pcap-archiver.sh 2>/dev/null || true
-        grep -q 'shieldnode-notify' /usr/local/sbin/shieldnode-pcap-archiver.sh && \
-            print_ok "pcap-archiver: notify-hook добавлен (upgrade-путь)" || \
-            print_warn "pcap-archiver: notify-hook НЕ добавлен — добавь вручную после 'ATTACK DETECTED'"
-    else
-        print_info "pcap-archiver: notify-hook уже присутствует"
-    fi
-fi
+print_ok "OnFailure hooks: $NOTIFY_HOOKED сервисов (crowdsec, bouncer, nftables)"
 
 print_info "Настройка: sudoedit /etc/shieldnode/notify.conf → затем тест:"
 print_info "  sudo /usr/local/sbin/shieldnode-notify.sh info test 'notify works'"
@@ -11198,7 +11986,6 @@ print_info "  sudo /usr/local/sbin/shieldnode-notify.sh info test 'notify works'
 #   set_entries{name}           — размер каждого blocklist set (scanner/threat/...)
 #   drops_total{counter}        — named-counters из ddos_protect (суммарные drops)
 #   crowdsec_active_bans        — активные ban-decisions
-#   pcap_attacks_total          — число заархивированных атак (директорий)
 #   service_up{name}            — 0/1 по ключевым сервисам
 #   events_db_size_bytes        — размер events.db
 #   scrape_duration_seconds     — самодиагностика экспортера
@@ -11206,7 +11993,10 @@ print_info "  sudo /usr/local/sbin/shieldnode-notify.sh info test 'notify works'
 print_header "ШАГ 12.11: METRICS (node_exporter textfile)"
 
 # v3.31.0: master-switch SHIELD_METRICS (limits.conf). 0 = полное отключение:
-# таймер стоп+disable, unit-файлы удаляются (не оставляем мусор).
+# юнит(ы) стоп+disable, unit-файлы удаляются (не оставляем мусор).
+# v4.0.0-hotfix (O6): shieldnode-metrics.timer больше НЕ создаётся — метрики
+# вызываются из конца тика shieldnode-aggregator (запаздывание ≤1 тик). Ветка
+# ниже всё равно сносит таймер — на нодах, где он остался от старой версии.
 SHIELD_METRICS="${SHIELD_METRICS:-1}"
 if [ "$SHIELD_METRICS" != "1" ]; then
     print_info "SHIELD_METRICS=$SHIELD_METRICS — metrics отключены оператором"
@@ -11221,7 +12011,9 @@ mkdir -p "$METRICS_DIR"
 cat > /usr/local/sbin/shieldnode-metrics.sh <<'METRICS_SCRIPT_EOF'
 #!/bin/bash
 # shieldnode-metrics — экспорт метрик защиты в node_exporter textfile format.
-# Запускается через shieldnode-metrics.timer раз в минуту.
+# v4.0.0-hotfix (O6): вызывается из конца тика shieldnode-aggregator
+# (отдельный shieldnode-metrics.timer больше не создаётся). Ручной запуск:
+# systemctl start shieldnode-metrics.service (service оставлен для совместимости).
 # Atomic write: tmp + mv (node_exporter может читать в любой момент).
 set -o pipefail
 export LANG=C LC_ALL=C
@@ -11273,14 +12065,9 @@ if [ -r /var/lib/crowdsec/data/crowdsec.db ] && command -v sqlite3 >/dev/null 2>
 fi
 echo "shieldnode_crowdsec_active_bans ${BANS:-0}"
 
-echo "# HELP shieldnode_pcap_attacks_total Archived attack captures"
-echo "# TYPE shieldnode_pcap_attacks_total gauge"
-PCAP_N=$(find /var/lib/shieldnode/pcap-archive -mindepth 1 -maxdepth 1 -name 'attack-*' 2>/dev/null | wc -l)
-echo "shieldnode_pcap_attacks_total ${PCAP_N:-0}"
-
 echo "# HELP shieldnode_service_up Key service state (1=active)"
 echo "# TYPE shieldnode_service_up gauge"
-for svc in crowdsec crowdsec-firewall-bouncer shieldnode-nftables shieldnode-pcap; do
+for svc in crowdsec crowdsec-firewall-bouncer shieldnode-nftables; do
     if systemctl is-active --quiet "$svc" 2>/dev/null; then UP=1; else UP=0; fi
     echo "shieldnode_service_up{name=\"$svc\"} $UP"
 done
@@ -11319,21 +12106,15 @@ ExecStart=/usr/local/sbin/shieldnode-metrics.sh
 Nice=19
 METRICS_UNIT_EOF
 
-cat > /etc/systemd/system/shieldnode-metrics.timer <<'METRICS_TIMER_EOF'
-[Unit]
-Description=Run shieldnode-metrics every minute
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=1min
-AccuracySec=15s
-
-[Install]
-WantedBy=timers.target
-METRICS_TIMER_EOF
+# v4.0.0-hotfix (O6): shieldnode-metrics.timer больше НЕ создаётся —
+# metrics.sh вызывается из конца тика shieldnode-aggregator (минус отдельный
+# timer + service-прогон в минуту). service остаётся: ручной запуск +
+# совместимость. Страховка: сносим таймер если остался от старой версии
+# (основной реапер — ШАГ 1.5 п.12).
+systemctl disable --now shieldnode-metrics.timer >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/shieldnode-metrics.timer 2>/dev/null
 
 systemctl daemon-reload 2>/dev/null || true
-systemctl enable --now shieldnode-metrics.timer >/dev/null 2>&1
 # Первый прогон сразу — чтобы файл существовал до первого scrape
 /usr/local/sbin/shieldnode-metrics.sh >/dev/null 2>&1 || true
 
@@ -11347,167 +12128,15 @@ print_info "Проверка: curl -s localhost:9100/metrics | grep shieldnode_"
 fi  # SHIELD_METRICS=1
 
 # ==============================================================================
-# ШАГ 12.12: TARPIT (v3.33.0, stage3) — endlessh honeypot → auto-ban
+# ШАГ 12.12: TARPIT — УДАЛЁН ПОЛНОСТЬЮ (v4.0.0-hotfix, REMOVE TARPIT)
 # ==============================================================================
-#
-# Идея: endlessh слушает фейковый SSH-порт (SHIELD_TARPIT_PORT, default 8022).
-# Легитимные пользователи про него НЕ ЗНАЮТ — стучатся только сканеры.
-# Zero false positives by design.
-#
-# Механика:
-#   1. nft правило: SYN на tarpit-порт → add @tarpit_caught (timeout 24h) + accept
-#   2. endlessh принимает соединение и БЕСКОНЕЧНО шлёт мусор (banner) —
-#      сканер висит, тратит время, не сканирует дальше
-#   3. nft правило: src in @tarpit_caught → DROP всего остального трафика
-#      (защищённые порты + всё остальное)
-#   4. Через 24h IP выпадает из set'а автоматически (kernel timeout)
-#
-# Ресурсы: endlessh — single-threaded C, ~1MB RSS, сотни одновременных
-# соединений без нагрузки. Это НЕ fail2ban-style парсинг логов — бан
-# происходит в nft на SYN-пакете, мгновенно и без CPU.
-
-print_header "ШАГ 12.12: TARPIT (endlessh honeypot)"
-
-SHIELD_TARPIT="${SHIELD_TARPIT:-1}"
-SHIELD_TARPIT_PORT="${SHIELD_TARPIT_PORT:-8022}"
-SHIELD_TARPIT_BAN_HOURS="${SHIELD_TARPIT_BAN_HOURS:-24}"
-
-# Валидация порта: не должен быть SSH / защищаемым / системным
-TARPIT_PORT_OK=1
-if [ "$SHIELD_TARPIT_PORT" = "$SSH_PORT" ]; then
-    print_error "TARPIT_PORT=$SHIELD_TARPIT_PORT совпадает с SSH_PORT — отключено"
-    TARPIT_PORT_OK=0
-fi
-for pp in $PORTS_TCP; do
-    if [ "$pp" = "$SHIELD_TARPIT_PORT" ]; then
-        print_error "TARPIT_PORT=$SHIELD_TARPIT_PORT совпадает с защищаемым портом — отключено"
-        TARPIT_PORT_OK=0
-    fi
-done
-if [ "$SHIELD_TARPIT_PORT" -lt 1024 ] 2>/dev/null; then
-    print_error "TARPIT_PORT=$SHIELD_TARPIT_PORT < 1024 (system ports) — отключено"
-    TARPIT_PORT_OK=0
-fi
-
-if [ "$SHIELD_TARPIT" != "1" ] || [ "$TARPIT_PORT_OK" != "1" ]; then
-    if [ "$SHIELD_TARPIT" != "1" ]; then
-        print_info "SHIELD_TARPIT=$SHIELD_TARPIT — tarpit выключен оператором"
-    fi
-    # Выключено → снимаем артефакты если были (upgrade из версии где было ON)
-    systemctl disable --now endlessh.service >/dev/null 2>&1 || true
-else
-    # endlessh в репо Debian/Ubuntu (universe). Ставим, если нет.
-    if ! command -v endlessh >/dev/null 2>&1; then
-        print_status "Устанавливаем endlessh..."
-        DEBIAN_FRONTEND=noninteractive apt-get install -y endlessh >/dev/null 2>&1 || \
-            print_warn "endlessh не установлен (нет в репо?) — tarpit пропущен"
-    fi
-
-    if command -v endlessh >/dev/null 2>&1; then
-        # Конфиг: порт + delay между строками мусора (мс). 10 сек — агрессивно
-        # держит сканер, но не душит наш CPU (endlessh и так ~zero).
-        cat > /etc/endlessh/config <<'ENDLESSH_EOF'
-# endlessh config — управляется shieldnode (ШАГ 12.12)
-# Порт меняется через SHIELD_TARPIT_PORT в /etc/shieldnode/limits.conf
-Port 8022
-Delay 10000
-MaxLineLength 32
-MaxClients 4096
-LogLevel 1
-BindFamily 4
-ENDLESSH_EOF
-        # Порт из переменной (подменяем дефолт 8022 из шаблона выше)
-        sed -i "s/^Port .*/Port $SHIELD_TARPIT_PORT/" /etc/endlessh/config
-
-        # v3.37.3 (BUG-ENDLESSH-NAMESPACE, репорт: status=226/NAMESPACE):
-        # пакетный юнит Debian/Ubuntu содержит агрессивный sandbox
-        # (PrivateDevices/ProtectHome/ProtectSystem — это mount namespaces),
-        # который на части VPS-ядер падает при старте с 226/NAMESPACE.
-        # Пишем СВОЙ минимальный юнит БЕЗ namespace-опций (NoNewPrivileges и
-        # RestrictAddressFamilies — seccomp-based, namespaces не используют,
-        # безопасны на любых ядрах). /etc/systemd/system/*.service имеет
-        # приоритет над пакетным /lib/systemd/system/.
-        cat > /etc/systemd/system/endlessh.service <<'ENDLESSH_UNIT_EOF'
-[Unit]
-Description=Endlessh SSH Tarpit (shieldnode)
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/endlessh -f /etc/endlessh/config
-Restart=always
-RestartSec=5
-# Порты >1024 — root не нужен. nobody есть в любом Debian/Ubuntu.
-User=nobody
-# seccomp-based харденинг (НЕ namespace — работает на всех VPS-ядрах):
-NoNewPrivileges=true
-RestrictAddressFamilies=AF_INET AF_UNIX
-
-[Install]
-WantedBy=multi-user.target
-ENDLESSH_UNIT_EOF
-
-        # endlessh НЕ должен быть на том же порту что SSH — ещё раз проверка
-        # после всех валидаций (paranoia, но дёшево)
-        if [ "$SHIELD_TARPIT_PORT" != "$SSH_PORT" ]; then
-            systemctl daemon-reload 2>/dev/null || true
-            # reset-failed: нода могла быть в "Start request repeated too quickly"
-            systemctl reset-failed endlessh.service >/dev/null 2>&1 || true
-            systemctl enable --now endlessh.service >/dev/null 2>&1
-            if systemctl is-active --quiet endlessh.service 2>/dev/null; then
-                print_ok "endlessh активен на порту $SHIELD_TARPIT_PORT (~1MB RAM, tarpit для сканеров)"
-            else
-                print_warn "endlessh не стартовал — проверь: journalctl -u endlessh -n 20"
-            fi
-        fi
-
-        # nft: tarpit_caught set + правила. Добавляем в существующую таблицу
-        # ddos_protect — set с timeout, атомарно.
-        #
-        # Set: tarpit_caught { type ipv4_addr; flags timeout; }
-        #   - элементы добавляются nft-правилом на SYN к tarpit-порту
-        #   - auto-expire через SHIELD_TARPIT_BAN_HOURS
-        #
-        # Правила (в input chain, ПОРЯДОК ВАЖЕН):
-        #   1. src @tarpit_caught → drop (ВСЁ, не только tarpit-порт) — раньше
-        #      остальных accept'ов, но ПОСЛЕ established/whitelist
-        #   2. dport tarpit → add @tarpit_caught + accept (endlessh получает)
-        #
-        # Мы НЕ генерируем весь ruleset здесь — ШАГ 4 уже создал таблицу.
-        # Добавляем set и правила атомарно одной транзакцией.
-        if nft list table inet ddos_protect >/dev/null 2>&1; then
-            # nft идемпотентность: 'add set' fails if exists — || true
-            nft add set inet ddos_protect tarpit_caught \
-                '{ type ipv4_addr; flags timeout; comment "v3.33_tarpit"; }' 2>/dev/null || true
-
-                # Правило 1: DROP всего от пойманных (вставляем в начало input chain,
-                # но ПОСЛЕ iif lo / established — позиция после базовых правил).
-                # Используем insert (в начало), base rules (lo/established) уже есть
-                # выше по приоритету обработки? Нет — insert ставит ПЕРВЫМ.
-                # Нам нужно: lo и established РАНЬШЕ drop. Поэтому add (в конец),
-                # а не insert. Порядок в chain: lo → established → ... → tarpit-drop.
-                # tarpit_caught IP, у которого есть established-соединение — он его
-                # доиграет, новые не откроет. Это корректно.
-                if ! nft list chain inet ddos_protect input 2>/dev/null | grep -q 'tarpit_caught'; then
-                    nft add rule inet ddos_protect input \
-                        ip saddr @tarpit_caught counter drop comment "v3.33_tarpit_drop" 2>/dev/null && \
-                        print_ok "nft: tarpit_caught → DROP (весь трафик, ${SHIELD_TARPIT_BAN_HOURS}h timeout)"
-                fi
-
-                # Правило 2: SYN на tarpit-порт → в set + accept (endlessh примет).
-                # add @tarpit_caught { ip saddr timeout Xh } — atomic add с TTL.
-                if ! nft list chain inet ddos_protect input 2>/dev/null | grep -q 'v3.33_tarpit_trap'; then
-                    nft add rule inet ddos_protect input \
-                        tcp dport "$SHIELD_TARPIT_PORT" tcp flags syn \
-                        add @tarpit_caught "{ ip saddr timeout ${SHIELD_TARPIT_BAN_HOURS}h }" \
-                        counter accept comment "v3.33_tarpit_trap" 2>/dev/null && \
-                        print_ok "nft: порт $SHIELD_TARPIT_PORT → tarpit_caught + endlessh"
-                fi
-        else
-            print_warn "ddos_protect таблицы нет — tarpit nft-правила будут при следующем полном install"
-        fi
-    fi
-fi
+# Фича была мёртва с рождения: правила добавлялись в НЕсуществующий chain
+# "input" таблицы inet ddos_protect (template создаёт только prerouting +
+# overflow-цепочки) → оба `nft add rule` молча падали, set tarpit_caught
+# никогда не наполнялся, а summary при этом печатал "Tarpit: ON".
+# endlessh + его юнит + set + ключи SHIELD_TARPIT* снимаются реапером в
+# ШАГ 1.5 (п.10). Пакет endlessh осознанно НЕ purge'ится (прецедент tcpdump).
+# ==============================================================================
 
 # ==============================================================================
 # ШАГ 12.13: API (v3.33.0, stage3) — unix socket JSON endpoint
@@ -11620,22 +12249,30 @@ API_SERVICE_EOF
 fi
 
 # ==============================================================================
-# ШАГ 12.14: ROLLBACK (v3.33.0, stage3) — снапшот критичных конфигов
+# ШАГ 12.14: ROLLBACK (v3.33.0, stage3) — команда node-rollback + ротация
 # ==============================================================================
 #
-# Перед каждым install/upgrade: tar-снапшот всего что скрипт меняет:
+# v4.0.0-hotfix (D4): сам СНАПШОТ теперь создаётся в НАЧАЛЕ install-flow
+# (сразу после определения install vs upgrade, до ШАГ 1) — ДО любых
+# модификаций. Раньше он создавался здесь, ПОСЛЕ всех изменений → "откат"
+# возвращал свежеустановленное состояние вместо предыдущего рабочего.
+#
+# Здесь остаются:
+#   - установка/обновление команды node-rollback (восстановление из снапшота)
+#   - ротация снапшотов keep-N (NODE_ROLLBACK_KEEP, default 5)
+#
+# Снапшот содержит:
 #   - /etc/shieldnode/ (конфиги, blocklists state)
 #   - /etc/nftables.d/ (nft-конфиги от vpn-node-setup)
 #   - /etc/sysctl.d/ (sysctl-файлы обоих скриптов)
 #   - /etc/systemd/system/shieldnode-* и vpn-* (unit-файлы)
 #   - nft ruleset (текущий kernel state)
-#   - limits.conf, notify.conf, stack.conf
 #
 # Команда восстановления: node-rollback <snapshot-id>
-#   Распаковывает, применяет nft ruleset, daemon-reload, restart.
+#   Распаковывает, применяет nft ruleset (только table inet ddos_protect),
+#   daemon-reload, restart.
 #
-# Размер снапшота: ~100-500KB (конфиги + ruleset, БЕЗ events.db/pcap).
-# Ротация: NODE_ROLLBACK_KEEP (default 5), старые удаляются.
+# Размер снапшота: ~100-500KB (конфиги + ruleset, БЕЗ events.db).
 
 print_header "ШАГ 12.14: ROLLBACK"
 
@@ -11714,10 +12351,34 @@ if [ -d "$STAGE/etc" ]; then
     echo "Configs restored."
 fi
 
-# nft ruleset
-if [ -f "$STAGE/nft-ruleset.nft" ]; then
-    nft -f "$STAGE/nft-ruleset.nft" && echo "nft ruleset restored." || \
-        echo "WARN: nft ruleset restore failed — проверь вручную: nft -f $STAGE/nft-ruleset.nft"
+# nft ruleset — v4.0.0-hotfix (D6): восстанавливаем ТОЛЬКО table inet
+# ddos_protect, а не весь ruleset. Полный `nft -f ruleset` из снапшота
+# воскрешал бы таблицы удалённых в v4.0.0 стеков (shield_synproxy,
+# shield_ctguard, tarpit) и перетирал бы чужие таблицы (docker, ufw).
+# Блок извлекается awk'ом по балансу фигурных скобок.
+if [ -s "$STAGE/nft-ruleset.nft" ]; then
+    NFT_TMP=$(mktemp /tmp/node-rollback-nft.XXXXXX.nft)
+    awk '
+        /^table inet ddos_protect[[:space:]]*\{/ { inblk=1; depth=0 }
+        inblk {
+            print
+            depth += gsub(/\{/, "{") - gsub(/\}/, "}")
+            if (depth == 0) { inblk=0; exit }
+        }
+    ' "$STAGE/nft-ruleset.nft" > "$NFT_TMP"
+    if [ -s "$NFT_TMP" ]; then
+        nft delete table inet ddos_protect 2>/dev/null || true
+        if nft -f "$NFT_TMP"; then
+            echo "nft table inet ddos_protect restored."
+        else
+            echo "ERROR: nft -f failed — ddos_protect НЕ восстановлен (snapshot: $SNAP)." >&2
+            rm -f "$NFT_TMP"
+            exit 1
+        fi
+    else
+        echo "No table inet ddos_protect block in snapshot — только restart сервиса."
+    fi
+    rm -f "$NFT_TMP"
 fi
 
 # sysctl
@@ -11735,32 +12396,8 @@ echo "Rollback complete: $(basename "$SNAP")"
 ROLLBACK_EOF
     chmod 0755 /usr/local/sbin/node-rollback
 
-    # Снапшот ТЕКУЩЕГО состояния (перед тем как этот install его изменит).
-    # Имя: YYYYMMDD-HHMMSS-pre-v<version>
-    SNAP_TS=$(date +%Y%m%d-%H%M%S)
-    SNAP_NAME="${SNAP_TS}-pre-v${SHIELDNODE_VERSION}"
-    SNAP_FILE="$ROLLBACK_DIR/${SNAP_NAME}.tar.gz"
-
-    SNAP_STAGE=$(mktemp -d /tmp/shield-snap.XXXXXX)
-    # Файловые конфиги
-    mkdir -p "$SNAP_STAGE/etc"
-    [ -d /etc/shieldnode ] && cp -a /etc/shieldnode "$SNAP_STAGE/etc/" 2>/dev/null
-    [ -d /etc/nftables.d ] && cp -a /etc/nftables.d "$SNAP_STAGE/etc/" 2>/dev/null
-    [ -d /etc/sysctl.d ] && cp -a /etc/sysctl.d "$SNAP_STAGE/etc/" 2>/dev/null
-    mkdir -p "$SNAP_STAGE/etc/systemd/system"
-    for unit in /etc/systemd/system/shieldnode-* /etc/systemd/system/vpn-*; do
-        [ -f "$unit" ] && cp -a "$unit" "$SNAP_STAGE/etc/systemd/system/" 2>/dev/null
-    done
-    # Kernel nft state (для точного восстановления)
-    nft list ruleset > "$SNAP_STAGE/nft-ruleset.nft" 2>/dev/null || true
-
-    tar -czf "$SNAP_FILE" -C "$SNAP_STAGE" . 2>/dev/null
-    rm -rf "$SNAP_STAGE"
-
-    if [ -f "$SNAP_FILE" ]; then
-        SNAP_SIZE=$(du -h "$SNAP_FILE" | cut -f1)
-        print_ok "Snapshot: $SNAP_NAME ($SNAP_SIZE) → node-rollback $SNAP_NAME"
-    fi
+    # v4.0.0-hotfix (D4): снапшот здесь БОЛЬШЕ НЕ создаётся — он делается в
+    # начале install-flow ДО модификаций. Здесь только ротация keep-N.
 
     # Ротация: удаляем старые сверх NODE_ROLLBACK_KEEP
     SNAP_COUNT=$(ls -1 "$ROLLBACK_DIR"/*.tar.gz 2>/dev/null | wc -l)
@@ -11867,7 +12504,7 @@ fi
 # он был последним кандидатом... нет, наоборот: earlyoom убьёт того кого надо
 # РАНЬШЕ kernel OOM, когда система ещё отзывчива. Дополняет zram.
 #
-# Для VPN-ноды критично: лучше убить aggregator/pcap, чем xray.
+# Для VPN-ноды критично: лучше убить aggregator, чем xray.
 
 print_header "ШАГ 12.16: EARLYOOM"
 
@@ -11879,20 +12516,41 @@ if [ "$SHIELD_EARLYOOM" != "1" ]; then
 else
     if ! command -v earlyoom >/dev/null 2>&1; then
         print_status "Устанавливаем earlyoom..."
-        DEBIAN_FRONTEND=noninteractive apt-get install -y earlyoom >/dev/null 2>&1 || \
+        # audit C7 (T2-16): ждём apt-lock + timeout — раньше при локе был
+        # молчаливый skip, при blackhole-сети стопор до apt-таймаутов.
+        wait_for_apt_lock
+        DEBIAN_FRONTEND=noninteractive timeout 120 apt-get install -y earlyoom >/dev/null 2>&1 || \
             print_warn "earlyoom не установлен (нет в репо?) — пропущен"
     fi
 
     if command -v earlyoom >/dev/null 2>&1; then
         # Конфиг: пороги 10% SIGTERM / 5% SIGKILL (дефолт), avoid=xray+sshd+crowdsec
-        # EARLYOOM_ARGS: -m процент MemAvailable, -s процент SwapFree,
-        #   --avoid regex процессов которые НЕ трогать
+        # v4.0.0-hotfix (D12): backup оригинала ДО перезаписи — uninstall
+        # восстанавливает из .shieldnode-bak (раньше backup не создавался).
+        if [ -f /etc/default/earlyoom ] && [ ! -f /etc/default/earlyoom.shieldnode-bak ]; then
+            cp -a /etc/default/earlyoom /etc/default/earlyoom.shieldnode-bak 2>/dev/null || true
+        fi
         cat > /etc/default/earlyoom <<'EARLYOOM_EOF'
 # earlyoom config — управляется shieldnode (ШАГ 12.16)
 # -m 10: SIGTERM когда MemAvailable < 10%
 # -s 5:  SIGKILL когда SwapFree < 5% (и MemAvailable < 5%)
-# --avoid: процессы которые earlyoom НЕ убивает (xray, sshd, crowdsec, systemd)
-EARLYOOM_ARGS="-m 10 -s 5 -r 60 --avoid '(^|/)(xray|sshd|crowdsec|crowdsec-firewall-bouncer|systemd|ss|init)$'"
+#
+# --avoid: процессы которые earlyoom НЕ убивает в первую очередь
+# (xray, sshd, crowdsec, bouncer, docker-стек, systemd).
+#
+# audit C2 (T2-02): earlyoom матчит regex по /proc/PID/comm, а comm
+# ОБРЕЗАН ядром до 15 байт — "crowdsec-firewall-bouncer" (25 симв.)
+# никогда не совпадёт. Усечённая форма: "crowdsec-firewa".
+# audit C2 (T2-03): добавлены containerd/dockerd/docker-proxy — kill
+# containerd = смерть всех shim'ов = remnanode/xray лежит до рестарта
+# docker-стека (хуже чем потеря aggregator'а).
+# audit C2 (T2-04): ВАЖНО — --avoid это НЕ иммунитет, а bias −300 к
+# oom_score (man earlyoom). При большом RSS xray всё равно может быть
+# выбран жертвой. Для гарантированной защиты xray рекомендуется
+# OOMScoreAdjust=-900 в override его unit'а
+# (systemctl edit xray → [Service] OOMScoreAdjust=-900); docker-юниты
+# shieldnode намеренно не трогает.
+EARLYOOM_ARGS="-m 10 -s 5 -r 60 --avoid '(^|/)(xray|sshd|crowdsec|crowdsec-firewa|containerd|dockerd|docker-proxy|systemd|ss|init)$'"
 EARLYOOM_EOF
         systemctl enable --now earlyoom.service >/dev/null 2>&1
         if systemctl is-active --quiet earlyoom.service 2>/dev/null; then
@@ -11907,7 +12565,7 @@ fi
 # ШАГ 12.17: CHRONY + NTS (v3.36.0) — шифрованное время
 # ==============================================================================
 #
-# Точное время критично для защиты: events.db timestamps, pcap captures,
+# Точное время критично для защиты: events.db timestamps,
 # CrowdSec decisions (ban duration), TLS-сертификаты. Подделка NTP-ответов
 # (UDP, нешифрованный) позволяет сдвинуть время → ломает корреляцию атак,
 # истёкшие баны "оживают" или наоборот.
@@ -11927,11 +12585,18 @@ if [ "$SHIELD_CHRONY" != "1" ]; then
 else
     if ! command -v chronyd >/dev/null 2>&1; then
         print_status "Устанавливаем chrony..."
-        DEBIAN_FRONTEND=noninteractive apt-get install -y chrony >/dev/null 2>&1 || \
+        # audit C7 (T2-16): ждём apt-lock + timeout 120.
+        wait_for_apt_lock
+        DEBIAN_FRONTEND=noninteractive timeout 120 apt-get install -y chrony >/dev/null 2>&1 || \
             print_warn "chrony не установлен — пропущен (время остаётся на timesyncd)"
     fi
 
     if command -v chronyd >/dev/null 2>&1; then
+        # v4.0.0-hotfix (D12): backup оригинального chrony.conf ДО перезаписи —
+        # uninstall восстанавливает из .shieldnode-bak.
+        if [ -f /etc/chrony/chrony.conf ] && [ ! -f /etc/chrony/chrony.conf.shieldnode-bak ]; then
+            cp -a /etc/chrony/chrony.conf /etc/chrony/chrony.conf.shieldnode-bak 2>/dev/null || true
+        fi
         # Конфиг с NTS-серверами (Cloudflare + Netnod — публичные, поддерживают NTS)
         cat > /etc/chrony/chrony.conf <<'CHRONY_EOF'
 # chrony.conf — управляется shieldnode (ШАГ 12.17), NTS-шифрование
@@ -11951,7 +12616,16 @@ ntsdumpdir /var/lib/chrony
 CHRONY_EOF
 
         # Отключаем timesyncd чтобы не конфликтовал с chronyd
-        systemctl disable --now systemd-timesyncd.service >/dev/null 2>&1 || true
+        # v4.0.0-hotfix (D2): маркер — uninstall re-enable'ит timesyncd ТОЛЬКО
+        # если мы его реально disable'нули (он был active/enabled до нас).
+        if systemctl is-active --quiet systemd-timesyncd.service 2>/dev/null || \
+           systemctl is-enabled --quiet systemd-timesyncd.service 2>/dev/null; then
+            systemctl disable --now systemd-timesyncd.service >/dev/null 2>&1 || true
+            mkdir -p /var/lib/shieldnode 2>/dev/null
+            : > /var/lib/shieldnode/.timesyncd-disabled-by-shieldnode 2>/dev/null || true
+        else
+            systemctl disable --now systemd-timesyncd.service >/dev/null 2>&1 || true
+        fi
         systemctl enable --now chrony.service >/dev/null 2>&1
 
         sleep 2
@@ -11976,7 +12650,13 @@ fi
 # Обновления — руками: apt-get update && apt-get upgrade.
 # Здесь — откат нашей же конфигурации на нодах, где v3.36.0 отработал.
 
-if [ -f /etc/apt/apt.conf.d/51shieldnode-unattended ]; then
+# v4.0.0-hotfix (D12): gate не только по файлу, но и по факту is-enabled
+# таймеров — если наш конфиг уже снесён, а таймеры остались enabled (v3.36.0
+# успел enable до отката конфига), всё равно добиваем отключение.
+if [ -f /etc/apt/apt.conf.d/51shieldnode-unattended ] || \
+   systemctl is-enabled --quiet apt-daily.timer 2>/dev/null || \
+   systemctl is-enabled --quiet apt-daily-upgrade.timer 2>/dev/null || \
+   systemctl is-enabled --quiet unattended-upgrades.service 2>/dev/null; then
     rm -f /etc/apt/apt.conf.d/51shieldnode-unattended
     # 20auto-upgrades с нашим маркером (Periodic=1) — тоже убираем; если файл
     # чужой (cloud-image default) — не трогаем.
@@ -11984,7 +12664,7 @@ if [ -f /etc/apt/apt.conf.d/51shieldnode-unattended ]; then
         rm -f /etc/apt/apt.conf.d/20auto-upgrades
     fi
     systemctl disable --now unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
-    print_info "unattended-upgrades: конфиг v3.36.0 откачен (фоновые apt отключены — как в vpn-node-setup)"
+    print_info "unattended-upgrades: фоновые apt отключены (конфиг v3.36.0 + таймеры — как в vpn-node-setup)"
 fi
 
 # ==============================================================================
@@ -12006,10 +12686,14 @@ systemctl daemon-reload 2>/dev/null || true
 systemctl reset-failed shieldnode-update@custom.path \
                        shieldnode-update@custom.service \
                        'shieldnode-update@*.service' \
+                       protected-ports-update.path \
+                       protected-ports-update.service \
                        shieldnode-whitelist.path \
-                       shieldnode-whitelist.service 2>/dev/null || true
+                       shieldnode-whitelist.service \
+                       shieldnode-whitelist.timer 2>/dev/null || true
 systemctl enable --now shieldnode-update@custom.path >/dev/null 2>&1 || true
 systemctl enable --now shieldnode-whitelist.path >/dev/null 2>&1 || true
+systemctl enable --now shieldnode-whitelist.timer >/dev/null 2>&1 || true
 
 # 3. Один принудительный прогон updater'ов: применяет изменения файлов,
 #    накопившиеся пока watcher был мёртв (иначе WHITELIST DRIFT / custom
@@ -12083,6 +12767,29 @@ if ! nft list table inet ddos_protect >/dev/null 2>&1; then
     sleep 1
     systemctl restart shieldnode-nftables.service >/dev/null 2>&1
     sleep 2
+fi
+
+# v4.0.0-hotfix (находка T4-3, ПРОПУСК-7): если ruleset флашили в процессе
+# установки (bouncer pre-inst/postinst, ufw disable/enable выше), то свои
+# таблицы (ddos_protect/UFW/bouncer) мы восстановили, а docker'овские
+# iptables-nft таблицы (ip nat / ip filter) никто не пересоздал — docker
+# делает это только на (re)start'е. Без restart docker DNAT/MASQUERADE мертвы
+# → VPN-порты контейнеров недоступны. Гейт iptables-backend=nf_tables чтобы
+# не рестартовать docker зря на iptables-legacy хостах (даунтайм VPN).
+if systemctl is-active --quiet docker 2>/dev/null && \
+   iptables --version 2>/dev/null | grep -q nf_tables && \
+   ! nft list table ip nat 2>/dev/null | grep -q .; then
+    logger -t shieldnode "WARN: docker active, но table ip nat отсутствует (flush ruleset в процессе install?) — restart docker"
+    print_warn "Docker активен, но table ip nat отсутствует (ruleset был flushed) — перезапускаю docker (пересоздаст ip nat/ip filter; краткий даунтайм контейнеров)"
+    systemctl restart docker 2>/dev/null || true
+    sleep 2
+    if nft list table ip nat >/dev/null 2>&1; then
+        print_ok "Docker: table ip nat восстановлена после restart docker"
+        logger -t shieldnode "docker restarted — table ip nat восстановлена"
+    else
+        print_error "Docker: table ip nat НЕ появилась после restart — VPN-порты контейнеров мертвы. Проверь: journalctl -u docker -n 30"
+        logger -t shieldnode "ERROR: table ip nat отсутствует и после restart docker"
+    fi
 fi
 
 if ! nft list table inet ddos_protect >/dev/null 2>&1; then
@@ -12379,11 +13086,19 @@ else
 fi
 
 # v1.3: scanner blocklist size
+# v4.0.0-hotfix (D14б): порог >= 100 (паттерн как у tor-проверки выше) +
+# подсказка про SHIELD_FEED_MIRROR — на РФ-нодах raw.githubusercontent.com
+# может быть недоступен и scanner-фиды (shadow-netlab/traffic-guard-lists)
+# не скачиваются.
+# v4.0.0-hotfix (H2/H4 + U-L1): limits.conf source'ится до mirror-блоков —
+# подсказка «задайте в limits.conf» теперь рабочая (применится при guard
+# upgrade); «пуст» → «подозрительно мал» (set может быть не пуст, а
+# деградировавшим).
 BL_V4=$(nft list set inet ddos_protect scanner_blocklist_v4 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l)
-if [ "$BL_V4" -gt 0 ]; then
+if [ "$BL_V4" -ge 100 ]; then
     print_ok "Scanner blocklist: $BL_V4 IPv4 подсетей"
 else
-    print_warn "Scanner blocklist пуст — проверь journalctl -u shieldnode-update@scanner"
+    print_warn "scanner_blocklist подозрительно мал ($BL_V4 < 100) — на РФ-ноде задайте SHIELD_FEED_MIRROR в /etc/shieldnode/limits.conf и выполните guard upgrade (или разово: SHIELD_FEED_MIRROR=https://mirror/ bash shieldnode.sh); диагностика: journalctl -u shieldnode-update@scanner"
 fi
 
 # v3.29.0: на Docker-хостах FORWARD policy = DROP ломает egress контейнеров. Обычно
@@ -12397,6 +13112,19 @@ if shield_docker_present; then
         print_ok "Docker + FORWARD policy=accept (egress контейнеров не блокируется)"
     else
         print_info "Docker есть; FORWARD policy не определил (iptables-legacy?) — проверь egress контейнера вручную"
+    fi
+    # v4.0.0-hotfix (находка T4-3, ПРОПУСК-7): docker active, но его таблица
+    # ip nat (iptables-nft) отсутствует — значит ruleset флашили ПОСЛЕ старта
+    # docker (bouncer pre-inst/postinst и т.п.) и docker свои цепочки не
+    # пересоздал → DNAT/MASQUERADE мертвы, VPN-порты контейнеров недоступны.
+    # Раньше здесь было только нейтральное info — теперь явный WARN.
+    # Гейт iptables-backend=nf_tables: на legacy-хостах table ip nat в nft
+    # не существует штатно (не WARN'им).
+    if systemctl is-active --quiet docker 2>/dev/null && \
+       iptables --version 2>/dev/null | grep -q nf_tables && \
+       ! nft list table ip nat 2>/dev/null | grep -q .; then
+        print_warn "Docker active, но table ip nat отсутствует (ruleset был flushed после старта docker?) — DNAT/MASQUERADE контейнеров НЕ работает, VPN-порты мертвы"
+        print_info "Фикс: sudo systemctl restart docker (пересоздаст ip nat/ip filter; кратковременный даунтайм контейнеров)"
     fi
 fi
 
@@ -12453,6 +13181,17 @@ fi
 # ШАГ 14: ИТОГИ (v3.12.0 — компактно)
 # ==============================================================================
 
+# audit C3: install завершён успешно — снимаем marker незавершённого install
+# (создан в ШАГ 1). shieldnode-boot-repair.service при следующем boot'е
+# станет no-op (ConditionPathExists).
+# v4.0.0 (G7): при SMOKE_FAIL=1 маркер НЕ снимаем — установка не считается
+# завершённой, boot-repair сможет дофиксить состояние после ребута.
+if [ "${SMOKE_FAIL:-0}" -eq 0 ]; then
+    rm -f /var/lib/shieldnode/.install-in-progress 2>/dev/null || true
+else
+    print_warn "Smoke-test НЕ пройден — маркер .install-in-progress оставлен (boot-repair повторит finalize после ребута)"
+fi
+
 # v1.5 fix: $0 на pipe-mode = /dev/fd/63
 SCRIPT_NAME="$0"
 case "$SCRIPT_NAME" in
@@ -12475,7 +13214,13 @@ TCP_PORTS_COUNT=$(echo "$XRAY_PORTS_TCP" | tr ',' '\n' | grep -c .)
 
 echo ""
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
-echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v${SHIELDNODE_VERSION} установлен${NC}"
+if [ "${SMOKE_FAIL:-0}" -eq 1 ]; then
+    # v4.0.0 (G7): честный баннер при провале smoke-test — никакого зелёного ✓
+    echo -e "  ${RED}✗${NC} ${BOLD}shieldnode v${SHIELDNODE_VERSION} установлен С ОШИБКАМИ${NC}"
+    echo -e "  ${RED}Smoke-test не пройден${NC} ${DIM}— см. FAIL-строки выше; exit code будет 2${NC}"
+else
+    echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v${SHIELDNODE_VERSION} установлен${NC}"
+fi
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
 echo ""
 echo -e "  ${BOLD}Защита активна:${NC}"
@@ -12488,7 +13233,7 @@ echo -e "   • Blocklists:    ${BL_LINE}"
 # v3.20.6: блок Mobile-RU удалён — whitelist отменён в v3.20.0, оставшаяся
 # отображалка вводила в заблуждение ("первый sync через несколько минут" —
 # никакого sync не будет, фичи нет).
-echo -e "   • Лимиты:        ct=15000, new-conn=40000/min ${DIM}(500-1000 client base)${NC}"
+echo -e "   • Лимиты:        ct=${SHIELD_CT_CONN_FLOOD}, new-conn=${SHIELD_RATE_NEWCONN} ${DIM}(500-1000 client base)${NC}"
 # v3.14.0: статус auto-sync features
 if [ "${ENABLE_GITHUB_SYNC:-1}" = "1" ]; then
     echo -e "   • GitHub sync:   ${GREEN}ON${NC}  ${DIM}(custom.txt каждые 6ч)${NC}"
@@ -12507,18 +13252,11 @@ else
     echo -e "   • Notify:        ${YELLOW}шаблон${NC} ${DIM}(заполни /etc/shieldnode/notify.conf)${NC}"
 fi
 if [ "${SHIELD_METRICS:-1}" = "1" ]; then
-    echo -e "   • Metrics:       ${GREEN}ON${NC}  ${DIM}(textfile, 1мин nice-19 ~0.1с CPU; off: SHIELD_METRICS=0 в limits.conf)${NC}"
+    echo -e "   • Metrics:       ${GREEN}ON${NC}  ${DIM}(textfile, тик aggregator'а ~1мин; off: SHIELD_METRICS=0 в limits.conf)${NC}"
 else
     echo -e "   • Metrics:       ${DIM}OFF (SHIELD_METRICS=0)${NC}"
 fi
-# v3.33.0 (stage3): tarpit / API / rollback статус
-if [ "${SHIELD_TARPIT:-1}" = "1" ] && systemctl is-active --quiet endlessh.service 2>/dev/null; then
-    echo -e "   • Tarpit:        ${GREEN}ON${NC}  ${DIM}(endlessh порт ${SHIELD_TARPIT_PORT:-8022} → tarpit_caught set; off: SHIELD_TARPIT=0)${NC}"
-elif [ "${SHIELD_TARPIT:-1}" = "1" ]; then
-    echo -e "   • Tarpit:        ${YELLOW}configured${NC} ${DIM}(endlessh не активен — проверь journalctl -u endlessh)${NC}"
-else
-    echo -e "   • Tarpit:        ${DIM}OFF (SHIELD_TARPIT=0)${NC}"
-fi
+# v3.33.0 (stage3): API / rollback статус (tarpit удалён в v4.0.0-hotfix)
 if [ "${SHIELD_API:-1}" = "1" ] && [ -S /run/shieldnode/api.sock ]; then
     echo -e "   • API:           ${GREEN}ON${NC}  ${DIM}(unix:/run/shieldnode/api.sock, 0 RAM в простое; off: SHIELD_API=0)${NC}"
 else
@@ -12550,3 +13288,11 @@ if [ -d "$BACKUP_DIR" ]; then
 fi
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
 echo ""
+
+# v4.0.0 (G7): провал smoke-test = ненулевой exit code для CI/скриптов-обёрток.
+# Маркер .install-in-progress при этом НЕ снят (см. выше) — boot-repair
+# дофиксит ноду после ребута. exit 2 (не 1) чтобы отличать от syntax/usage.
+if [ "${SMOKE_FAIL:-0}" -eq 1 ]; then
+    exit 2
+fi
+exit 0
