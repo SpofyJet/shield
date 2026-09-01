@@ -68,6 +68,54 @@
 #      Неудача починки в smoke/final → SMOKE_FAIL=1 (маркер
 #      .install-in-progress остаётся → boot-repair, exit 2) — только когда
 #      есть bridge-контейнеры.
+#  REDUNDANT-FIX (пасс «лишние действия», 2026-09-01): убраны повторные
+#      действия, не менявшие состояние системы:
+#      • Финальная загрузка blocklists после smoke-test перезапускала ВСЕ 4
+#        feed-updater'а (scanner/threat/tor/custom) безусловно — хотя первый
+#        запуск уже сделал ExecStartPost shieldnode-nftables.service. Теперь
+#        перезапуск только для set'ов с 0 entries (race-окно/feed недоступен);
+#        непустые — skip. Экономия: 4 внешних скачивания + парсинг на каждой
+#        установке/upgrade.
+#      • CrowdSec hub update+upgrade на fresh-install шёл ДВАЖДЫ (ШАГ 12.4 и
+#        безусловный BUG-13 блок): индекс хаба и коллекции скачивались два
+#        раза подряд. Добавлен маркер HUB_UPDATED_THIS_RUN — второй прогон
+#        пропускается.
+#      • Слепой `sleep 5` перед `cscli metrics` заменён поллингом
+#        `cscli lapi status` (1..5с, ранний выход) — обычно <1с вместо 5с.
+#      Проверено и оставлено (не лишнее): 26 daemon-reload (каждый между
+#      записью/удалением unit-файла и unit-операцией), restart'ы crowdsec
+#      (меняются credentials/config), двойные enable --now (reset-failed +
+#      re-enable в watcher-recovery и guard-меню — осознанный recovery).
+#  FIX POST-CHECK (по результатам check-shieldnode.sh на боевых нодах):
+#      • BLOCK_TOR=0, но tor дропался: ExecStartPost nftables-сервиса и
+#        финальная загрузка blocklists запускали tor-updater БЕЗУСЛОВНО
+#        (unit-файл создаёт make_timer всегда) → set заполнялся (~800 IP),
+#        а drop-правило в шаблоне безусловное → tor-трафик блокировался
+#        вопреки выключенной фиче. Теперь tor-updater запускается только
+#        при BLOCK_TOR=1 (ExecStartPost через $NFT_POST_UPDATE_SERVICES,
+#        финальная загрузка и отчёт — skip tor).
+#      • legacy-реапер mobile_ru/broadband_ru делал только disable --now —
+#        unit-файлы оставались в /etc/systemd/system навсегда. Теперь
+#        rm -f файлов после disable.
+#  FIX NEEDRESTART/TTY (репорт 2026-09-01, скрин с ноды: «зависимости не
+#      установились, полетело меню»). Единый корень обоих симптомов —
+#      needrestart: после apt-get install он спавнил интерактивный TUI
+#      (список сервисов на перезапуск) ДАЖЕ с DEBIAN_FRONTEND=noninteractive.
+#      TUI висел до `timeout 120` → apt убивался (rc=124) ПОСЛЕ того как dpkg
+#      уже распаковал бинарь → ложный warn «не установлен», а следующая
+#      проверка command -v находила бинарь → «активен». Убитый TUI оставлял
+#      tty в raw-режиме → весь дальнейший вывод «лесенкой» (LF без CR).
+#      • Глобально: export NEEDRESTART_SUSPEND=1 (needrestart ≥3.x не
+#        запускается вовсе из apt-хуков) + trap 'stty sane' EXIT как страховка.
+#      • earlyoom/chrony: timeout 180 + `|| true` + verify-by-binary — warn
+#        печатается только если бинаря реально нет.
+#      • «NTS-серверов видно: 0 0»: `grep -c PAT || echo 0` при 0 совпадений
+#        печатал «0» И выходил rc=1 → срабатывал || и добавлялся второй 0.
+#        Теперь `|| true` + дефолт ${VAR:-0}.
+#      • wait_for_apt_lock: \r-спиннер заменён на newline-сообщение раз в
+#        30с — \r ломал разметку в web-SSH консолях (progressive right-shift).
+#      Если tty уже «лесенкой» от прошлого запуска: выполни `stty sane`
+#      (или reset) в своей сессии — скрипт чинит только свой вывод.
 #  REMOVE TARPIT (ШАГ 12.12 выпилен целиком): фича была мёртва с рождения —
 #      оба `nft add rule inet ddos_protect input ...` шли в НЕсуществующий
 #      chain (template создаёт только prerouting/overflow), stderr глушился,
@@ -1325,6 +1373,17 @@
 
 
 set -o pipefail
+
+# v4.0.1 FIX (репорт: «зависимости не установились, полетело меню»):
+# needrestart после apt-get install поднимает интерактивный TUI даже при
+# DEBIAN_FRONTEND=noninteractive. TUI висит до timeout (apt убит → ложный
+# "не установлен" рядом с "активен"), а убитый TUI оставляет tty в raw-
+# режиме → весь дальнейший вывод съезжает лесенкой. Глушим needrestart
+# глобально для всех apt-вызовов скрипта + страховочный stty sane.
+export NEEDRESTART_SUSPEND=1
+# Если что-то всё же оставило tty в raw-режиме (needrestart/whiptail/etc,
+# убитые по timeout) — на выходе возвращаем терминал в норму.
+trap 'stty sane 2>/dev/null || true' EXIT
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -3073,11 +3132,17 @@ wait_for_apt_lock() {
 
         sleep 5
         elapsed=$((elapsed + 5))
-        printf "\r  ${YELLOW}⏳${NC} Ждём apt lock... ${BOLD}${elapsed}s${NC}    "
+        # v4.0.1 FIX: \r-спиннер ломал разметку в терминалах которые не
+        # обрабатывают carriage return корректно (web-консоли, screen/tmux
+        # с узким окном) — строки съезжали лесенкой, "полетело меню".
+        # Печатаем каждый статус НОВОЙ строкой раз в 30с (не каждые 5с —
+        # чтобы не засорять вывод).
+        if [ $((elapsed % 30)) -eq 0 ]; then
+            print_info "Ждём apt lock... ${elapsed}s (unattended-upgrades работает)"
+        fi
     done
 
     if [ $first_msg -eq 0 ]; then
-        printf "\r"
         print_ok "apt освободился (ждали ${elapsed}s)"
     fi
     return 0
@@ -3646,11 +3711,25 @@ fi
 
 # 7) v3.20.0+: mobile_ru и broadband_ru timer'ы УДАЛЕНЫ из shieldnode (whitelist'ы убраны).
 #    Если ранее были установлены (v3.13.0+/v3.19.0+) — отключить и удалить.
+#    v4.0.1 FIX: раньше только disable --now — unit-ФАЙЛЫ оставались в
+#    /etc/systemd/system навсегда (systemctl cat их находил, check-скрипт
+#    WARN'ил). Теперь после disable удаляем и сами файлы.
 for legacy_timer in shieldnode-update@mobile_ru.timer shieldnode-update@mobile_ru.service \
                     shieldnode-update@broadband_ru.timer shieldnode-update@broadband_ru.service; do
     if systemctl list-unit-files "$legacy_timer" 2>/dev/null | grep -q "$legacy_timer"; then
         LEGACY_FOUND=1
         systemctl disable --now "$legacy_timer" 2>/dev/null || true
+    fi
+done
+# Удаляем сами unit-файлы (иначе systemctl cat их находит даже после disable)
+for legacy_unit_file in \
+    /etc/systemd/system/shieldnode-update@mobile_ru.timer \
+    /etc/systemd/system/shieldnode-update@mobile_ru.service \
+    /etc/systemd/system/shieldnode-update@broadband_ru.timer \
+    /etc/systemd/system/shieldnode-update@broadband_ru.service; do
+    if [ -f "$legacy_unit_file" ]; then
+        LEGACY_FOUND=1
+        rm -f "$legacy_unit_file"
     fi
 done
 
@@ -5426,6 +5505,14 @@ if [ -f "$NFTABLES_MAIN" ] && grep -q "$NFT_DDOS_CONF" "$NFTABLES_MAIN"; then
 fi
 
 # Создаём свой systemd-сервис для загрузки нашей таблицы
+# v4.0.1 FIX: tor-updater в ExecStartPost — ТОЛЬКО при BLOCK_TOR=1. Раньше
+# tor.service стартовал безусловно → tor_exit_blocklist_v4 заполнялся даже
+# при выключенной фиче, а drop-правило в шаблоне безусловное → tor-трафик
+# фактически дропался вопреки конфигу оператора.
+NFT_POST_UPDATE_SERVICES="shieldnode-update@scanner.service shieldnode-update@threat.service shieldnode-update@custom.service shieldnode-whitelist.service"
+if [ "$BLOCK_TOR" = "1" ]; then
+    NFT_POST_UPDATE_SERVICES="shieldnode-update@scanner.service shieldnode-update@threat.service shieldnode-update@tor.service shieldnode-update@custom.service shieldnode-whitelist.service"
+fi
 cat > /etc/systemd/system/shieldnode-nftables.service <<EOF
 [Unit]
 Description=Shieldnode DDoS protection nftables ruleset
@@ -5451,7 +5538,7 @@ ExecStart=/usr/sbin/nft -f $NFT_DDOS_CONF
 # таблицу с ПУСТЫМИ set'ами — без триггера updater'ов blocklist'ы ждали бы
 # ближайший таймер (до 24ч). "-" → не ронять unit при ошибке запуска,
 # --no-block → не задерживать boot (updater'ы oneshot, сами ждут network-online).
-ExecStartPost=-/usr/bin/systemctl start --no-block shieldnode-update@scanner.service shieldnode-update@threat.service shieldnode-update@tor.service shieldnode-update@custom.service shieldnode-whitelist.service
+ExecStartPost=-/usr/bin/systemctl start --no-block $NFT_POST_UPDATE_SERVICES
 # При остановке/restart удаляем только нашу таблицу.
 # v3.18.8: префикс "-" → systemd игнорирует exit code. Если таблицу уже
 # флушнул внешний процесс (bouncer post-inst regression и т.п.), unit
@@ -7604,6 +7691,10 @@ SKIP_EOF
     if timeout --kill-after=10s 120s cscli hub update 2>/dev/null \
        && timeout --kill-after=10s 120s cscli hub upgrade 2>/dev/null; then
         print_ok "CrowdSec hub обновлён"
+        # v4.0.1 REDUNDANT-FIX: маркер успеха — ШАГ BUG-13 ниже пропустит
+        # повторный hub update+upgrade (иначе на fresh-install hub-индекс
+        # и все коллекции скачивались дважды подряд).
+        HUB_UPDATED_THIS_RUN=1
     else
         print_warn "Hub upgrade не успел за 2 мин — продолжаем без него"
         print_info "Запусти позже: sudo cscli hub update && sudo cscli hub upgrade"
@@ -8181,12 +8272,19 @@ fi
 # Без этого: сценарии устаревают, новые sshd-bf варианты не подхватываются.
 # CrowdSec >= 1.7.2 имеет встроенный systemd timer (hubupdate.timer), на
 # старых версиях нужен cron.
-print_status "Обновляю CrowdSec hub..."
-# audit C7 (T2-11): timeout 120 как на fresh-install выше — при blackholed
-# сети инсталлер раньше висел минуты на connect+скачивании коллекций.
-if timeout --kill-after=10s 120s cscli hub update >/dev/null 2>&1; then
-    if timeout --kill-after=10s 120s cscli hub upgrade >/dev/null 2>&1; then
-        print_ok "Hub: коллекции/сценарии обновлены"
+# v4.0.1 REDUNDANT-FIX: если hub уже обновлён выше в этом же прогоне
+# (fresh-install ветка, ~2 мин назад) — повторное скачивание индекса и
+# коллекций бессмысленно, пропускаем.
+if [ "${HUB_UPDATED_THIS_RUN:-0}" = "1" ]; then
+    print_ok "CrowdSec hub уже обновлён в этом прогоне — повтор не нужен"
+else
+    print_status "Обновляю CrowdSec hub..."
+    # audit C7 (T2-11): timeout 120 как на fresh-install выше — при blackholed
+    # сети инсталлер раньше висел минуты на connect+скачивании коллекций.
+    if timeout --kill-after=10s 120s cscli hub update >/dev/null 2>&1; then
+        if timeout --kill-after=10s 120s cscli hub upgrade >/dev/null 2>&1; then
+            print_ok "Hub: коллекции/сценарии обновлены"
+        fi
     fi
 fi
 
@@ -12749,8 +12847,17 @@ else
         # audit C7 (T2-16): ждём apt-lock + timeout — раньше при локе был
         # молчаливый skip, при blackhole-сети стопор до apt-таймаутов.
         wait_for_apt_lock
-        DEBIAN_FRONTEND=noninteractive timeout 120 apt-get install -y earlyoom >/dev/null 2>&1 || \
+        # v4.0.1 FIX: apt-get мог быть убит timeout'ом ПОСЛЕ того как dpkg
+        # уже поставил пакет (post-install triggers/needrestart на нагруженной
+        # ноде) → ложный "не установлен" рядом с "активен". Проверяем факт
+        # наличия бинаря ПОСЛЕ попытки, а не только exit code.
+        # NEEDRESTART_SUSPEND=1: не даём needrestart сканировать процессы
+        # (на ноде с сотнями коннектов это минуты — съедал весь timeout 120).
+        DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 \
+            timeout 180 apt-get install -y earlyoom >/dev/null 2>&1 || true
+        if ! command -v earlyoom >/dev/null 2>&1; then
             print_warn "earlyoom не установлен (нет в репо?) — пропущен"
+        fi
     fi
 
     if command -v earlyoom >/dev/null 2>&1; then
@@ -12817,8 +12924,14 @@ else
         print_status "Устанавливаем chrony..."
         # audit C7 (T2-16): ждём apt-lock + timeout 120.
         wait_for_apt_lock
-        DEBIAN_FRONTEND=noninteractive timeout 120 apt-get install -y chrony >/dev/null 2>&1 || \
+        # v4.0.1 FIX: как с earlyoom — проверяем факт наличия бинаря после
+        # попытки (apt-get мог быть убит timeout'ом после распаковки пакета
+        # → ложный warn рядом с "chrony активен").
+        DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 \
+            timeout 180 apt-get install -y chrony >/dev/null 2>&1 || true
+        if ! command -v chronyd >/dev/null 2>&1; then
             print_warn "chrony не установлен — пропущен (время остаётся на timesyncd)"
+        fi
     fi
 
     if command -v chronyd >/dev/null 2>&1; then
@@ -12860,7 +12973,10 @@ CHRONY_EOF
 
         sleep 2
         if systemctl is-active --quiet chrony.service 2>/dev/null; then
-            NTS_SOURCES=$(chronyc sources 2>/dev/null | grep -c 'NTS\|time.cloudflare\|netnod' || echo 0)
+            # v4.0.1 FIX: `grep -c ... || echo 0` при 0 совпадений печатал
+            # "0" от grep И второй "0" от echo → "NTS-серверов видно: 0 0".
+            NTS_SOURCES=$(chronyc sources 2>/dev/null | grep -c 'NTS\|time.cloudflare\|netnod' || true)
+            NTS_SOURCES="${NTS_SOURCES:-0}"
             print_ok "chrony активен, NTS-серверов видно: $NTS_SOURCES (~3MB RAM)"
             print_info "  Проверка NTS: chronyc sources -v (колонка S с флагом N = NTS-auth)"
         else
@@ -13250,11 +13366,34 @@ else
     # пустой. Сейчас nft table 100% активна (smoke-test это проверил),
     # перезапускаем все updater'ы один раз для гарантии загрузки.
     print_status "Финальная загрузка blocklists (после smoke-test)..."
+    # v4.0.1 REDUNDANT-FIX: первый запуск updater'ов уже сделал ExecStartPost
+    # shieldnode-nftables.service. Перезапускаем ТОЛЬКО те feed'ы, чей nft set
+    # пуст (race-окно ШАГ 6 / feed был недоступен) — иначе все 4 внешних
+    # feed'а скачивались и парсились дважды при каждой установке/upgrade.
     # v3.20.6: mobile_ru удалён из списка — whitelist отменён в v3.20.0
     for n in scanner threat tor custom; do
-        # Только если сервис вообще существует (например tor — только при BLOCK_TOR=1)
+        # v4.0.1 FIX: tor не трогаем при BLOCK_TOR=0 — unit-файл существует
+        # всегда (make_timer безусловен), запуск updater'а заполнял бы set
+        # вопреки выключенной фиче.
+        if [ "$n" = "tor" ] && [ "$BLOCK_TOR" != "1" ]; then
+            continue
+        fi
+        # Только если сервис вообще существует
         if [ -f "/etc/systemd/system/shieldnode-update@${n}.service" ] || \
            systemctl cat "shieldnode-update@${n}.service" >/dev/null 2>&1; then
+            SET_NAME=$(case "$n" in
+                scanner)      echo "scanner_blocklist_v4" ;;
+                threat)       echo "threat_blocklist_v4"  ;;
+                tor)          echo "tor_exit_blocklist_v4" ;;
+                custom)       echo "custom_blocklist_v4"  ;;
+            esac)
+            PRE_SIZE=$(nft list set inet ddos_protect "$SET_NAME" 2>/dev/null | \
+                tr '\n' ' ' | grep -cE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' || true)
+            PRE_SIZE="${PRE_SIZE:-0}"
+            if [ "$PRE_SIZE" -gt 0 ]; then
+                print_ok "  $n: уже загружен ($PRE_SIZE entries) — повтор не нужен"
+                continue
+            fi
             # timeout — на случай если внешний URL feed виснет
             timeout --kill-after=10s 60s \
               systemctl start "shieldnode-update@${n}.service" 2>/dev/null || true
@@ -13262,6 +13401,8 @@ else
     done
     # Краткий отчёт по размерам set'ов
     for n in scanner threat tor custom; do
+        # v4.0.1: tor пропускаем в отчёте если фича выключена
+        [ "$n" = "tor" ] && [ "$BLOCK_TOR" != "1" ] && continue
         SET_NAME=$(case "$n" in
             scanner)      echo "scanner_blocklist_v4" ;;
             threat)       echo "threat_blocklist_v4"  ;;
@@ -13279,8 +13420,14 @@ else
 fi
 echo ""
 
-print_info "Жду 5 секунд чтобы парсеры успели прочитать логи..."
-sleep 5
+# v4.0.1 REDUNDANT-FIX: было слепое sleep 5. Теперь ждём готовности LAPI
+# с ранним выходом (обычно <1с), максимум 5с как раньше.
+if command -v cscli >/dev/null 2>&1; then
+    for _i in $(seq 1 5); do
+        cscli lapi status >/dev/null 2>&1 && break
+        sleep 1
+    done
+fi
 
 print_status "CrowdSec metrics:"
 echo ""
@@ -13522,6 +13669,11 @@ if [ -d "$BACKUP_DIR" ]; then
 fi
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
 echo ""
+
+# v4.0.1 FIX: финальный stty sane — гарантированно выполняется на нормальном
+# пути (ранний trap '...' EXIT перезаписывается более поздними trap'ами
+# TMP-cleanup'ов; если дочерний TUI/утилита оставила tty в raw — чиним здесь).
+stty sane 2>/dev/null || true
 
 # v4.0.0 (G7): провал smoke-test = ненулевой exit code для CI/скриптов-обёрток.
 # Маркер .install-in-progress при этом НЕ снят (см. выше) — boot-repair
