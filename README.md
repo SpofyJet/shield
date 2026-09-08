@@ -4,7 +4,7 @@
 Один скрипт: nftables-фильтрация на prerouting, CrowdSec + firewall-bouncer,
 динамические blocklist-фиды, автовосстановление после инцидентов и TUI-панель `guard`.
 
-![version](https://img.shields.io/badge/version-v4.0.0-blue)
+![version](https://img.shields.io/badge/version-v4.1.0-blue)
 ![platform](https://img.shields.io/badge/platform-Ubuntu%2024.04%2B-orange)
 ![shell](https://img.shields.io/badge/lang-bash-lightgrey)
 
@@ -17,7 +17,7 @@ sudo bash <(curl -fsSL https://raw.githubusercontent.com/SpofyJet/shield/main/sh
 Пиннинг на конкретный релиз:
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/SpofyJet/shield/v4.0.0/shieldnode.sh)
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/SpofyJet/shield/v4.1.0/shieldnode.sh)
 ```
 
 Зеркало для РФ-нод (DPI может резать raw.githubusercontent.com):
@@ -58,19 +58,21 @@ SHIELD_FEED_MIRROR=https://your.mirror/ sudo bash <(curl -fsSL https://raw.githu
 - Ядро XanMod — рекомендуется (ставится [vpn-node-setup](https://github.com/SpofyJet/node))
 - Remnawave panel + remnanode/Xray в Docker
 
-## Changelog v4.0.0
+## Changelog v4.1.0
 
-Полный аудит (39 находок) + S-оптимизации. Ключевое:
+FEEDS-релиз: ссылки-фиды прямо в lists/scanner.txt.
 
-- tarpit/endlessh **удалён полностью** (не чинился — вырезан)
-- drop `ct state invalid` перенесён **после** whitelist-accept'ов
-- priority -150 безусловно; атомарная запись `ddos-protect.conf` (tmp + `nft -c` + mv)
-- whitelist.timer + hash-guard v2, строгая валидация CIDR (отклонение /0–/7)
-- uninstall закрывает 100% артефактов (юниты, sysctl, ufw, notify, rollback)
-- boot-repair + маркер `.install-in-progress`, SMOKE_FAIL → exit 2
-- guard: переработанное меню, чистый дашборд, защита от busy-loop не-TTY
-- docker: daemon.json log-opts 50m×3, восстановление `ip nat`, healthcheck
-- logrotate 10-мин тик; staleness-алерты фидов; snapshot → atomic rollback
+- **inline-URL в list-файлах**: строки `https://...` в `/etc/shieldnode/lists/*.txt`
+  качаются как полноценные фиды (plain + JSON). Добавить фид = вставить ссылку
+  в `lists/scanner.txt` на github — shieldnode.sh трогать не нужно
+- **github-sync** теперь синкает `custom.txt` И `scanner.txt` каждые 6ч
+  (+ мгновенный рестарт updater'а после синка, без ожидания timer'а)
+- **lists/scanner.txt пересобран**: 12 фидов-ссылок (RIPEstat AS61280/AS213853
+  ГРЧЦ + AS197571 НКЦКИ — живые BGP из RIPE RIS; ShadowWhisperer 60k + maltrail +
+  OpenFilters binaryedge/strechoid — 99.9% union'а 15 фидов по overlap-анализу)
+  + 1 343 сети RKN-статики (ГРЧЦ LIR, Roskomnadzor-net, СКИПА, APN-RKN)
+  — валидировано боевыми хитами на 8 нодах (17.9M хитов, 14 809 IP)
+- дедуп URL'ов, закомментированный `# http...` фид не качается
 
 Полная история изменений — в шапке скрипта `shieldnode.sh`.
 

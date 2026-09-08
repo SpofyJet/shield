@@ -1,6 +1,33 @@
 #!/bin/bash
 
 # ==============================================================================
+#  VPN NODE DDoS PROTECTION v4.1.0 — FEEDS: inline-URL в lists + scanner sync
+#
+#  INLINE-URL В LIST-ФАЙЛАХ (2026-09-08): update-blocklist.sh выдёргивает
+#      строки http(s):// из локальных /etc/shieldnode/lists/<name>.txt и
+#      качает их наравне с REMOTE_URLS (JSON-ветка `\.json($|\?)` работает
+#      и для них). Оператор добавляет фид просто вставкой ссылки в
+#      lists/scanner.txt в github — без правок shieldnode.sh. Закомменти-
+#      рованный (# http...) URL игнорируется; дедуп URL'ов против дублей
+#      с DEFAULT_REMOTE_BLOCKLISTS. IP-парсер URL-строки не подхватывает
+#      (regex требует цифру первым непробельным символом) — IP и ссылки
+#      могут жить в одном файле.
+#  GITHUB-SYNC теперь синкает custom.txt И scanner.txt (6ч), после синка
+#      не-custom файла сразу стартует shieldnode-update@<name>.service
+#      (не дожидаясь timer'а). Переопределяется GITHUB_SYNC_LISTS в conf.
+#      Валидация принимает и файлы, начинающиеся с URL ('h').
+#  LISTS/SCANNER.TXT в репо пересобран (валидация на 8 боевых нодах через
+#      check-scanners v1.0.4: 14 809 уникальных IP сканеров, 17.9M хитов):
+#      СЕКЦИЯ A — 12 фидов-ссылок (RIPEstat AS61280/AS213853/AS197571 =
+#      живые BGP ГРЧЦ/НКЦКИ из RIPE RIS; tread-lightly, shadow-netlab ×2,
+#      gist sngvy; SCAN-ядро: ShadowWhisperer 60k + maltrail ×2 +
+#      OpenFilters binaryedge/strechoid — overlap-анализ 15 фидов, эти 12
+#      дают 99.9% union'а). СЕКЦИЯ B — 1 343 сети RKN-статики без публичных
+#      фидов (LIR-объекты ГРЧЦ в сетях Ростелеком/Sovintel/Электросвязь/
+#      Спецсвязь, Roskomnadzor-net, СКИПА, APN-RKN), пометки CONFIRMED.
+#  DEFAULT_REMOTE_BLOCKLISTS[scanner] — тот же 12-URL набор как bootstrap
+#      (на случай, если seed не скачался); дедуп не даст двойной качки.
+#
 #  VPN NODE DDoS PROTECTION v4.0.0 — MAJOR: pcap-стек удалён полностью
 #
 #  REMOVE PCAP (весь стек): хостеры не принимают pcap-файлы, а ring+archiver
@@ -97,6 +124,28 @@
 #      • legacy-реапер mobile_ru/broadband_ru делал только disable --now —
 #        unit-файлы оставались в /etc/systemd/system навсегда. Теперь
 #        rm -f файлов после disable.
+#  FEEDS SCANNER (2026-09-08, валидация на 8 боевых нодах через
+#      check-scanners v1.0.4: 14 809 уникальных IP сканеров, 17.9M хитов).
+#      INLINE-URL В LIST-ФАЙЛАХ: update-blocklist.sh теперь выдёргивает
+#      строки http(s):// из локальных /etc/shieldnode/lists/<name>.txt и
+#      качает их наравне с REMOTE_URLS (JSON-ветка `\.json($|\?)` работает
+#      и для них). Оператор добавляет фид просто вставкой ссылки в
+#      lists/scanner.txt в github — без правок shieldnode.sh. Закомменти-
+#      рованный (# http...) URL игнорируется; дедуп URL'ов против дублей
+#      с DEFAULT_REMOTE_BLOCKLISTS. IP-парсер URL-строки не подхватывает
+#      (regex требует цифру первым непробельным символом) — IP и ссылки
+#      могут жить в одном файле.
+#      GITHUB-SYNC теперь синкает custom.txt И scanner.txt (6ч), после
+#      синка не-custom файла сразу стартует shieldnode-update@<name>.service
+#      (не дожидаясь timer'а). Переопределяется GITHUB_SYNC_LISTS в conf.
+#      lists/scanner.txt в репо: СЕКЦИЯ A — 12 фидов-ссылок (RIPEstat
+#      AS61280/AS213853/AS197571 = живые BGP ГРЧЦ/НКЦКИ из RIPE RIS;
+#      tread-lightly, shadow-netlab ×2, gist sngvy; SCAN-ядро:
+#      ShadowWhisperer 60k + maltrail ×2 + OpenFilters binaryedge/strechoid
+#      — overlap-анализ 15 фидов, эти 12 дают 99.9% union'а), СЕКЦИЯ B —
+#      1 343 сети RKN-статики без публичных фидов (LIR-объекты ГРЧЦ,
+#      Roskomnadzor-net, СКИПА, APN-RKN).
+
 #  FIX NEEDRESTART/TTY (репорт 2026-09-01, скрин с ноды: «зависимости не
 #      установились, полетело меню»). Единый корень обоих симптомов —
 #      needrestart: после apt-get install он спавнил интерактивный TUI
@@ -1359,7 +1408,7 @@
 #    sudo guard --json         — JSON для Zabbix/Prometheus
 #    sudo guard upgrade        — re-install с github (auto-snapshot для rollback)
 #    sudo guard rollback       — откатиться к предыдущему snapshot'у
-#    sudo guard sync           — синк custom.txt прямо сейчас
+#    sudo guard sync           — синк lists (custom+scanner) с github прямо сейчас
 #
 #  Удаление: sudo bash shieldnode.sh --uninstall
 #
@@ -1431,7 +1480,7 @@ SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/SpofyJet/s
 # можно задавать и в /etc/shieldnode/limits.conf, а не только через env.
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="4.0.0"
+SHIELDNODE_VERSION="4.1.0"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -1699,7 +1748,17 @@ DEFAULT_LOCAL_BLOCKLISTS=(
 
 # Объединение URL'ов через запятую → один set
 DEFAULT_REMOTE_BLOCKLISTS=(
-    "scanner=https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/antiscanner.list,https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/government_networks.list,https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_cidr.txt"
+    # v4.0.0-feeds (2026-09-08): оптимальный набор по overlap-анализу 15 фидов
+    # (84 848 уникальных сетей суммарно; эти 12 URL покрывают 84 764 = 99.9%).
+    # RKN-приоритет: RIPEstat = живые BGP-префиксы ГРЧЦ (AS61280/AS213853) и
+    # НКЦКИ (AS197571) из RIPE RIS без лага комьюнити-листов; JSON с ?resource=
+    # матчится веткой `\.json($|\?)` update-blocklist.sh (проверено живым
+    # прогоном). gist sngvy = Netlas/Group-IB/Nessly (72 уникальных RU-сканера).
+    # SCAN: ShadowWhisperer (59.9k, ядро), maltrail (+11.2k уникальных),
+    # OpenFilters binaryedge (+6.5k) и stretchoid (+4.1k) — всё, что SW
+    # не агрегирует. Убраны как 100%-дубли: OpenFilters censys/shodan/
+    # shadowserver/onyphe/xpanse, MISP shodan/shadowserver (покрыты SW+maltrail).
+    "scanner=https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/antiscanner.list,https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/government_networks.list,https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_cidr.txt,https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS61280,https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS213853,https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS197571,https://gist.githubusercontent.com/sngvy/07cee7ac810c9d222fbebddff8c1d1b8/raw/blacklist.txt,https://raw.githubusercontent.com/ShadowWhisperer/IPs/main/Lists/Scanners,https://raw.githubusercontent.com/stamparm/maltrail/master/data/mass_scanner.txt,https://raw.githubusercontent.com/stamparm/maltrail/master/data/mass_scanner_cidr.txt,https://raw.githubusercontent.com/OpenFilters/internet-scanners/main/cidr/binaryedge_v4.txt,https://raw.githubusercontent.com/OpenFilters/internet-scanners/main/cidr/strechoid_v4.txt"
     "threat=https://www.spamhaus.org/drop/drop_v4.json,https://www.spamhaus.org/drop/drop_v6.json,https://iplists.firehol.org/files/firehol_level1.netset"
     # v3.23.14 FALSE-POSITIVE FIX: убраны blocklist.de/all и stamparm/ipsum L3 —
     # это АГРЕГАТОРЫ abuse-репортов. Они часто содержат публичные CGNAT/PAT-адреса
@@ -6390,6 +6449,34 @@ for entry in "${REMOTE_BLOCKLISTS[@]}"; do
     esac
 done
 
+# v4.0.0-feeds (INLINE-URL): строки http(s):// внутри локальных list-файлов
+# (/etc/shieldnode/lists/<name>.txt) — это тоже источники: оператор вставляет
+# ссылку на фид прямо в lists/scanner.txt в github-репо, updater выдёргивает
+# её и качает наравне с REMOTE_URLS. IP-строки и URL-строки могут жить в одном
+# файле: IP-парсер ниже URL'ы не подхватывает (regex требует цифру первым
+# непробельным символом), URL-экстрактор наоборот берёт только http(s)://.
+INLINE_URLS=""
+if [ -n "$LOCAL_PATHS" ]; then
+    IFS=',' read -ra _LP_ARR <<< "$LOCAL_PATHS"
+    for _lp in "${_LP_ARR[@]}"; do
+        _lp="${_lp## }"; _lp="${_lp%% }"
+        [ -r "$_lp" ] || continue
+        _inl=$(grep -aoE '^[[:space:]]*https?://[^[:space:]#]+' "$_lp" 2>/dev/null | sed 's/^[[:space:]]*//')
+        [ -n "$_inl" ] && INLINE_URLS="${INLINE_URLS:+${INLINE_URLS},}$(printf '%s' "$_inl" | tr '\n' ',')"
+    done
+    unset _LP_ARR _lp _inl
+fi
+INLINE_URLS="${INLINE_URLS%,}"
+if [ -n "$INLINE_URLS" ]; then
+    REMOTE_URLS="${REMOTE_URLS:+${REMOTE_URLS},}${INLINE_URLS}"
+    logger -t "$LOG_TAG" "inline URLs из локальных файлов: $(printf '%s' "$INLINE_URLS" | tr ',' '\n' | wc -l) шт"
+fi
+# Дедуп: один и тот же URL в DEFAULT_REMOTE_BLOCKLISTS и в lists/<name>.txt
+# (типично после v4.0.0-feeds) не должен качаться дважды.
+if [ -n "$REMOTE_URLS" ]; then
+    REMOTE_URLS=$(printf '%s' "$REMOTE_URLS" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' | awk '!seen[$0]++' | paste -sd, -)
+fi
+
 # MIN_ENTRIES + FAIL_THRESHOLD: per-name override → DEFAULT_*
 case "$NAME" in
     scanner)      MIN_ENTRIES="${MIN_ENTRIES_SCANNER:-$DEFAULT_MIN_ENTRIES_SCANNER}"     ;;
@@ -6804,21 +6891,20 @@ UPDATER_EOF
 chmod 0755 "$SHIELD_UPDATER_SCRIPT"
 print_ok "Updater: $SHIELD_UPDATER_SCRIPT"
 
-# 2.6) v3.14.0: GitHub sync updater — качает lists/custom.txt с github,
-#      обновляет /etc/shieldnode/lists/custom.txt (custom-local.txt не трогает).
+# 2.6) v3.14.0: GitHub sync updater — качает lists/custom.txt + lists/scanner.txt
+#      с github, обновляет /etc/shieldnode/lists/ (custom-local.txt не трогает).
 SHIELD_GITHUB_SYNC_SCRIPT="/usr/local/sbin/shieldnode-github-sync.sh"
 cat > "$SHIELD_GITHUB_SYNC_SCRIPT" <<GITHUB_SYNC_EOF
 #!/bin/bash
-# shieldnode v3.20.4 — github sync для lists/custom.txt
+# shieldnode v3.20.4 — github sync для lists/custom.txt + lists/scanner.txt
 # Запускается через shieldnode-github-sync.timer (раз в 6ч).
-# Без интернета или 404 — оставляет существующий файл как есть.
+# Без интернета или 404 — оставляет существующие файлы как есть.
+# v4.0.0-feeds: scanner.txt тоже синкается (там RKN-ядро + inline-URL фидов).
 
 set -o pipefail
 export LANG=C LC_ALL=C
 
 LOG_TAG="shieldnode-github-sync"
-TARGET="/etc/shieldnode/lists/custom.txt"
-URL="$SHIELD_REPO_URL/lists/custom.txt"
 
 # Загружаем конфиг (опциональный)
 if [ -f /etc/shieldnode/shieldnode.conf ]; then
@@ -6832,56 +6918,71 @@ if [ "\${ENABLE_GITHUB_SYNC:-1}" != "1" ]; then
     exit 0
 fi
 
-TMP=\$(mktemp /etc/shieldnode/lists/.custom.txt.XXXXXX 2>/dev/null) || TMP=\$(mktemp)
-trap 'rm -f "\$TMP"' EXIT
+# v4.0.0-feeds: список файлов для синка (пробел-сепаратор). Можно расширить
+# через GITHUB_SYNC_LISTS="custom scanner threat" в shieldnode.conf.
+SYNC_LISTS="\${GITHUB_SYNC_LISTS:-custom scanner}"
+RC=0
 
-if ! curl -fsSL --max-time 30 --retry 2 "\$URL" -o "\$TMP" 2>/dev/null; then
-    logger -t "\$LOG_TAG" "WARN: не смог скачать \$URL — оставляю текущий \$TARGET"
-    exit 1
-fi
+for NAME in \$SYNC_LISTS; do
+    TARGET="/etc/shieldnode/lists/\${NAME}.txt"
+    URL="$SHIELD_REPO_URL/lists/\${NAME}.txt"
 
-if [ ! -s "\$TMP" ]; then
-    logger -t "\$LOG_TAG" "WARN: github вернул пустой файл — оставляю текущий"
-    exit 1
-fi
+    TMP=\$(mktemp /etc/shieldnode/lists/.\${NAME}.txt.XXXXXX 2>/dev/null) || TMP=\$(mktemp)
 
-# v3.18.11 SH-NEW-56: проверка что content — plain text, не HTML-error-page.
-# Github raw обычно возвращает 404 (тогда -f выкинет), но cloudflare maintenance
-# / proxy errors могут вернуть 200 OK + HTML body.
-# Plain text custom.txt всегда начинается с '#' (header comment) или digit (IP).
-FIRST_BYTE=\$(head -c 1 "\$TMP")
-case "\$FIRST_BYTE" in
-    \\#|[0-9]) ;; # OK plain-text
-    *)
-        logger -t "\$LOG_TAG" "WARN: github вернул не-text content (first byte: \$(printf '%q' \"\$FIRST_BYTE\")) — оставляю текущий"
-        exit 1
-        ;;
-esac
-# Дополнительно: явно отклоняем HTML
-if head -3 "\$TMP" | grep -qiE '<html|<!doctype'; then
-    logger -t "\$LOG_TAG" "WARN: github вернул HTML — оставляю текущий"
-    exit 1
-fi
+    if ! curl -fsSL --max-time 30 --retry 2 "\$URL" -o "\$TMP" 2>/dev/null; then
+        logger -t "\$LOG_TAG" "WARN: не смог скачать \$URL — оставляю текущий \$TARGET"
+        rm -f "\$TMP"; RC=1; continue
+    fi
 
-# Sanity-check: новый файл должен быть валидным (хотя бы 1 IP-подобная строка
-# или хотя бы заголовок-комментарий — пустые тоже ОК для seed'ов).
-NEW_LINES=\$(wc -l < "\$TMP")
-NEW_LINES="\${NEW_LINES:-0}"
+    if [ ! -s "\$TMP" ]; then
+        logger -t "\$LOG_TAG" "WARN: github вернул пустой \${NAME}.txt — оставляю текущий"
+        rm -f "\$TMP"; RC=1; continue
+    fi
 
-# Сравниваем с текущим файлом — если идентичны, не делаем ничего
-if [ -f "\$TARGET" ] && cmp -s "\$TARGET" "\$TMP"; then
-    logger -t "\$LOG_TAG" "no-change: github custom.txt идентичен локальному"
-    exit 0
-fi
+    # v3.18.11 SH-NEW-56: проверка что content — plain text, не HTML-error-page.
+    # Github raw обычно возвращает 404 (тогда -f выкинет), но cloudflare maintenance
+    # / proxy errors могут вернуть 200 OK + HTML body.
+    # Plain text list всегда начинается с '#' (header comment), digit (IP)
+    # или 'h' (inline-URL фида, v4.0.0-feeds).
+    FIRST_BYTE=\$(head -c 1 "\$TMP")
+    case "\$FIRST_BYTE" in
+        \\#|[0-9]|h) ;; # OK plain-text
+        *)
+            logger -t "\$LOG_TAG" "WARN: github вернул не-text content для \${NAME}.txt (first byte: \$(printf '%q' \"\$FIRST_BYTE\")) — оставляю текущий"
+            rm -f "\$TMP"; RC=1; continue
+            ;;
+    esac
+    # Дополнительно: явно отклоняем HTML
+    if head -3 "\$TMP" | grep -qiE '<html|<!doctype'; then
+        logger -t "\$LOG_TAG" "WARN: github вернул HTML для \${NAME}.txt — оставляю текущий"
+        rm -f "\$TMP"; RC=1; continue
+    fi
 
-# v3.18.8: атомарная замена. mktemp в той же директории что и TARGET → mv
-# не пересекает FS-границу (раньше /tmp могло быть tmpfs → mv = cp+unlink,
-# path-watcher ловил partial-файл).
-chmod 0644 "\$TMP"
-mv "\$TMP" "\$TARGET"   # atomic — same FS
-trap - EXIT             # файл уже на месте, cleanup отменяем
-logger -t "\$LOG_TAG" "sync OK: \$TARGET обновлён (\$NEW_LINES lines). path-watcher триггерит nft update."
-exit 0
+    NEW_LINES=\$(wc -l < "\$TMP")
+    NEW_LINES="\${NEW_LINES:-0}"
+
+    # Сравниваем с текущим файлом — если идентичны, не делаем ничего
+    if [ -f "\$TARGET" ] && cmp -s "\$TARGET" "\$TMP"; then
+        logger -t "\$LOG_TAG" "no-change: github \${NAME}.txt идентичен локальному"
+        rm -f "\$TMP"; continue
+    fi
+
+    # v3.18.8: атомарная замена. mktemp в той же директории что и TARGET → mv
+    # не пересекает FS-границу (раньше /tmp могло быть tmpfs → mv = cp+unlink,
+    # path-watcher ловил partial-файл).
+    chmod 0644 "\$TMP"
+    mv "\$TMP" "\$TARGET"   # atomic — same FS
+    logger -t "\$LOG_TAG" "sync OK: \$TARGET обновлён (\$NEW_LINES lines)"
+done
+
+# После синка scanner/threat/tor — триггерим их updater'ы (для custom это
+# делает path-watcher; у остальных path-watcher'а нет, ждать timer до 6ч —
+# долго, если оператор только что вставил ссылку в lists/scanner.txt).
+for NAME in \$SYNC_LISTS; do
+    [ "\$NAME" = "custom" ] && continue   # custom подхватит inotify path-watcher
+    systemctl start "shieldnode-update@\${NAME}.service" >/dev/null 2>&1 || true
+done
+exit \$RC
 GITHUB_SYNC_EOF
 chmod 0755 "$SHIELD_GITHUB_SYNC_SCRIPT"
 print_ok "GitHub sync updater: $SHIELD_GITHUB_SYNC_SCRIPT"
@@ -6995,7 +7096,7 @@ print_ok "Version-check updater: $SHIELD_VERSION_CHECK_SCRIPT"
 # Systemd units для github-sync и version-check
 cat > /etc/systemd/system/shieldnode-github-sync.service <<EOF
 [Unit]
-Description=Sync shieldnode custom.txt from github
+Description=Sync shieldnode lists (custom+scanner) from github
 After=network-online.target
 Wants=network-online.target
 
@@ -7006,7 +7107,7 @@ EOF
 
 cat > /etc/systemd/system/shieldnode-github-sync.timer <<EOF
 [Unit]
-Description=Sync shieldnode custom.txt from github every $DEFAULT_GITHUB_SYNC_INTERVAL
+Description=Sync shieldnode lists (custom+scanner) from github every $DEFAULT_GITHUB_SYNC_INTERVAL
 Requires=shieldnode-github-sync.service
 
 [Timer]
@@ -9737,7 +9838,7 @@ Usage:
   sudo guard --json     JSON output (for integrations)
   sudo guard upgrade    re-run installer from github (apply latest version)
   sudo guard rollback   restore state from before last 'guard upgrade'
-  sudo guard sync       force github sync of custom.txt now
+  sudo guard sync       force github sync of lists (custom+scanner) now
   sudo guard check      force version check now
   sudo guard self-test  health check (v3.23.5+): conntrack, disk, MY_IP, services
 
@@ -13653,7 +13754,7 @@ echo -e "  ${BOLD}Команды:${NC}"
 echo -e "   ${CYAN}sudo guard${NC}                — дашборд защиты + меню (включая [s] settings)"
 echo -e "   ${CYAN}sudo guard --once${NC}         — снимок без меню"
 echo -e "   ${CYAN}sudo guard upgrade${NC}        — обновить до новой версии с github"
-echo -e "   ${CYAN}sudo guard sync${NC}           — синк custom.txt прямо сейчас"
+echo -e "   ${CYAN}sudo guard sync${NC}           — синк lists (custom+scanner) с github прямо сейчас"
 echo -e "   ${CYAN}sudo guard check${NC}          — проверить новую версию прямо сейчас"
 echo -e "   ${CYAN}sudo bash $SCRIPT_NAME --uninstall${NC}  — удалить"
 echo ""
