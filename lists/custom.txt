@@ -2649,3 +2649,17 @@
 115.160.97.208     # nodes=1 ev=ssh AS9694 SEOKYUNG-CATV-AS-KR-KR - Seokyung Cable Television Co.. Ltd., KR
 59.97.21.114       # nodes=2 ev=ssh AS9829 BSNL-NIB - National Internet Backbone, IN
 202.184.148.229    # nodes=4 ev=ssh AS9930 TTNET-MY - TIME dotCom Berhad No. 14, Jalan Majistret U1/26 Hicom Glenmarie Industrial Park 40150 Shah Alam Selangor, Malaysia, MY
+
+# --- collect-attackers 2.0.2 · 2026-11-09 · 7 нод · +11 IP: сканеры портов ---
+# доказательство: чистый TCP SYN в 5 и более закрытых портов ниже диапазона исходящих портов ноды.
+45.77.137.113      # nodes=2 ev=ufw ports=6 AS20473 AS-VULTR - The Constant Company, LLC, US
+45.77.141.28       # nodes=4 ev=ufw ports=6 AS20473 AS-VULTR - The Constant Company, LLC, US
+45.136.255.176     # nodes=4 ev=ufw ports=10 AS56309 SIAMDATA-TH - Siamdata Communication Co.,Ltd., TH
+46.225.49.115      # nodes=1 ev=ufw ports=12 AS24940 HETZNER-AS - Hetzner Online GmbH, DE
+57.129.145.103     # nodes=1 ev=ufw ports=15 AS16276 OVH - OVH SAS, FR
+78.130.242.31      # nodes=1 ev=ufw ports=5 AS9070 Cooolbox - Cooolbox AD, BG
+85.93.13.34        # nodes=1 ev=ufw ports=50 AS12586 ASGHOSTNET - GHOSTnet GmbH, DE
+104.255.152.18     # nodes=1 ev=ufw ports=169 AS7040 NETMINDERS - Netminders Server Hosting, CA
+136.148.223.73     # nodes=1 ev=ufw ports=9 AS214640 HOSTUP - Hostup AB, SE
+199.21.149.124     # nodes=1 ev=ufw ports=143 AS7040 NETMINDERS - Netminders Server Hosting, CA
+199.167.138.45     # nodes=1 ev=ufw ports=66 AS7040 NETMINDERS - Netminders Server Hosting, CA
