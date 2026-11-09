@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # collect-attackers.sh — сбор IP сканеров и атакующих с VPN-ноды для custom-списка
-# Version: 2.0.1
+# Version: 2.0.2
 #
 # Работает с обоими стеками: старым shieldnode (таблица inet ddos_protect, events.db, логи [shield:*])
 # и новым vpn-node-stack (inet shieldnode). ТОЛЬКО ЧТЕНИЕ, кроме --apply.
@@ -13,7 +13,8 @@
 #                                                      # объединить отчёты нескольких нод (root не нужен)
 #
 # Что считается доказательством (по умолчанию):
-#   ufw        — UFW BLOCK: стук в ЗАКРЫТЫЕ порты (клиенты VPN ходят только на открытые)
+#   ufw        — UFW BLOCK: чистый TCP SYN в закрытый порт ниже диапазона исходящих портов ноды
+#                (UDP и высокие порты не считаются: туда приходят ответы сервисов клиентам VPN)
 #   ssh        — неудачные входы sshd (подбор пароля; VPN-клиентам SSH не нужен)
 #   tcp_invalid, tarpit, confirmed/ddos — старый shield: сканы флагами, ловушка, подтверждённая атака
 #   ssh_flood, abuse_journal, flood_ban — новый стек: наборы ssh/tcp/udp_abusers и их история
@@ -52,7 +53,7 @@ command -v python3 >/dev/null 2>&1 || { echo "нужен python3" >&2; exit 1; }
 exec python3 - "$@" <<'PYEOF'
 import ipaddress, json, os, re, socket, subprocess, sys, time, collections, shutil
 
-VERSION = "2.0.1"
+VERSION = "2.0.2"
 FIX = os.environ.get("COLLECT_FIXTURE_DIR", "")      # тесты: вывод команд из файлов
 ROOT = os.environ.get("COLLECT_ROOT", "")            # тесты: префикс для /etc, /var, /run
 args = sys.argv[1:]
@@ -294,6 +295,10 @@ since = "%d days ago" % DAYS
 kern = run("journal_kernel", ["journalctl", "-k", "--since", since, "--no-pager", "-q", "-o", "cat"])
 ufw_ports = collections.defaultdict(set); ufw_hits = collections.Counter()
 REPLY_SPORTS = {53, 80, 123, 443, 853, 5222, 5228}
+try:
+    LOCAL_PORT_LOW = min(32768, int(open(ROOT + "/proc/sys/net/ipv4/ip_local_port_range").read().split()[0]))
+except (OSError, ValueError, IndexError):
+    LOCAL_PORT_LOW = 1024
 shield_log = collections.Counter()
 for line in kern.splitlines():
     src = re.search(r"SRC=(%s)" % IPV4, line)
@@ -302,12 +307,14 @@ for line in kern.splitlines():
     if "[UFW BLOCK]" in line:
         dpt = re.search(r"DPT=(\d+)", line); pr = re.search(r"PROTO=(\w+)", line)
         spt = re.search(r"SPT=(\d+)", line)
-        # 2.0.1: запоздалые ответы сайтов, куда ходят сами клиенты, — не атака.
-        # Считаем только попытки открыть соединение: чистый SYN, не с порта сервиса
-        # и не на эфемерный порт (туда приходят ответы на исходящие соединения ноды).
-        if pr and pr.group(1) == "TCP" and not (" SYN " in line and " ACK " not in line): continue
+        # 2.0.2: в лог закрытых портов попадают запоздалые ответы сервисов клиентам VPN
+        # (Apple FaceTime udp/3483, Valve, Cloudflare) и сами клиенты: нода ходит наружу с
+        # портов ip_local_port_range, ответ после истечения conntrack выглядит как «стук».
+        # Считаем только то, что ответом быть не может: чистый TCP SYN на порт ниже
+        # диапазона исходящих портов ноды и не с порта сервиса.
+        if not pr or pr.group(1) != "TCP" or not (" SYN " in line and " ACK " not in line): continue
         if spt and int(spt.group(1)) in REPLY_SPORTS: continue
-        if dpt and 32768 <= int(dpt.group(1)) <= 60999: continue
+        if not dpt or int(dpt.group(1)) >= LOCAL_PORT_LOW: continue
         ufw_hits[ip] += 1
         if dpt: ufw_ports[ip].add("%s/%s" % (dpt.group(1), pr.group(1) if pr else "?"))
     else:
