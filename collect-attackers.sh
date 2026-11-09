@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # collect-attackers.sh — сбор IP сканеров и атакующих с VPN-ноды для custom-списка
-# Version: 2.0.0
+# Version: 2.0.1
 #
 # Работает с обоими стеками: старым shieldnode (таблица inet ddos_protect, events.db, логи [shield:*])
 # и новым vpn-node-stack (inet shieldnode). ТОЛЬКО ЧТЕНИЕ, кроме --apply.
@@ -52,7 +52,7 @@ command -v python3 >/dev/null 2>&1 || { echo "нужен python3" >&2; exit 1; }
 exec python3 - "$@" <<'PYEOF'
 import ipaddress, json, os, re, socket, subprocess, sys, time, collections, shutil
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 FIX = os.environ.get("COLLECT_FIXTURE_DIR", "")      # тесты: вывод команд из файлов
 ROOT = os.environ.get("COLLECT_ROOT", "")            # тесты: префикс для /etc, /var, /run
 args = sys.argv[1:]
@@ -293,6 +293,7 @@ if NEW:
 since = "%d days ago" % DAYS
 kern = run("journal_kernel", ["journalctl", "-k", "--since", since, "--no-pager", "-q", "-o", "cat"])
 ufw_ports = collections.defaultdict(set); ufw_hits = collections.Counter()
+REPLY_SPORTS = {53, 80, 123, 443, 853, 5222, 5228}
 shield_log = collections.Counter()
 for line in kern.splitlines():
     src = re.search(r"SRC=(%s)" % IPV4, line)
@@ -300,6 +301,13 @@ for line in kern.splitlines():
     ip = src.group(1)
     if "[UFW BLOCK]" in line:
         dpt = re.search(r"DPT=(\d+)", line); pr = re.search(r"PROTO=(\w+)", line)
+        spt = re.search(r"SPT=(\d+)", line)
+        # 2.0.1: запоздалые ответы сайтов, куда ходят сами клиенты, — не атака.
+        # Считаем только попытки открыть соединение: чистый SYN, не с порта сервиса
+        # и не на эфемерный порт (туда приходят ответы на исходящие соединения ноды).
+        if pr and pr.group(1) == "TCP" and not (" SYN " in line and " ACK " not in line): continue
+        if spt and int(spt.group(1)) in REPLY_SPORTS: continue
+        if dpt and 32768 <= int(dpt.group(1)) <= 60999: continue
         ufw_hits[ip] += 1
         if dpt: ufw_ports[ip].add("%s/%s" % (dpt.group(1), pr.group(1) if pr else "?"))
     else:
